@@ -1,0 +1,405 @@
+// One connection to a server: how it is opened and greeted, and how
+// commands travel on it.
+internal partial module adm.network.redis.resp {
+	use (
+		std.net
+		std.net.tls
+		std.sync
+		adm.network.redis::*
+	)
+
+	// Target is where a connection goes and how it introduces itself.
+	struct Target {
+		host           string
+		port           int
+		// The path of a Unix socket; "" for TCP.
+		path           string
+		secure         bool
+		tlsConfig      ?tls.Config
+		username       string
+		password       string
+		database       int
+		name           string
+		// The RESP version to ask for: 3 or 2.
+		protocol       int
+		connectTimeout duration
+		timeout        duration
+		// What the server must say it is (`ROLE`): "master" or "slave"; ""
+		// asks nothing.
+		role           string
+		// A cluster replica that is to answer reads (`READONLY`).
+		replica        bool
+	}
+
+	// A copy of a target that goes to another address.
+	def retarget(base Target, host string, port int) Target {
+		return Target{host: host, port: port, path: "", secure: base.secure, tlsConfig: base.tlsConfig, username: base.username, password: base.password, database: base.database, name: base.name, protocol: base.protocol, connectTimeout: base.connectTimeout, timeout: base.timeout, role: "", replica: false}
+	}
+
+	// Conn is one connection. One task uses it at a time.
+	type Conn {
+		wire     Wire
+		stream   net.Stream
+		// The RESP version the server agreed to.
+		protocol int        = 2
+		// Set once the connection cannot be used again: it failed, timed
+		// out in the middle of a reply, or was closed.
+		broken   bool
+		// Set when the connection came out of the idle list, so a failure
+		// before any reply may be a connection the server dropped while it
+		// was idle.
+		reused   bool
+		// What the server said about itself in answer to HELLO.
+		hello    Value
+		// Pushes that arrived between replies, oldest first.
+		pushes   Value[]
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			wire = new Wire(stream, timeout)
+			hello = new Value()
+		}
+
+		// run writes a batch and reads one reply per command it holds,
+		// waiting up to `wait` for each (0s without end). Error replies come
+		// back as values.
+		// Fails with a RedisError as `Wire.read` does; the connection is
+		// then broken.
+		def run(batch Batch, wait duration) !Value[] {
+			fail errorOf(ErrorKind.Closed, "redis: the connection is closed") when broken
+			wire.timeout = wait
+			let out Value[] = []
+			let failure ?error = none
+			wire.send(batch.data) onerror (err error) {
+				failure = err
+				recover none
+			}
+			for let i = 0; i < batch.count && failure is none; i++ {
+				let v = reply() onerror (err error) {
+					failure = err
+					recover new Value()
+				}
+				out.push(v)
+			}
+			if !(failure is none) {
+				close()
+				fail failure
+			}
+			return out
+		}
+
+		// The next reply that is not a push; pushes met on the way are kept
+		// in `pushes`.
+		def reply() !Value {
+			for {
+				let v = try wire.read()
+				return v unless v.kind == ValueKind.Push
+				pushes.push(v)
+			}
+			return new Value()
+		}
+
+		// Whether a reply arrives within `wait` (0s: waits without end).
+		// Fails with a RedisError of ErrorKind.Connection when the
+		// connection breaks while waiting.
+		def ready(wait duration) !bool {
+			return true when wire.buffered() > 0
+			let before = wire.timeout
+			wire.timeout = wait
+			let got = true
+			let failure ?error = none
+			wire.need(1) onerror (err error) {
+				got = false
+				let late = false
+				late = err.kind == ErrorKind.TimedOut when err is RedisError
+				failure = err unless late
+				recover none
+			}
+			wire.timeout = before
+			if !(failure is none) {
+				close()
+				fail failure
+			}
+			return got
+		}
+
+		def close() {
+			return when broken
+			broken = true
+			stream.close() onerror recover none
+		}
+	}
+
+	// Pool is the connections of one client: it lends one to each exchange
+	// and opens them as they are needed, up to a limit.
+	type Pool {
+		target        Target
+		atomic idle   Conn[]         = []
+		permits       sync.Semaphore
+		atomic opened bool           = false
+		atomic closed bool           = false
+
+		def new() {
+			permits = new sync.Semaphore(1)
+		}
+
+		// open sets where connections go and how many there may be, and
+		// returns the first, borrowed.
+		// Fails with a RedisError as `dial` does.
+		def open(target Target, limit int) !Conn {
+			self.target = target
+			permits = new sync.Semaphore(limit)
+			permits.acquire()
+			let conn = dial(target) onerror (err error) {
+				permits.release()
+				fail err
+			}
+			opened = true
+			return conn
+		}
+
+		// prepare sets where connections go and how many there may be
+		// without opening one.
+		def prepare(target Target, limit int) {
+			self.target = target
+			permits = new sync.Semaphore(limit)
+			opened = true
+		}
+
+		// call sends one command and returns its reply, waiting up to `wait`
+		// for it (0s without end).
+		// Fails with a RedisError: the server's error reply, and as
+		// `exchange` and `Batch.add` do.
+		def call(wait duration, args any[]) !Value {
+			let batch = new Batch()
+			try batch.add(args)
+			let replies = try exchange(batch, wait)
+			let reply = replies[0]
+			fail serverError(reply.text()) when reply.isError()
+			return reply
+		}
+
+		// run sends commands as one batch and returns their replies in
+		// order, error replies as values.
+		// Fails with a RedisError as `exchange` and `Batch.add` do.
+		def run(commands any[][], wait duration) !Value[] {
+			let batch = new Batch()
+			for let command in commands {
+				try batch.add(command)
+			}
+			return try exchange(batch, wait)
+		}
+
+		// hold lends a connection for several exchanges.
+		// Fails with a RedisError as `borrow` does.
+		def hold(args any[], now bool) !?Hold {
+			return Hold{pool: self, conn: try borrow()}
+		}
+
+		// The server a connection of its own goes to.
+		// Fails with a RedisError of ErrorKind.Closed when the pool is
+		// closed or was never opened.
+		def place(args any[]) !Target {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when closed
+			fail errorOf(ErrorKind.Closed, "redis: the client is not connected; call connect first") unless opened
+			return target
+		}
+
+		def pools() !Pool[] {
+			return [self]
+		}
+
+		def isOpen() bool {
+			return opened
+		}
+
+		def isClosed() bool {
+			return closed
+		}
+
+		// exchange sends a batch on a borrowed connection and returns its
+		// replies, error replies as values.
+		// Fails with a RedisError as `send` and `borrow` do.
+		def exchange(batch Batch, wait duration) !Value[] {
+			return try send(try borrow(), batch, wait)
+		}
+
+		// send runs a batch on a borrowed connection, gives the connection
+		// back and returns the replies, error replies as values. A batch
+		// that fails before any reply on a connection that sat idle is sent
+		// once more on a new one: the server may have dropped the old one
+		// meanwhile.
+		// Fails with a RedisError as `Conn.run` and `borrow` do.
+		def send(conn Conn, batch Batch, wait duration) !Value[] {
+			let stale = conn.reused
+			let failure ?error = none
+			let replies = conn.run(batch, wait) onerror (err error) {
+				failure = err
+				recover Value[]
+			}
+			giveBack(conn)
+			return replies when failure is none
+			let lost = false
+			lost = failure.kind == ErrorKind.Connection when failure is RedisError
+			fail failure unless stale && lost
+			// The other idle connections are no younger.
+			for let old in takeAll() {
+				old.close()
+			}
+			let fresh = try borrow()
+			let again = fresh.run(batch, wait) onerror (err error) {
+				giveBack(fresh)
+				fail err
+			}
+			giveBack(fresh)
+			return again
+		}
+
+		// borrow takes a connection out of the pool, opening one when none
+		// is idle, waiting when all are in use.
+		// Fails with a RedisError: ErrorKind.Closed when the pool is closed
+		// or was never opened, and as `dial` does.
+		def borrow() !Conn {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when closed
+			fail errorOf(ErrorKind.Closed, "redis: the client is not connected; call connect first") unless opened
+			permits.acquire()
+			let conn = takeIdle()
+			if !(conn is none) {
+				conn.reused = true
+				return conn
+			}
+			return dial(target) onerror (err error) {
+				permits.release()
+				fail err
+			}
+		}
+
+		// giveBack returns a borrowed connection: to the idle list, or
+		// closed when it broke or the pool closed meanwhile.
+		def giveBack(conn Conn) {
+			if conn.broken || closed {
+				conn.close()
+			} else {
+				conn.pushes = []
+				putIdle(conn)
+			}
+			permits.release()
+		}
+
+		// close closes the idle connections; borrowed ones close as they
+		// come back.
+		def close() {
+			closed = true
+			for let conn in takeAll() {
+				conn.close()
+			}
+		}
+
+		atomic def takeIdle() ?Conn {
+			return none when idle.len() == 0
+			return idle.pop()
+		}
+
+		atomic def putIdle(conn Conn) {
+			idle.push(conn)
+		}
+
+		atomic def takeAll() Conn[] {
+			let all = idle
+			idle = []
+			return all
+		}
+	}
+
+	// dial opens a connection, under TLS when the target asks, and greets
+	// the server: protocol version, user and password, client name,
+	// database.
+	// Fails with a RedisError: ErrorKind.Connection when the server cannot
+	// be reached or TLS fails, ErrorKind.Denied when it refuses the user or
+	// password, ErrorKind.Server when it refuses the database or the name.
+	def dial(target Target) !Conn {
+		let address = target.path
+		address = target.host.contains(":") ?? ("[{target.host}]:{target.port}", "{target.host}:{target.port}") when address == ""
+		let socket = net.dialStream(address, target.connectTimeout) onerror (err error) {
+			fail errorOf(ErrorKind.Connection, "redis: {err.message}")
+		}
+		let stream net.Stream = socket
+		if target.secure {
+			let config = tls.Config{}
+			let given = target.tlsConfig
+			config = given unless given is none
+			config.serverName = target.host when config.serverName == ""
+			let secured = tls.client(socket, config)
+			secured.handshake(target.connectTimeout) onerror (err error) {
+				socket.close() onerror recover none
+				fail errorOf(ErrorKind.Connection, "redis: TLS: {err.message}")
+			}
+			stream = secured
+		}
+		let conn = new Conn(stream, target.timeout)
+		greet(conn, target) onerror (err error) {
+			conn.close()
+			fail err
+		}
+		return conn
+	}
+
+	// Sends the commands that open a session.
+	def greet(conn Conn, target Target) !none {
+		let named = false
+		if target.protocol >= 3 {
+			let hello any[] = ["HELLO", "3"]
+			hello.push("AUTH", target.username == "" ?? ("default", target.username), target.password) when target.password != ""
+			hello.push("SETNAME", target.name) when target.name != ""
+			let answer = try one(conn, target.timeout, ...hello)
+			if answer.isError() {
+				let failure = serverError(answer.text())
+				// A server older than 6 does not know HELLO, and one that
+				// knows it may not speak RESP3: both go on in RESP2.
+				let old = failure.prefix == "NOPROTO" || (failure.prefix == "ERR" && answer.text().lower().contains("unknown command"))
+				fail failure unless old
+			} else {
+				conn.protocol = 3
+				conn.hello = answer
+				named = true
+			}
+		}
+		if conn.protocol < 3 {
+			if target.password != "" {
+				let answer = target.username == "" ?? (try one(conn, target.timeout, "AUTH", target.password), try one(conn, target.timeout, "AUTH", target.username, target.password))
+				fail serverError(answer.text()) when answer.isError()
+			}
+		}
+		if target.name != "" && !named {
+			let answer = try one(conn, target.timeout, "CLIENT", "SETNAME", target.name)
+			fail serverError(answer.text()) when answer.isError()
+		}
+		if target.database != 0 {
+			let answer = try one(conn, target.timeout, "SELECT", target.database)
+			fail serverError(answer.text()) when answer.isError()
+		}
+		if target.role != "" {
+			// A server that changed roles since it was named is as good
+			// as gone: whoever named it has to ask again.
+			let answer = try one(conn, target.timeout, "ROLE")
+			fail serverError(answer.text()) when answer.isError()
+			let actual = answer.items.len() > 0 ?? (answer.items[0].text(), "")
+			fail errorOf(ErrorKind.Connection, "redis: {target.host}:{target.port} is a {actual}, not the {target.role} it was named as") when actual != target.role
+		}
+		if target.replica {
+			let answer = try one(conn, target.timeout, "READONLY")
+			fail serverError(answer.text()) when answer.isError()
+		}
+		return none
+	}
+
+	// Runs one command on a connection and returns its reply, an error
+	// reply included.
+	// Fails with a RedisError as `Conn.run` and `Batch.add` do.
+	def one(conn Conn, wait duration, args ...any) !Value {
+		let batch = new Batch()
+		try batch.add(args)
+		let replies = try conn.run(batch, wait)
+		return replies[0]
+	}
+}

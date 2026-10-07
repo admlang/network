@@ -1,0 +1,662 @@
+// These tests need an S3 server; without ADM_TEST_S3 they pass without
+// running. See README.md for the server they expect.
+partial module adm.network.s3 {
+	use (
+		std.bytes
+		std.net.http
+		std.os
+		std.testing
+		std.time
+		adm.network.s3.sigv4::(sha256Hex)
+	)
+
+	// The server as `http://accessKey:secretKey@host:port`. The tests make
+	// and remove buckets whose names start with `adm-test-`.
+	@env("ADM_TEST_S3")
+	internal const testServer string
+
+	// A client for the test server.
+	def testClient(options string = "") !Client {
+		return try connect("{testServer}{options}")
+	}
+
+	// Removes a bucket with everything in it.
+	def wipe(store Client, name string) !none {
+		return none unless try store.hasBucket(name)
+		let bucket = store.bucket(name)
+		for let entry in try bucket.versions().all() {
+			try bucket.delete(entry.key, entry.version)
+		}
+		for let pending in try bucket.uploads() {
+			try bucket.resume(pending.key, pending.id).abort()
+		}
+		try store.deleteBucket(name)
+		return none
+	}
+
+	// An empty bucket of that name.
+	def fresh(store Client, name string) !Bucket {
+		try wipe(store, name)
+		return try store.createBucket(name)
+	}
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is S3Error
+		return ErrorKind.Server
+	}
+
+	// `size` bytes that do not repeat at any chunk or part boundary.
+	def pattern(size int) byte[] {
+		let out byte[] = []
+		out.len(size)
+		let state uint32 = 2463534242
+		for let i = 0; i < size; i++ {
+			state = state ^ (state << 13)
+			state = state ^ (state >> 17)
+			state = state ^ (state << 5)
+			out[i] = byte(state & 255)
+		}
+		return out
+	}
+
+	check "Client" {
+		@test()
+		def TestAddresses() !none {
+			let kind = ErrorKind.Server
+			connect("ftp://example.com") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("https://example.com/bucket") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("https://example.com?colour=red") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Argument
+
+			let aws = try connect("https://s3.eu-central-1.amazonaws.com", "AKIDEXAMPLE", "secret")
+			assert aws.region == "eu-central-1"
+			assert aws.str() == "s3.Client(https://s3.eu-central-1.amazonaws.com)"
+			let link = try aws.bucket("photos").presign("2026/a b.jpg", 1h)
+			assert link.startsWith("https://photos.s3.eu-central-1.amazonaws.com/2026/a%20b.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F")
+			assert link.contains("%2Feu-central-1%2Fs3%2Faws4_request&")
+			assert link.contains("&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=")
+			// A dot in the name does not fit the certificate: the path it is.
+			let dotted = try aws.bucket("my.photos").presign("a", 1h)
+			assert dotted.startsWith("https://s3.eu-central-1.amazonaws.com/my.photos/a?")
+
+			let local = try connect("http://key:secret@127.0.0.1:9000?region=garage&addressing=virtual")
+			assert local.accessKey == "key"
+			assert local.region == "garage"
+			let forced = try local.bucket("data").presign("k", 1min)
+			assert forced.startsWith("http://data.127.0.0.1:9000/k?")
+
+			kind = ErrorKind.Server
+			aws.bucket("photos").presign("k", 192h) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover ""
+			}
+			assert kind == ErrorKind.Argument
+			return none
+		}
+
+		@test()
+		def TestBuckets() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-buckets")
+			assert bucket.name == "adm-test-buckets"
+			assert try store.hasBucket("adm-test-buckets")
+			assert !(try store.hasBucket("adm-test-not-there"))
+			let seen = false
+			for let info in try store.buckets() {
+				seen = true when info.name == "adm-test-buckets"
+			}
+			assert seen
+			assert (try bucket.region()) == "us-east-1"
+
+			let kind = ErrorKind.Server
+			store.createBucket("adm-test-buckets") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover bucket
+			}
+			assert kind == ErrorKind.Exists
+
+			try bucket.put("keeps-it-busy", "x")
+			kind = ErrorKind.Server
+			store.deleteBucket("adm-test-buckets") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotEmpty
+			try bucket.delete("keeps-it-busy")
+			try store.deleteBucket("adm-test-buckets")
+
+			kind = ErrorKind.Server
+			let code = ""
+			bucket.put("k", "v") onerror (err error) {
+				kind = kindOfFailure(err)
+				code = err.serverCode when err is S3Error
+				recover ObjectInfo{}
+			}
+			assert kind == ErrorKind.NoBucket
+			assert code == "NoSuchBucket"
+			return none
+		}
+
+		@test()
+		def TestWrongSecret() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			store.secretKey = "not-the-secret"
+			try store.connect(testServer.replace(/\/\/[^@]*@/, "//"))
+			let kind = ErrorKind.Server
+			let code = ""
+			store.buckets() onerror (err error) {
+				kind = kindOfFailure(err)
+				code = err.serverCode when err is S3Error
+				recover []
+			}
+			assert kind == ErrorKind.Denied
+			assert code == "SignatureDoesNotMatch"
+			return none
+		}
+
+		@test()
+		def TestOtherRegion() !none {
+			return none when testServer == ""
+			// Signed for the wrong region first, then for the one the server
+			// names.
+			let store = try testClient("?region=eu-west-3")
+			let bucket = try fresh(try testClient(), "adm-test-region")
+			let far = store.bucket("adm-test-region")
+			try far.put("k", "v")
+			assert (try (try far.get("k")).text()) == "v"
+			try wipe(try testClient(), "adm-test-region")
+			return none
+		}
+	}
+
+	check "Objects" {
+		@test()
+		def TestPutGet() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-objects")
+			let written = try bucket.put("notes/today.md", "# héllo\n", "text/markdown", WriteOptions{metadata: {"author": "ana", "draft": "yes"}, cacheControl: "max-age=60", labels: {"team": "docs"}})
+			assert written.etag == "d5ccb5c5b6e9bfb8f6df2a5b9c1a1be9" || written.etag.len() == 32
+			assert written.size == 9
+
+			let info = try bucket.info("notes/today.md")
+			fail "no info" when info is none
+			assert info.size == 9
+			assert info.etag == written.etag
+			assert info.contentType == "text/markdown"
+			assert info.metadata["author"] == "ana"
+			assert info.metadata["draft"] == "yes"
+			assert info.cacheControl == "max-age=60"
+			assert info.tagCount == 1
+			assert info.modified.year() >= 2026
+
+			let object = try bucket.get("notes/today.md")
+			assert object.length == 9
+			assert object.info.contentType == "text/markdown"
+			assert (try object.text()) == "# héllo\n"
+
+			assert try bucket.has("notes/today.md")
+			assert !(try bucket.has("notes/tomorrow.md"))
+			let missing = try bucket.info("notes/tomorrow.md")
+			assert missing is none
+			let kind = ErrorKind.Server
+			bucket.get("notes/tomorrow.md") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover object
+			}
+			assert kind == ErrorKind.NoObject
+
+			try bucket.delete("notes/today.md")
+			try bucket.delete("notes/today.md")
+			assert !(try bucket.has("notes/today.md"))
+			try wipe(store, "adm-test-objects")
+			return none
+		}
+
+		@test()
+		def TestRanges() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-ranges")
+			try bucket.put("digits", "0123456789")
+			let middle = try bucket.get("digits", ReadOptions{offset: 2, length: 3})
+			assert middle.length == 3
+			assert middle.info.size == 10
+			assert (try middle.text()) == "234"
+			assert (try (try bucket.get("digits", ReadOptions{offset: 7})).text()) == "789"
+			assert (try (try bucket.get("digits", ReadOptions{offset: -4})).text()) == "6789"
+			let kind = ErrorKind.Server
+			bucket.get("digits", ReadOptions{offset: 50, length: 5}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover middle
+			}
+			assert kind == ErrorKind.Range
+			try wipe(store, "adm-test-ranges")
+			return none
+		}
+
+		@test()
+		def TestOddKeys() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-keys")
+			let keys = ["a b/ü+%&=?#.txt", "50%off/it's (new)*!.txt", "semi;colon,comma@at:colon$.txt", "日本語/ファイル", "tilde~under_score-dash.dot"]
+			for let key in keys {
+				try bucket.put(key, key)
+				assert (try (try bucket.get(key)).text()) == key
+			}
+			let listed string[] = []
+			for let entry in try bucket.list().all() {
+				listed.push(entry.key)
+			}
+			assert listed.len() == keys.len()
+			for let key in keys {
+				assert listed.includes(key)
+			}
+			let failures = try bucket.delete(keys)
+			assert failures.len() == 0
+			assert (try bucket.list().all()).len() == 0
+			try wipe(store, "adm-test-keys")
+			return none
+		}
+
+		@test()
+		def TestConditions() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-conditions")
+			let first = try bucket.put("lock", "one", options = WriteOptions{ifNoneMatch: "*"})
+			let kind = ErrorKind.Server
+			bucket.put("lock", "two", options = WriteOptions{ifNoneMatch: "*"}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover first
+			}
+			assert kind == ErrorKind.Precondition
+			assert (try (try bucket.get("lock")).text()) == "one"
+
+			let object = try bucket.get("lock", ReadOptions{ifMatch: first.etag})
+			try object.close()
+			kind = ErrorKind.Server
+			bucket.get("lock", ReadOptions{ifNoneMatch: first.etag}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover object
+			}
+			assert kind == ErrorKind.NotModified
+			kind = ErrorKind.Server
+			bucket.get("lock", ReadOptions{ifMatch: "0123456789abcdef0123456789abcdef"}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover object
+			}
+			assert kind == ErrorKind.Precondition
+			try wipe(store, "adm-test-conditions")
+			return none
+		}
+
+		@test()
+		def TestStreamedPut() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-stream")
+			// Three signed chunks, the last one short.
+			let data = pattern(700 * 1024 + 123)
+			let written = try bucket.put("big.bin", new bytes.Buffer(data), data.len(), "application/octet-stream")
+			assert written.size == data.len()
+			let back = try (try bucket.get("big.bin")).bytes()
+			assert back.len() == data.len()
+			assert sha256Hex(back) == sha256Hex(data)
+			// The three ways to take the content as it arrives.
+			let streamed = try bucket.get("big.bin")
+			let sink = new bytes.Buffer()
+			assert (try streamed.copyTo(sink)) == data.len()
+			let chunk byte[] = []
+			chunk.len(1000)
+			let partial_ = try bucket.get("big.bin", ReadOptions{length: 2500})
+			let got = 0
+			for {
+				let n = try partial_.read(chunk)
+				break when n == 0
+				got += n
+			}
+			assert got == 2500
+			let path = "/tmp/adm-s3-test-{time.now().unixNs()}"
+			try (try bucket.get("big.bin")).save(path)
+			assert sha256Hex(try os.readFile(path)) == sha256Hex(data)
+			try os.remove(path)
+			let nothing byte[] = []
+			try bucket.put("empty.bin", new bytes.Buffer(nothing), 0)
+			let info = try bucket.info("empty.bin")
+			fail "no info" when info is none
+			assert info.size == 0
+			try wipe(store, "adm-test-stream")
+			return none
+		}
+
+		@test()
+		def TestCopyAndTags() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-copy")
+			let other = try fresh(store, "adm-test-copy-to")
+			try bucket.put("a b.txt", "copy me", "text/plain", WriteOptions{metadata: {"kept": "yes"}})
+			let same = try bucket.copy("a b.txt", "c.txt")
+			assert same.key == "c.txt"
+			let kept = try bucket.info("c.txt")
+			fail "no info" when kept is none
+			assert kept.contentType == "text/plain"
+			assert kept.metadata["kept"] == "yes"
+			try bucket.copy("a b.txt", "moved/d.txt", "adm-test-copy-to", options = WriteOptions{metadata: {"fresh": "1"}})
+			let replaced = try other.info("moved/d.txt")
+			fail "no info" when replaced is none
+			assert replaced.metadata["fresh"] == "1"
+			assert !replaced.metadata.hasKey("kept")
+			assert (try (try other.get("moved/d.txt")).text()) == "copy me"
+
+			try bucket.tagging("c.txt", {"stage": "draft", "owner": "ana maria"})
+			let labels = try bucket.tagging("c.txt")
+			assert labels.len() == 2
+			assert labels["owner"] == "ana maria"
+			let none_ map<string, string>
+			try bucket.tagging("c.txt", none_)
+			assert (try bucket.tagging("c.txt")).len() == 0
+
+			let kind = ErrorKind.Server
+			bucket.copy("not-there", "x") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover same
+			}
+			assert kind == ErrorKind.NoObject
+			try wipe(store, "adm-test-copy")
+			try wipe(store, "adm-test-copy-to")
+			return none
+		}
+
+		@test()
+		def TestListing() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-list")
+			for let i = 0; i < 23; i++ {
+				try bucket.put("logs/2026/{i.str().padStart(2, "0")}.txt", "line {i}")
+			}
+			try bucket.put("logs/2025/00.txt", "old")
+			try bucket.put("readme.txt", "top")
+
+			let walk = bucket.list("logs/2026/", pageSize = 10)
+			let sizes int[] = []
+			for {
+				let page = try walk.next()
+				break when page is none
+				sizes.push(page.objects.len())
+			}
+			assert sizes.len() == 3
+			assert sizes[0] == 10 && sizes[1] == 10 && sizes[2] == 3
+			let all = try bucket.list().all()
+			assert all.len() == 25
+			assert all[0].key == "logs/2025/00.txt"
+			assert all[0].size == 3
+			assert all[0].etag.len() == 32
+			assert all[24].key == "readme.txt"
+
+			let top = try bucket.list(delimiter = "/").next()
+			fail "no page" when top is none
+			assert top.prefixes.len() == 1 && top.prefixes[0] == "logs/"
+			assert top.objects.len() == 1 && top.objects[0].key == "readme.txt"
+			let years = try bucket.list("logs/", "/").next()
+			fail "no page" when years is none
+			assert years.prefixes.len() == 2
+			assert years.prefixes[1] == "logs/2026/"
+			let later = try bucket.list("logs/2026/", startAfter = "logs/2026/20.txt").all()
+			assert later.len() == 2
+
+			let keys string[] = []
+			for let entry in all {
+				keys.push(entry.key)
+			}
+			assert (try bucket.delete(keys)).len() == 0
+			assert (try bucket.list().all()).len() == 0
+			try wipe(store, "adm-test-list")
+			return none
+		}
+
+		@test()
+		def TestVersions() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-versions")
+			assert !(try bucket.versioning())
+			try bucket.versioning(true)
+			assert try bucket.versioning()
+			let one = try bucket.put("doc", "one")
+			let two = try bucket.put("doc", "two")
+			assert one.version != "" && two.version != "" && one.version != two.version
+			assert (try (try bucket.get("doc")).text()) == "two"
+			assert (try (try bucket.get("doc", ReadOptions{version: one.version})).text()) == "one"
+
+			try bucket.delete("doc")
+			assert !(try bucket.has("doc"))
+			let history = try bucket.versions("doc").all()
+			assert history.len() == 3
+			assert history[0].deleteMarker && history[0].latest
+			assert history[1].version == two.version && !history[1].latest
+			assert history[2].version == one.version && history[2].size == 3
+
+			try bucket.delete("doc", history[0].version)
+			assert (try (try bucket.get("doc")).text()) == "two"
+			try bucket.versioning(false)
+			assert !(try bucket.versioning())
+			try wipe(store, "adm-test-versions")
+			return none
+		}
+
+		@test()
+		def TestBucketSettings() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-settings")
+			assert (try bucket.policy()) is none
+			let policy = "\{\"Version\":\"2012-10-17\",\"Statement\":[\{\"Effect\":\"Allow\",\"Principal\":\{\"AWS\":[\"*\"]\},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::adm-test-settings/public/*\"]\}]\}"
+			try bucket.policy(policy)
+			let stored = try bucket.policy()
+			fail "no policy" when stored is none
+			assert stored.contains("s3:GetObject")
+			// The policy opens `public/` to requests without a signature.
+			try bucket.put("public/hello.txt", "open")
+			let open = try http.get("{testServer.replace(/\/\/[^@]*@/, "//")}/adm-test-settings/public/hello.txt")
+			assert open.status == 200
+			assert (try open.text()) == "open"
+			try bucket.policy(none)
+			assert (try bucket.policy()) is none
+
+			assert (try bucket.tagging()).len() == 0
+			try bucket.tagging({"env": "test"})
+			assert (try bucket.tagging())["env"] == "test"
+			let none_ map<string, string>
+			try bucket.tagging(none_)
+			assert (try bucket.tagging()).len() == 0
+
+			assert (try bucket.configuration("lifecycle")) is none
+			try bucket.configuration("lifecycle", "<LifecycleConfiguration><Rule><ID>old-logs</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>")
+			let rules = try bucket.configuration("lifecycle")
+			fail "no lifecycle" when rules is none
+			assert rules.contains("old-logs")
+			try bucket.configuration("lifecycle", none)
+			assert (try bucket.configuration("lifecycle")) is none
+
+			let res = try store.request("get", "adm-test-settings", query = {"location": ""})
+			assert (try res.text()).contains("LocationConstraint")
+			try wipe(store, "adm-test-settings")
+			return none
+		}
+	}
+
+	check "Multipart" {
+		@test()
+		def TestParts() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-parts")
+			let head = pattern(5 * 1024 * 1024)
+			let tail = pattern(1234)
+			let upload = try bucket.multipart("joined.bin", "application/x-test", WriteOptions{metadata: {"how": "parts"}})
+			let pending = try bucket.uploads()
+			assert pending.len() == 1
+			assert pending[0].key == "joined.bin" && pending[0].id == upload.id
+
+			let second = try upload.part(2, tail)
+			let first = try upload.part(1, head)
+			let listed = try bucket.resume("joined.bin", upload.id).parts()
+			assert listed.len() == 2
+			assert listed[0].number == 1 && listed[0].size == head.len() && listed[0].etag == first.etag
+			let done = try upload.complete([second, first])
+			assert done.etag.endsWith("-2")
+			assert done.parts == 2
+			assert (try bucket.uploads()).len() == 0
+
+			let info = try bucket.info("joined.bin")
+			fail "no info" when info is none
+			assert info.size == head.len() + tail.len()
+			assert info.contentType == "application/x-test"
+			assert info.metadata["how"] == "parts"
+			let back = try (try bucket.get("joined.bin")).bytes()
+			let whole byte[] = []
+			whole.push(...head)
+			whole.push(...tail)
+			assert sha256Hex(back) == sha256Hex(whole)
+			let partTwo = try bucket.get("joined.bin", ReadOptions{part: 2})
+			assert partTwo.length == tail.len()
+			try partTwo.close()
+
+			// Parts filled from an object already stored.
+			let copy = try bucket.multipart("copied.bin")
+			let whole1 = try copy.copyPart(1, "joined.bin", length = head.len())
+			let rest = try copy.copyPart(2, "joined.bin", offset = head.len(), length = tail.len())
+			try copy.complete([whole1, rest])
+			assert sha256Hex(try (try bucket.get("copied.bin")).bytes()) == sha256Hex(whole)
+
+			let dropped = try bucket.multipart("dropped.bin")
+			try dropped.part(1, tail)
+			try dropped.abort()
+			try dropped.abort()
+			assert (try bucket.uploads()).len() == 0
+			let kind = ErrorKind.Server
+			dropped.part(2, tail) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover first
+			}
+			assert kind == ErrorKind.NoUpload
+			try wipe(store, "adm-test-parts")
+			return none
+		}
+
+		@test()
+		def TestUpload() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			store.partSize = 5 * 1024 * 1024
+			store.uploadTasks = 3
+			try store.connect(testServer)
+			let bucket = try fresh(store, "adm-test-upload")
+			let small = pattern(70000)
+			let one = try bucket.upload("small.bin", new bytes.Buffer(small), "application/octet-stream")
+			assert one.parts == 0
+			assert sha256Hex(try (try bucket.get("small.bin")).bytes()) == sha256Hex(small)
+
+			// Five parts, the last one short, three in flight.
+			let large = pattern(22 * 1024 * 1024 + 17)
+			let many = try bucket.upload("large.bin", new bytes.Buffer(large), "application/octet-stream", WriteOptions{metadata: {"via": "upload"}})
+			assert many.parts == 5
+			assert many.size == large.len()
+			assert many.etag.endsWith("-5")
+			let info = try bucket.info("large.bin")
+			fail "no info" when info is none
+			assert info.size == large.len()
+			assert info.metadata["via"] == "upload"
+			assert sha256Hex(try (try bucket.get("large.bin")).bytes()) == sha256Hex(large)
+
+			// Exactly two full parts.
+			let even = pattern(10 * 1024 * 1024)
+			let two = try bucket.upload("even.bin", new bytes.Buffer(even))
+			assert two.parts == 2
+			assert (try bucket.uploads()).len() == 0
+			try wipe(store, "adm-test-upload")
+			return none
+		}
+	}
+
+	check "Presigned" {
+		@test()
+		def TestLinks() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-links")
+			try bucket.put("shared/a b.txt", "by link", "text/plain")
+			let link = try bucket.presign("shared/a b.txt", 5min)
+			let res = try http.get(link)
+			assert res.status == 200
+			assert (try res.text()) == "by link"
+			// Without the signature the same address is refused.
+			let bare = try http.get(link.slice(0, link.indexOf("?")))
+			assert bare.status == 403
+			try bare.close()
+			let named = try bucket.presign("shared/a b.txt", 5min, params = {"response-content-disposition": "attachment; filename=\"b.txt\""})
+			let download = try http.get(named)
+			assert download.status == 200
+			assert download.headers.get("Content-Disposition") == "attachment; filename=\"b.txt\""
+			try download.close()
+
+			let drop = try bucket.presign("inbox/scan.txt", 5min, http.Method.PUT, headers = {"Content-Type": "text/plain; charset=utf-8"})
+			let client = new http.Client()
+			let put = try client.put(drop, "text/plain", "dropped".bytes())
+			assert put.status == 200
+			try put.close()
+			assert (try (try bucket.get("inbox/scan.txt")).text()) == "dropped"
+			// Another content type than the one signed is refused.
+			let wrong = try client.put(drop, "image/png", "nope".bytes())
+			assert wrong.status == 403
+			try wrong.close()
+			try wipe(store, "adm-test-links")
+			return none
+		}
+
+		@test()
+		def TestPostForm() !none {
+			return none when testServer == ""
+			let store = try testClient()
+			let bucket = try fresh(store, "adm-test-form")
+			let form = try bucket.postForm("uploads/$\{filename\}", 5min, 1024, "text/plain")
+			let boundary = "adm-test-boundary-7f3a"
+			let body = ""
+			for let (field, value) in form.fields {
+				body += "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+			}
+			let file = "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"note.txt\"\r\nContent-Type: text/plain\r\n\r\n"
+			let client = new http.Client()
+			let sent = try client.post(form.url, "multipart/form-data; boundary={boundary}", "{body}{file}from a form\r\n--{boundary}--\r\n".bytes())
+			assert sent.status == 204
+			try sent.close()
+			assert (try (try bucket.get("uploads/note.txt")).text()) == "from a form"
+			// Over the size the policy allows.
+			let large = "x".repeat(2000)
+			let refused = try client.post(form.url, "multipart/form-data; boundary={boundary}", "{body}{file}{large}\r\n--{boundary}--\r\n".bytes())
+			assert refused.status == 400
+			try refused.close()
+			try wipe(store, "adm-test-form")
+			return none
+		}
+	}
+}

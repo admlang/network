@@ -1,0 +1,177 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// StreamEntry is one entry of a stream.
+	struct StreamEntry {
+		// `milliseconds-sequence`, as the server assigned or the writer gave.
+		id     string
+		fields map<string, string>
+	}
+
+	// PendingEntry is an entry a consumer group delivered and nobody
+	// acknowledged yet.
+	struct PendingEntry {
+		id         string
+		consumer   string
+		// How long ago it was last delivered.
+		idle       duration
+		deliveries int
+	}
+
+	// Claimed is what `xautoClaim` took over.
+	struct Claimed {
+		// Where the next call goes on; `0-0` when the walk is over.
+		next    string
+		entries StreamEntry[]
+	}
+
+	// Commands on streams. Each fails with a RedisError as `command` does,
+	// and with ErrorKind.WrongType when the key holds another kind of value.
+	partial type Client {
+		// Appends an entry and returns its id. `id` "*" lets the server
+		// assign one. `maxLen` > 0 trims the stream to about that many
+		// entries (to exactly that many with `exact`). Fails with the
+		// server's error when `id` is not above the last entry's.
+		def xadd(key string, fields map<string, any>, id string = "*", maxLen int = 0, exact bool = false) !string {
+			fail errorOf(ErrorKind.Argument, "redis: xadd needs at least one field") when fields.len() == 0
+			let args any[] = ["XADD", key]
+			args.push("MAXLEN", exact ?? ("=", "~"), maxLen) when maxLen > 0
+			args.push(id)
+			return (try call(timeout, ...joinedPairs(args, fields))).text()
+		}
+
+		// How many entries the stream has.
+		// Fails as `command` does.
+		def xlen(key string) !int {
+			return (try call(timeout, "XLEN", key)).toInt()
+		}
+
+		// Deletes entries. Returns how many existed.
+		// Fails as `command` does.
+		def xdel(key string, ids ...string) !int {
+			return (try call(timeout, ...joined(["XDEL", key], ids))).toInt()
+		}
+
+		// Trims the stream to about `maxLen` entries (to exactly that many
+		// with `exact`). Returns how many it removed.
+		// Fails as `command` does.
+		def xtrim(key string, maxLen int, exact bool = false) !int {
+			return (try call(timeout, "XTRIM", key, "MAXLEN", exact ?? ("=", "~"), maxLen)).toInt()
+		}
+
+		// The entries with ids from `start` to `end`, both included, oldest
+		// first (newest first with `reverse`); `-` and `+` stand for the
+		// first and the last id, `(id` excludes a bound. `count` > 0 returns
+		// that many.
+		// Fails as `command` does.
+		def xrange(key string, start string = "-", end string = "+", count int = 0, reverse bool = false) !StreamEntry[] {
+			let args any[] = reverse ?? (["XREVRANGE", key, end, start], ["XRANGE", key, start, end])
+			args.push("COUNT", count) when count > 0
+			return entriesOf(try call(timeout, ...args))
+		}
+
+		// The entries after an id in each stream, by stream; `$` as an id
+		// means those added from now on. `wait` makes the server hold the
+		// call until an entry arrives or the wait ends (0s: without end).
+		// Streams with nothing new are left out.
+		// Fails as `command` does.
+		def xread(streams map<string, string>, count int = 0, wait ?duration = none) !map<string, StreamEntry[]> {
+			let args any[] = ["XREAD"]
+			return streamsOf(try call(readOptions(args, streams, count, wait), ...args))
+		}
+
+		// Creates a consumer group that starts after `id` (`$`: with the
+		// entries added from now on, `0`: with the whole stream).
+		// `makeStream` creates the stream when it does not exist. Fails with
+		// the server's error (BUSYGROUP) when the group exists.
+		def xgroupCreate(key string, group string, id string = "$", makeStream bool = false) !none {
+			let args any[] = ["XGROUP", "CREATE", key, group, id]
+			args.push("MKSTREAM") when makeStream
+			try call(timeout, ...args)
+			return none
+		}
+
+		// Deletes a consumer group. False when there was none.
+		// Fails as `command` does.
+		def xgroupDestroy(key string, group string) !bool {
+			return (try call(timeout, "XGROUP", "DESTROY", key, group)).toBool()
+		}
+
+		// Removes a consumer from a group. Returns how many pending entries
+		// it had.
+		// Fails as `command` does.
+		def xgroupDelConsumer(key string, group string, consumer string) !int {
+			return (try call(timeout, "XGROUP", "DELCONSUMER", key, group, consumer)).toInt()
+		}
+
+		// Reads as a consumer of a group: with `>` as a stream's id the
+		// entries no consumer of the group got yet, with another id this
+		// consumer's own pending entries after it. Entries read are pending
+		// until `xack`, unless `noAck`. `count` and `wait` as in `xread`.
+		// Fails as `command` does.
+		def xreadGroup(group string, consumer string, streams map<string, string>, count int = 0, wait ?duration = none, noAck bool = false) !map<string, StreamEntry[]> {
+			let args any[] = ["XREADGROUP", "GROUP", group, consumer]
+			args.push("NOACK") when noAck
+			return streamsOf(try call(readOptions(args, streams, count, wait), ...args))
+		}
+
+		// Acknowledges entries of a group. Returns how many were pending.
+		// Fails as `command` does.
+		def xack(key string, group string, ids ...string) !int {
+			return (try call(timeout, ...joined(["XACK", key, group], ids))).toInt()
+		}
+
+		// Up to `count` pending entries of a group with ids from `start` to
+		// `end`, those of one consumer when given.
+		// Fails as `command` does.
+		def xpending(key string, group string, count int = 10, start string = "-", end string = "+", consumer string = "") !PendingEntry[] {
+			let args any[] = ["XPENDING", key, group, start, end, count]
+			args.push(consumer) when consumer != ""
+			let reply = try call(timeout, ...args)
+			let out PendingEntry[] = []
+			for let item in reply.items {
+				continue when item.items.len() < 4
+				out.push(PendingEntry{id: item.items[0].text(), consumer: item.items[1].text(), idle: duration(item.items[2].toInt() * 1000000), deliveries: item.items[3].toInt()})
+			}
+			return out
+		}
+
+		// Makes a consumer the owner of pending entries that were last
+		// delivered at least `minIdle` ago, and returns those it took.
+		// Fails as `command` does.
+		def xclaim(key string, group string, consumer string, minIdle duration, ids ...string) !StreamEntry[] {
+			return entriesOf(try call(timeout, ...joined(["XCLAIM", key, group, consumer, millis(minIdle)], ids)))
+		}
+
+		// As `xclaim` for the pending entries from `start` on, without
+		// naming them; `count` > 0 takes that many. Go on with the `next`
+		// it returns.
+		// Fails as `command` does.
+		def xautoClaim(key string, group string, consumer string, minIdle duration, start string = "0-0", count int = 0) !Claimed {
+			let args any[] = ["XAUTOCLAIM", key, group, consumer, millis(minIdle), start]
+			args.push("COUNT", count) when count > 0
+			let reply = try call(timeout, ...args)
+			fail errorOf(ErrorKind.Protocol, "redis: an XAUTOCLAIM reply without a cursor and entries") when reply.items.len() < 2
+			return Claimed{next: reply.items[0].text(), entries: entriesOf(reply.items[1])}
+		}
+
+		// Adds COUNT, BLOCK and the streams to a read's arguments and
+		// returns how long its reply may take.
+		internal def readOptions(args any[], streams map<string, string>, count int, wait ?duration) duration {
+			let patient = timeout
+			args.push("COUNT", count) when count > 0
+			if !(wait is none) {
+				args.push("BLOCK", millis(wait))
+				patient = patience(timeout, wait)
+			}
+			args.push("STREAMS")
+			for let (key, _) in streams {
+				args.push(key)
+			}
+			for let (_, id) in streams {
+				args.push(id)
+			}
+			return patient
+		}
+	}
+}

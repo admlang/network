@@ -1,0 +1,134 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// Commands on hashes. Each fails with a RedisError as `command` does,
+	// and with ErrorKind.WrongType when the key holds another kind of value.
+	partial type Client {
+		// Sets one field. Reports whether the field is new.
+		// Fails as `command` does.
+		def hset(key string, field string, value any) !bool {
+			return (try call(timeout, "HSET", key, field, value)).toBool()
+		}
+
+		// Sets several fields. Returns how many are new.
+		// Fails as `command` does.
+		def hset(key string, values map<string, any>) !int {
+			return 0 when values.len() == 0
+			return (try call(timeout, ...joinedPairs(["HSET", key], values))).toInt()
+		}
+
+		// Sets a field unless it exists. Reports whether it wrote.
+		// Fails as `command` does.
+		def hsetNx(key string, field string, value any) !bool {
+			return (try call(timeout, "HSETNX", key, field, value)).toBool()
+		}
+
+		// The value of a field, none when the field or the key is missing.
+		// Fails as `command` does.
+		def hget(key string, field string) !?string {
+			return optional(try call(timeout, "HGET", key, field))
+		}
+
+		// The values of several fields, by field; missing ones are left out.
+		// Fails as `command` does.
+		def hmget(key string, fields ...string) !map<string, string> {
+			let out = new map<string, string>()
+			return out when fields.len() == 0
+			let reply = try call(timeout, ...joined(["HMGET", key], fields))
+			for let (i, item) in reply.items {
+				out.set(fields[i], item.text()) unless item.isNull()
+			}
+			return out
+		}
+
+		// Every field and its value; empty when the key does not exist.
+		// Fails as `command` does.
+		def hgetAll(key string) !map<string, string> {
+			return textMap(try call(timeout, "HGETALL", key))
+		}
+
+		// Deletes fields. Returns how many existed.
+		// Fails as `command` does.
+		def hdel(key string, fields ...string) !int {
+			return (try call(timeout, ...joined(["HDEL", key], fields))).toInt()
+		}
+
+		// Whether a field exists.
+		// Fails as `command` does.
+		def hexists(key string, field string) !bool {
+			return (try call(timeout, "HEXISTS", key, field)).toBool()
+		}
+
+		// The names of the fields.
+		// Fails as `command` does.
+		def hkeys(key string) !string[] {
+			return (try call(timeout, "HKEYS", key)).strings()
+		}
+
+		// The values of the fields.
+		// Fails as `command` does.
+		def hvals(key string) !string[] {
+			return (try call(timeout, "HVALS", key)).strings()
+		}
+
+		// How many fields the hash has.
+		// Fails as `command` does.
+		def hlen(key string) !int {
+			return (try call(timeout, "HLEN", key)).toInt()
+		}
+
+		// The length in bytes of a field's value, 0 when it is missing.
+		// Fails as `command` does.
+		def hstrlen(key string, field string) !int {
+			return (try call(timeout, "HSTRLEN", key, field)).toInt()
+		}
+
+		// Adds `by` to the number a field holds (0 when missing) and
+		// returns the result. Fails with the server's error when the value
+		// is not an integer.
+		def hincr(key string, field string, by int = 1) !int {
+			return (try call(timeout, "HINCRBY", key, field, by)).toInt()
+		}
+
+		// Adds `by` to the float a field holds and returns the result.
+		// Fails with the server's error when the value is not a number.
+		def hincrFloat(key string, field string, by float) !float {
+			return (try call(timeout, "HINCRBYFLOAT", key, field, by)).toFloat()
+		}
+
+		// Field names picked at random: `count` different ones, or with a
+		// negative count that many with repeats allowed.
+		// Fails as `command` does.
+		def hrandField(key string, count int = 1) !string[] {
+			return (try call(timeout, "HRANDFIELD", key, count)).strings()
+		}
+
+		// Makes fields expire after `ttl` (Redis 7.4). Returns, per field,
+		// 1 when the expiry was set, 2 when the field was deleted because
+		// the time has passed, -2 when the field does not exist.
+		// Fails as `command` does.
+		def hexpire(key string, ttl duration, fields ...string) !int[] {
+			let args any[] = ["HPEXPIRE", key, millis(ttl), "FIELDS", fields.len()]
+			return ints(try call(timeout, ...joined(args, fields)))
+		}
+
+		// How long a field has left (Redis 7.4); none when it does not
+		// exist or never expires.
+		// Fails as `command` does.
+		def httl(key string, field string) !?duration {
+			let reply = try call(timeout, "HPTTL", key, "FIELDS", 1, field)
+			let left = reply.items.len() > 0 ?? (reply.items[0].toInt(), -2)
+			return none when left < 0
+			return duration(left * 1000000)
+		}
+
+		// Removes the expiry of fields (Redis 7.4). Returns, per field, 1
+		// when it was removed, -1 when the field had none, -2 when the field
+		// does not exist.
+		// Fails as `command` does.
+		def hpersist(key string, fields ...string) !int[] {
+			let args any[] = ["HPERSIST", key, "FIELDS", fields.len()]
+			return ints(try call(timeout, ...joined(args, fields)))
+		}
+	}
+}

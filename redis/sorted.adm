@@ -1,0 +1,255 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// Commands on sorted sets. Each fails with a RedisError as `command`
+	// does, and with ErrorKind.WrongType when the key holds another kind of
+	// value.
+	partial type Client {
+		// Adds a member with a score, or sets the score of one that is
+		// there. Reports whether the member is new.
+		// Fails as `command` does.
+		def zadd(key string, member any, score float) !bool {
+			return (try call(timeout, "ZADD", key, score, member)).toBool()
+		}
+
+		// Adds members with their scores. `mode` limits it to new members or
+		// to those already there. Returns how many are new, or with
+		// `changed` how many are new or got another score.
+		// Fails as `command` does.
+		def zadd(key string, members map<string, float>, mode SetMode = SetMode.Always, changed bool = false) !int {
+			return 0 when members.len() == 0
+			let args any[] = ["ZADD", key]
+			args.push("NX") when mode == SetMode.IfMissing
+			args.push("XX") when mode == SetMode.IfExists
+			args.push("CH") when changed
+			for let (member, score) in members {
+				args.push(score)
+				args.push(member)
+			}
+			return (try call(timeout, ...args)).toInt()
+		}
+
+		// Removes members. Returns how many were there.
+		// Fails as `command` does.
+		def zrem(key string, members ...any) !int {
+			return (try call(timeout, ...joinedAny(["ZREM", key], members))).toInt()
+		}
+
+		// A member's score, none when it is not in the set.
+		// Fails as `command` does.
+		def zscore(key string, member any) !?float {
+			let reply = try call(timeout, "ZSCORE", key, member)
+			return none when reply.isNull()
+			return reply.toFloat()
+		}
+
+		// Adds `by` to a member's score (0 when missing) and returns the
+		// result.
+		// Fails as `command` does.
+		def zincr(key string, member any, by float = 1.0) !float {
+			return (try call(timeout, "ZINCRBY", key, by, member)).toFloat()
+		}
+
+		// How many members the set has.
+		// Fails as `command` does.
+		def zcard(key string) !int {
+			return (try call(timeout, "ZCARD", key)).toInt()
+		}
+
+		// How many members have a score from `min` to `max`, both included.
+		// Fails as `command` does.
+		def zcount(key string, min float, max float) !int {
+			return (try call(timeout, "ZCOUNT", key, min, max)).toInt()
+		}
+
+		// A member's position counting from the lowest score (from the
+		// highest with `reverse`), none when it is not in the set.
+		// Fails as `command` does.
+		def zrank(key string, member any, reverse bool = false) !?int {
+			let reply = try call(timeout, reverse ?? ("ZREVRANK", "ZRANK"), key, member)
+			return none when reply.isNull()
+			return reply.toInt()
+		}
+
+		// The members at positions `start` to `stop`, both included, from
+		// the lowest score (from the highest with `reverse`); negative
+		// positions count from the end. The defaults return every member.
+		// Fails as `command` does.
+		def zrange(key string, start int = 0, stop int = -1, reverse bool = false) !string[] {
+			let args any[] = ["ZRANGE", key, start, stop]
+			args.push("REV") when reverse
+			return (try call(timeout, ...args)).strings()
+		}
+
+		// As `zrange`, with each member's score.
+		// Fails as `command` does.
+		def zrangeScored(key string, start int = 0, stop int = -1, reverse bool = false) !Scored[] {
+			let args any[] = ["ZRANGE", key, start, stop]
+			args.push("REV") when reverse
+			args.push("WITHSCORES")
+			return scoredOf(try call(timeout, ...args))
+		}
+
+		// The members with a score from `min` to `max`, both included, with
+		// their scores, lowest first (highest first with `reverse`); `limit`
+		// > 0 returns that many from `offset`.
+		// Fails as `command` does.
+		def zrangeByScore(key string, min float, max float, reverse bool = false, offset int = 0, limit int = 0) !Scored[] {
+			let args any[] = ["ZRANGE", key]
+			if reverse {
+				args.push(max, min, "BYSCORE", "REV")
+			} else {
+				args.push(min, max, "BYSCORE")
+			}
+			args.push("LIMIT", offset, limit) when limit > 0
+			args.push("WITHSCORES")
+			return scoredOf(try call(timeout, ...args))
+		}
+
+		// The members between two bounds in byte order, for a set whose
+		// members share one score. A bound is `[text` (included), `(text`
+		// (excluded), `-` or `+` (no bound).
+		// Fails as `command` does.
+		def zrangeByLex(key string, min string = "-", max string = "+", reverse bool = false, offset int = 0, limit int = 0) !string[] {
+			let args any[] = ["ZRANGE", key]
+			if reverse {
+				args.push(max, min, "BYLEX", "REV")
+			} else {
+				args.push(min, max, "BYLEX")
+			}
+			args.push("LIMIT", offset, limit) when limit > 0
+			return (try call(timeout, ...args)).strings()
+		}
+
+		// Removes and returns up to `count` members with the lowest scores.
+		// Fails as `command` does.
+		def zpopMin(key string, count int = 1) !Scored[] {
+			return scoredOf(try call(timeout, "ZPOPMIN", key, count))
+		}
+
+		// Removes and returns up to `count` members with the highest scores.
+		// Fails as `command` does.
+		def zpopMax(key string, count int = 1) !Scored[] {
+			return scoredOf(try call(timeout, "ZPOPMAX", key, count))
+		}
+
+		// Waits up to `wait` (0s: without end) for a member in one of the
+		// sets and removes the one with the lowest score. Returns the set it
+		// came from, the member and its score; none when the wait ends
+		// first.
+		// Fails as `command` does.
+		def bzpopMin(keys string[], wait duration) !?Popped {
+			return poppedScored(try call(patience(timeout, wait), ...joined(["BZPOPMIN"], keys), seconds(wait)))
+		}
+
+		// As `bzpopMin`, taking the member with the highest score.
+		// Fails as `command` does.
+		def bzpopMax(keys string[], wait duration) !?Popped {
+			return poppedScored(try call(patience(timeout, wait), ...joined(["BZPOPMAX"], keys), seconds(wait)))
+		}
+
+		// Removes the members at positions `start` to `stop`. Returns how
+		// many.
+		// Fails as `command` does.
+		def zremRangeByRank(key string, start int, stop int) !int {
+			return (try call(timeout, "ZREMRANGEBYRANK", key, start, stop)).toInt()
+		}
+
+		// Removes the members with a score from `min` to `max`. Returns how
+		// many.
+		// Fails as `command` does.
+		def zremRangeByScore(key string, min float, max float) !int {
+			return (try call(timeout, "ZREMRANGEBYSCORE", key, min, max)).toInt()
+		}
+
+		// The members of any of the sets, each with the sum of its scores.
+		// Fails as `command` does.
+		def zunion(keys ...string) !Scored[] {
+			let args any[] = ["ZUNION", keys.len()]
+			joined(args, keys)
+			args.push("WITHSCORES")
+			return scoredOf(try call(timeout, ...args))
+		}
+
+		// The members all the sets share, each with the sum of its scores.
+		// Fails as `command` does.
+		def zinter(keys ...string) !Scored[] {
+			let args any[] = ["ZINTER", keys.len()]
+			joined(args, keys)
+			args.push("WITHSCORES")
+			return scoredOf(try call(timeout, ...args))
+		}
+
+		// Stores `zunion` of the sets in `to`. Returns its size.
+		// Fails as `command` does.
+		def zunionStore(to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["ZUNIONSTORE", to, keys.len()], keys))).toInt()
+		}
+
+		// Stores `zinter` of the sets in `to`. Returns its size.
+		// Fails as `command` does.
+		def zinterStore(to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["ZINTERSTORE", to, keys.len()], keys))).toInt()
+		}
+
+		// Adds a place to a geographic index. Reports whether it is new.
+		// Fails with the server's error for coordinates out of range.
+		def geoAdd(key string, member string, longitude float, latitude float) !bool {
+			return (try call(timeout, "GEOADD", key, longitude, latitude, member)).toBool()
+		}
+
+		// Where a place is, none when it is not in the index.
+		// Fails as `command` does.
+		def geoPos(key string, member string) !?GeoPoint {
+			let reply = try call(timeout, "GEOPOS", key, member)
+			return none when reply.items.len() == 0 || reply.items[0].items.len() < 2
+			let at = reply.items[0]
+			return GeoPoint{longitude: at.items[0].toFloat(), latitude: at.items[1].toFloat()}
+		}
+
+		// The distance between two places in `unit` (`m`, `km`, `mi`,
+		// `ft`), none when one of them is not in the index.
+		// Fails as `command` does.
+		def geoDist(key string, a string, b string, unit string = "m") !?float {
+			let reply = try call(timeout, "GEODIST", key, a, b, unit)
+			return none when reply.isNull()
+			return reply.toFloat()
+		}
+
+		// The places within `radius` of a point, nearest first, with their
+		// distance from it in `unit`; `count` > 0 returns that many.
+		// Fails as `command` does.
+		def geoSearch(key string, longitude float, latitude float, radius float, unit string = "m", count int = 0) !GeoHit[] {
+			let args any[] = ["GEOSEARCH", key, "FROMLONLAT", longitude, latitude, "BYRADIUS", radius, unit, "ASC"]
+			args.push("COUNT", count) when count > 0
+			args.push("WITHCOORD", "WITHDIST")
+			let reply = try call(timeout, ...args)
+			let out GeoHit[] = []
+			for let item in reply.items {
+				continue when item.items.len() < 3 || item.items[2].items.len() < 2
+				let at = item.items[2]
+				out.push(GeoHit{member: item.items[0].text(), distance: item.items[1].toFloat(), longitude: at.items[0].toFloat(), latitude: at.items[1].toFloat()})
+			}
+			return out
+		}
+	}
+
+	// GeoPoint is a position on Earth in degrees.
+	struct GeoPoint {
+		longitude float
+		latitude  float
+	}
+
+	// GeoHit is a place `geoSearch` found and its distance from the centre.
+	struct GeoHit {
+		member    string
+		distance  float
+		longitude float
+		latitude  float
+	}
+
+	internal def poppedScored(reply Value) ?Popped {
+		return none when reply.isNull() || reply.items.len() < 3
+		return Popped{key: reply.items[0].text(), value: reply.items[1].text(), score: reply.items[2].toFloat()}
+	}
+}

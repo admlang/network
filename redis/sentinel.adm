@@ -1,0 +1,229 @@
+// Redis Sentinel: asking a group of sentinels which server is the master
+// of a name, and asking again when that server stops being it.
+internal partial module adm.network.redis.resp {
+	use (
+		std.sync
+		std.time
+		adm.network.redis::*
+	)
+
+	def dialed(target Target) !?Conn {
+		return try dial(target)
+	}
+
+	def opened(pool Pool, target Target, limit int) !?Conn {
+		return try pool.open(target, limit)
+	}
+
+	// SentinelLink sends commands to the master the sentinels name.
+	type SentinelLink {
+		base        Target
+		limit       int
+		// The name the sentinels watch the master under.
+		master      string
+		// Guards `sentinels`, `pool` and `generation`.
+		lock        sync.Mutex
+		// One search for the master at a time.
+		resolving   sync.Mutex
+		// The sentinels to ask, the one that answered last first.
+		sentinels   Target[]
+		pool        ?Pool
+		// Counts the masters found, so a task knows another one already
+		// looked.
+		generation  int
+		atomic shut bool       = false
+
+		def new(base Target, master string, sentinels Target[], limit int) {
+			self.base = base
+			self.master = master
+			self.sentinels = sentinels
+			self.limit = limit
+			lock = new sync.Mutex()
+			resolving = new sync.Mutex()
+		}
+
+		def current() (?Pool, int) {
+			lock.lock()
+			let now = pool
+			let seen = generation
+			lock.unlock()
+			return (now, seen)
+		}
+
+		// resolve asks the sentinels in turn for the master's address and
+		// opens a pool to it; the server must say it is a master. `seen`
+		// is the generation the caller found wanting: when another task
+		// resolved since, its result is returned.
+		// Fails with a RedisError of ErrorKind.Connection when no sentinel
+		// answers or none names a master that does.
+		def resolve(seen int) !Pool {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+			resolving.lock()
+			let (now, at) = current()
+			if at != seen && !(now is none) {
+				resolving.unlock()
+				return now
+			}
+			lock.lock()
+			let asked = sentinels.clone()
+			lock.unlock()
+			let reason = "no sentinel answers"
+			for let (i, sentinel) in asked {
+				let conn = dialed(sentinel) onerror (err error) {
+					reason = err.message.trimPrefix("redis: ")
+					recover none
+				}
+				continue when conn is none
+				let answer = one(conn, sentinel.timeout, "SENTINEL", "get-master-addr-by-name", master) onerror recover new Value()
+				let others = one(conn, sentinel.timeout, "SENTINEL", "sentinels", master) onerror recover new Value()
+				conn.close()
+				if answer.isError() || answer.items.len() < 2 {
+					reason = answer.isError() ?? (answer.text(), "{sentinel.host}:{sentinel.port} knows no master '{master}'")
+					continue
+				}
+				let target = retarget(base, answer.items[0].text(), answer.items[1].toInt())
+				target.role = "master"
+				let next = new Pool()
+				let first = opened(next, target, limit) onerror (err error) {
+					reason = err.message.trimPrefix("redis: ")
+					recover none
+				}
+				continue when first is none
+				next.giveBack(first)
+				adopt(next, asked, i, others)
+				resolving.unlock()
+				return next
+			}
+			resolving.unlock()
+			fail errorOf(ErrorKind.Connection, "redis: the sentinels name no master '{master}' that answers: {reason}")
+		}
+
+		// Makes a pool the current one, puts the sentinel that named it
+		// first and adds the sentinels it knows of.
+		def adopt(next Pool, asked Target[], winner int, others Value) {
+			let order Target[] = [asked[winner]]
+			for let (i, sentinel) in asked {
+				order.push(sentinel) unless i == winner
+			}
+			for let other in others.items {
+				let ip = other.get("ip")
+				let port = other.get("port")
+				continue when ip is none || port is none
+				let known = false
+				for let sentinel in order {
+					known = true when sentinel.host == ip.text() && sentinel.port == port.toInt()
+				}
+				continue when known
+				let more = retarget(asked[winner], ip.text(), port.toInt())
+				order.push(more)
+			}
+			lock.lock()
+			let old = pool
+			pool = next
+			generation++
+			sentinels = order
+			lock.unlock()
+			next.close() when shut
+			old.close() unless old is none
+		}
+
+		// A connection to the master, looking for the new one for as long
+		// as a failover may take when the old one is gone.
+		// Fails with a RedisError as `resolve` and `Pool.borrow` do.
+		def lease() !Hold {
+			let started = time.now()
+			let reason = ""
+			for let hop = 0;; hop++ {
+				fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+				let (now, seen) = current()
+				if !(now is none) {
+					let got = try reach(now)
+					let conn = got.conn
+					return Hold{pool: now, conn: conn} unless conn is none
+					// Nothing was sent: the master is gone or is one no
+					// more, and the sentinels are asked who is.
+					reason = got.reason
+				}
+				let found = found(seen) onerror (err error) {
+					reason = err.message.trimPrefix("redis: ")
+					recover none
+				}
+				continue unless found is none
+				fail errorOf(ErrorKind.Connection, "redis: no master '{master}' within {base.connectTimeout}: {reason}") when time.now().since(started) > base.connectTimeout
+				time.sleep(duration(int(50ms) * (1 << hop.min(4))))
+			}
+			fail errorOf(ErrorKind.Connection, "redis: no master '{master}'")
+		}
+
+		def found(seen int) !?Pool {
+			return try resolve(seen)
+		}
+
+		def call(wait duration, args any[]) !Value {
+			let batch = new Batch()
+			try batch.add(args)
+			let started = time.now()
+			for {
+				let (_, seen) = current()
+				let held = try lease()
+				let replies = try sendOnce(held.pool, held.conn, batch, wait)
+				// The server dropped the connection while it sat idle, as a
+				// master does when it is made a replica: the next lease
+				// finds out.
+				continue when replies is none
+				let reply = replies[0]
+				return reply unless reply.isError()
+				let failure = serverError(reply.text())
+				// A master that became a replica refuses the write without
+				// running it: it goes to the new master.
+				fail failure unless failure.prefix == "READONLY" && time.now().since(started) <= base.connectTimeout
+				found(seen) onerror recover none
+				time.sleep(100ms)
+			}
+			fail errorOf(ErrorKind.Connection, "redis: no master '{master}'")
+		}
+
+		def run(commands any[][], wait duration) !Value[] {
+			let batch = new Batch()
+			for let command in commands {
+				try batch.add(command)
+			}
+			for {
+				let held = try lease()
+				let replies = try sendOnce(held.pool, held.conn, batch, wait)
+				return replies unless replies is none
+			}
+			return Value[]
+		}
+
+		def hold(args any[], now bool) !?Hold {
+			return try lease()
+		}
+
+		def place(args any[]) !Target {
+			let held = try lease()
+			held.pool.giveBack(held.conn)
+			return held.pool.target
+		}
+
+		def pools() !Pool[] {
+			let held = try lease()
+			held.pool.giveBack(held.conn)
+			return [held.pool]
+		}
+
+		def isOpen() bool {
+			return true
+		}
+
+		def isClosed() bool {
+			return shut
+		}
+
+		def close() {
+			shut = true
+			let (now, _) = current()
+			now.close() unless now is none
+		}
+	}
+}

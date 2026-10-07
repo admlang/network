@@ -1,0 +1,13 @@
+// An S3 client as an ADM library: Signature Version 4 over std.net.http.
+@manifest(version = "0.1.0")
+library adm.network.s3 {
+	use (
+		adm.network.s3
+		adm.network.s3.sigv4
+		adm.network.s3.wire
+	)
+
+	export (
+		adm.network.s3
+	)
+}

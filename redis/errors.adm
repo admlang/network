@@ -1,0 +1,56 @@
+partial module adm.network.redis {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is RedisError`.
+	enum ErrorKind {
+		// The server cannot be reached, or the connection broke.
+		Connection  = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut    = "timeout",
+		// The client, pipeline, transaction or subscription was closed.
+		Closed      = "closed",
+		// The server sent something that is not RESP, or the client was
+		// used in a way the protocol does not allow.
+		Protocol    = "protocol",
+		// An argument or an option the client does not take.
+		Argument    = "argument",
+		// The user or password is wrong, or the user may not run the
+		// command (NOAUTH, WRONGPASS, NOPERM).
+		Denied      = "denied",
+		// The key holds another kind of value (WRONGTYPE).
+		WrongType   = "wrongtype",
+		// The script is not in the server's cache (NOSCRIPT).
+		NoScript    = "noscript",
+		// A script is running and the server answers nothing else (BUSY).
+		Busy        = "busy",
+		// The server is still loading its data (LOADING).
+		Loading     = "loading",
+		// A write was sent to a replica (READONLY).
+		ReadOnly    = "readonly",
+		// The server is out of memory (OOM).
+		OutOfMemory = "oom",
+		// The transaction was discarded: a queued command was refused
+		// (EXECABORT), or a watched key changed before `exec`.
+		Aborted     = "aborted",
+		// The key's slot is served by another node (MOVED, ASK), the keys
+		// of one command live in different slots (CROSSSLOT), or the
+		// cluster is down (CLUSTERDOWN, TRYAGAIN).
+		Cluster     = "cluster",
+		// Any other error reply.
+		Server      = "server",
+	}
+
+	// RedisError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct RedisError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorKind
+		// The first word of the server's error reply (`WRONGTYPE`, `ERR`,
+		// `MOVED`), "" when the failure is not an error reply.
+		prefix  string
+	}
+}

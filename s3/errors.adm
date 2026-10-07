@@ -1,0 +1,61 @@
+partial module adm.network.s3 {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is S3Error`.
+	enum ErrorKind {
+		// The server cannot be reached, or the connection broke.
+		Connection   = "connection",
+		// The request did not finish within the timeout.
+		TimedOut     = "timeout",
+		// An argument or an option the client does not take.
+		Argument     = "argument",
+		// The credentials are wrong or may not do this (AccessDenied,
+		// InvalidAccessKeyId, SignatureDoesNotMatch, expired tokens).
+		Denied       = "denied",
+		// The bucket does not exist (NoSuchBucket).
+		NoBucket     = "nobucket",
+		// The object or the version does not exist (NoSuchKey,
+		// NoSuchVersion).
+		NoObject     = "noobject",
+		// The multipart upload does not exist: it was completed or aborted
+		// (NoSuchUpload).
+		NoUpload     = "noupload",
+		// The bucket name is taken (BucketAlreadyExists,
+		// BucketAlreadyOwnedByYou).
+		Exists       = "exists",
+		// The bucket still holds objects (BucketNotEmpty).
+		NotEmpty     = "notempty",
+		// A condition of the request did not hold (PreconditionFailed, a
+		// conditional write that lost).
+		Precondition = "precondition",
+		// The object has not changed since the entity tag or the time the
+		// request named (304).
+		NotModified  = "notmodified",
+		// The range lies outside the object (InvalidRange).
+		Range        = "range",
+		// The server asks for fewer requests (SlowDown, 503).
+		Throttled    = "throttled",
+		// The reply is not what S3 sends.
+		Protocol     = "protocol",
+		// Any other error reply.
+		Server       = "server",
+	}
+
+	// S3Error is the payload every failure of this library carries. `code`
+	// repeats `kind.value`.
+	struct S3Error {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		// The HTTP status of the reply; 0 when there was none.
+		status     int
+		// The server's error code (`NoSuchKey`, `AccessDenied`); "" when
+		// the failure is not an error reply.
+		serverCode string
+		// The request id the server gave the request, for its logs.
+		requestId  string
+	}
+}

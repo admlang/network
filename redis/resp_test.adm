@@ -1,0 +1,200 @@
+partial module adm.network.redis {
+	use (
+		std.testing
+		adm.network.redis.resp::*
+	)
+
+	// A stream that hands out fixed bytes a few at a time and keeps what is
+	// written to it.
+	type ScriptedStream {
+		input   byte[]
+		at      int
+		// How many bytes one read gives at most.
+		step    int
+		written byte[]
+
+		def new(input string, step int) {
+			self.input = input.bytes()
+			self.step = step
+		}
+
+		def read(data byte[], timeout duration) !int {
+			let n = input.len() - at
+			n = step when n > step
+			n = data.len() when n > data.len()
+			for let i = 0; i < n; i++ {
+				data[i] = input[at + i]
+			}
+			at += n
+			return n
+		}
+
+		def write(data byte[], timeout duration) !int {
+			written.push(...data)
+			return data.len()
+		}
+
+		def close() !none {
+			return none
+		}
+
+		def isOpen() bool {
+			return true
+		}
+	}
+
+	def parse(text string, step int = 3) !Value {
+		return new Wire(new ScriptedStream(text, step), 1s).read()
+	}
+
+	def failureOf(text string) ErrorKind {
+		let kind = ErrorKind.Server
+		parse(text) onerror (err error) {
+			kind = err.kind when err is RedisError
+			recover new Value()
+		}
+		return kind
+	}
+
+	check "RESP" {
+		@test()
+		def TestCommandEncoding() !none {
+			let batch = new Batch()
+			try batch.add(["SET", "kéy", 42, 1.5, true, [byte(0), byte(13), byte(10)]])
+			try batch.add(["PING"])
+			assert batch.count == 2
+			let expected = "*6\r\n$3\r\nSET\r\n$4\r\nkéy\r\n$2\r\n42\r\n$3\r\n1.5\r\n$1\r\n1\r\n$3\r\n".bytes()
+			expected.push(byte(0), byte(13), byte(10))
+			expected.push(..."\r\n*1\r\n$4\r\nPING\r\n".bytes())
+			assert batch.data.equals(expected)
+
+			let kind = ErrorKind.Server
+			batch.add(["SET", "k", none]) onerror (err error) {
+				kind = err.kind when err is RedisError
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			batch.add([]) onerror (err error) {
+				kind = err.kind when err is RedisError
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+		}
+
+		@test()
+		def TestScalars() !none {
+			let ok = try parse("+OK\r\n")
+			assert ok.kind == ValueKind.Status && ok.text() == "OK" && ok.toBool()
+			let failed = try parse("-ERR unknown\r\n")
+			assert failed.isError() && failed.text() == "ERR unknown"
+			let n = try parse(":-1234567890123\r\n")
+			assert n.kind == ValueKind.Integer && n.toInt() == -1234567890123
+			let bulk = try parse("$5\r\nhe\r\nx\r\n")
+			assert bulk.kind == ValueKind.Bulk && bulk.text() == "he\r\nx"
+			assert (try parse("$0\r\n\r\n")).text() == ""
+			assert (try parse("$-1\r\n")).isNull()
+			assert (try parse("*-1\r\n")).isNull()
+			assert (try parse("_\r\n")).isNull()
+			assert (try parse("#t\r\n")).toBool()
+			assert !(try parse("#f\r\n")).toBool()
+			let d = try parse(",3.25\r\n")
+			assert d.kind == ValueKind.Double && d.toFloat() == 3.25
+			assert (try parse(",inf\r\n")).toFloat() > 1e300
+			assert (try parse(",-inf\r\n")).toFloat() < -1e300
+			let nan = (try parse(",nan\r\n")).toFloat()
+			assert nan != nan
+			let huge = try parse("(3492890328409238509324850943850943825024385\r\n")
+			assert huge.kind == ValueKind.BigNumber && huge.text() == "3492890328409238509324850943850943825024385"
+			let bulkError = try parse("!21\r\nSYNTAX invalid syntax\r\n")
+			assert bulkError.isError() && bulkError.text() == "SYNTAX invalid syntax"
+			let verbatim = try parse("=15\r\ntxt:Some string\r\n")
+			assert verbatim.kind == ValueKind.Verbatim && verbatim.format == "txt" && verbatim.text() == "Some string"
+		}
+
+		@test()
+		def TestAggregates() !none {
+			let list = try parse("*3\r\n:1\r\n$1\r\na\r\n*2\r\n+x\r\n_\r\n")
+			assert list.kind == ValueKind.Array && list.len() == 3
+			assert list.items[2].items[0].text() == "x" && list.items[2].items[1].isNull()
+			assert list.str() == "[(integer) 1, \"a\", [x, (nil)]]"
+			assert (try parse("*0\r\n")).len() == 0
+
+			let m = try parse("%2\r\n+first\r\n:1\r\n+second\r\n,2.5\r\n")
+			assert m.kind == ValueKind.Map && m.len() == 2
+			assert m.entries()["second"].toFloat() == 2.5
+			let first = m.get("first")
+			fail "first is none" when first is none
+			assert first.toInt() == 1
+			assert m.get("third") is none
+
+			let flat = try parse("*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n")
+			assert flat.entries()["b"].toInt() == 2
+			let pairs = try parse("*2\r\n*2\r\n$1\r\na\r\n:1\r\n*2\r\n$1\r\nb\r\n:2\r\n")
+			assert pairs.entries()["b"].toInt() == 2
+
+			let set = try parse("~2\r\n+a\r\n+b\r\n")
+			assert set.kind == ValueKind.Set && set.strings().join(",") == "a,b"
+			let push = try parse(">3\r\n+message\r\n+news\r\n$2\r\nhi\r\n")
+			assert push.kind == ValueKind.Push && push.items[2].text() == "hi"
+
+			let tagged = try parse("|1\r\n+ttl\r\n:3600\r\n$5\r\nvalue\r\n")
+			assert tagged.text() == "value"
+			let attributes = tagged.attributes
+			fail "attributes is none" when attributes is none
+			assert attributes.entries()["ttl"].toInt() == 3600
+		}
+
+		@test()
+		def TestStreamedReplies() !none {
+			let text = try parse("$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;2\r\nld\r\n;0\r\n")
+			assert text.kind == ValueKind.Bulk && text.text() == "Hello world"
+			let list = try parse("*?\r\n:1\r\n:2\r\n:3\r\n.\r\n")
+			assert list.kind == ValueKind.Array && list.len() == 3 && list.items[2].toInt() == 3
+			let m = try parse("%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n")
+			assert m.kind == ValueKind.Map && m.len() == 2 && m.entries()["b"].toInt() == 2
+		}
+
+		@test()
+		def TestReadsOfAnySize() !none {
+			let body = "x".repeat(40000)
+			let text = "*2\r\n${body.len()}\r\n{body}\r\n:7\r\n"
+			for let step in [1, 2, 5, 4096, 100000] {
+				let v = try parse(text, step)
+				assert v.len() == 2 && v.items[0].data.len() == 40000 && v.items[1].toInt() == 7
+			}
+			// Two replies in one buffer are read one at a time.
+			let wire = new Wire(new ScriptedStream("+one\r\n+two\r\n", 100), 1s)
+			assert (try wire.read()).text() == "one"
+			assert wire.buffered() == 6
+			assert (try wire.read()).text() == "two"
+		}
+
+		@test()
+		def TestMalformedReplies() !none {
+			assert failureOf("?what\r\n") == ErrorKind.Protocol
+			assert failureOf("$3\r\nabcde\r\n") == ErrorKind.Protocol
+			assert failureOf("$-7\r\n") == ErrorKind.Protocol
+			assert failureOf("$999999999999\r\n") == ErrorKind.Protocol
+			assert failureOf("*-5\r\n") == ErrorKind.Protocol
+			assert failureOf("\r\n") == ErrorKind.Protocol
+			assert failureOf("%?\r\n+a\r\n.\r\n") == ErrorKind.Protocol
+			assert failureOf("*1\r\n".repeat(400) + ":1\r\n") == ErrorKind.Protocol
+			// The stream ends in the middle of a reply.
+			assert failureOf("$10\r\nabc") == ErrorKind.Connection
+			assert failureOf("*2\r\n:1\r\n") == ErrorKind.Connection
+			assert failureOf("+" + "y".repeat(70000)) == ErrorKind.Protocol
+		}
+
+		@test()
+		def TestServerErrorKinds() {
+			assert serverError("WRONGTYPE Operation against a key").kind == ErrorKind.WrongType
+			assert serverError("NOAUTH Authentication required.").kind == ErrorKind.Denied
+			assert serverError("NOPERM no permission").prefix == "NOPERM"
+			assert serverError("MOVED 3999 127.0.0.1:6381").kind == ErrorKind.Cluster
+			assert serverError("ERR syntax error").kind == ErrorKind.Server
+			assert serverError("LOADING").prefix == "LOADING"
+			assert serverError("EXECABORT Transaction discarded").code == "aborted"
+		}
+	}
+}

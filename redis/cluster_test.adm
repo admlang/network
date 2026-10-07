@@ -1,0 +1,414 @@
+// Tests of Redis Cluster and Sentinel. The parts that need servers pass
+// without running when ADM_TEST_REDIS_CLUSTER (the address of a cluster
+// node) or ADM_TEST_REDIS_SENTINEL (`master@sentinel,sentinel`) is not
+// set. See README.md for the servers they expect.
+partial module adm.network.redis {
+	use (
+		std.testing
+		std.time
+		adm.network.redis.resp::*
+	)
+
+	@env("ADM_TEST_REDIS_CLUSTER")
+	internal const testCluster string
+
+	@env("ADM_TEST_REDIS_SENTINEL")
+	internal const testSentinel string
+
+	// "1" lets the tests stop servers for good: the cluster and the
+	// sentinel group must be set up again afterwards.
+	@env("ADM_TEST_REDIS_HARD")
+	internal const testHard string
+
+	def cluster() !Client {
+		let r = try connectCluster(testCluster)
+		try r.flushAll()
+		return r
+	}
+
+	internal def bulk(text string) Value {
+		let v = new Value(ValueKind.Bulk)
+		v.data = text.bytes()
+		return v
+	}
+
+	internal def whole(n int) Value {
+		let v = new Value(ValueKind.Integer)
+		v.number = n
+		return v
+	}
+
+	internal def list(items ...Value) Value {
+		let v = new Value(ValueKind.Array)
+		v.items = items
+		return v
+	}
+
+	internal def spots(specs map<string, KeySpec>, words ...string) string {
+		let found = keyPositions(specs, words[0].lower(), words)
+		return "ask" when found is none
+		let out string[] = []
+		for let at in found {
+			out.push(words[at])
+		}
+		return out.join(",")
+	}
+
+	// The master that serves a key's slot, and another master, as
+	// `host:port`.
+	internal def ownerAndOther(node Client, key string) !(string, string) {
+		let layout = layoutOf(try node.command("CLUSTER", "SLOTS"), "127.0.0.1", false)
+		let shard = layout.slots[slotOf(key.bytes())]
+		fail "nobody serves {key}" when shard < 0
+		return (layout.masters[shard], layout.masters[(shard + 1) % layout.masters.len()])
+	}
+
+	check "Cluster" {
+		@test()
+		def TestSlots() !none {
+			assert slotOf("123456789".bytes()) == 12739
+			assert slotOf("foo".bytes()) == 12182
+			assert slotOf("".bytes()) == 0
+			assert slotOf("\{user1000\}.following".bytes()) == slotOf("user1000".bytes())
+			assert slotOf("\{user1000\}.followers".bytes()) == 3443
+			assert slotOf("foo\{bar\}\{zap\}".bytes()) == slotOf("bar".bytes())
+			assert slotOf("foo\{\{bar\}\}zap".bytes()) == slotOf("\{bar".bytes())
+			// An empty tag, or one that is never closed, is no tag.
+			assert slotOf("foo\{\}\{bar\}".bytes()) == slotOf("foo\{\}\{bar\}".bytes())
+			assert slotOf("\{\}foo".bytes()) != slotOf("".bytes())
+			assert slotOf("foo\{bar".bytes()) != slotOf("bar".bytes())
+			return none
+		}
+
+		@test()
+		def TestKeyPositions() !none {
+			let flags = list(bulk("readonly"))
+			let moving = list(bulk("movablekeys"))
+			let specs = keySpecs(list(
+				list(bulk("get"), whole(2), flags, whole(1), whole(1), whole(1)),
+				list(bulk("mset"), whole(-3), list(), whole(1), whole(-1), whole(2)),
+				list(bulk("del"), whole(-2), list(), whole(1), whole(-1), whole(1)),
+				list(bulk("ping"), whole(-1), list(), whole(0), whole(0), whole(0)),
+				list(bulk("eval"), whole(-3), moving, whole(0), whole(0), whole(0)),
+				list(bulk("zunionstore"), whole(-4), moving, whole(1), whole(1), whole(1)),
+				list(bulk("xread"), whole(-4), moving, whole(0), whole(0), whole(0)),
+				list(bulk("lmpop"), whole(-4), moving, whole(0), whole(0), whole(0)),
+				list(bulk("blmpop"), whole(-5), moving, whole(0), whole(0), whole(0)),
+				list(bulk("sort"), whole(-2), moving, whole(1), whole(1), whole(1)),
+				list(bulk("migrate"), whole(-6), moving, whole(3), whole(3), whole(1)),
+				list(bulk("object"), whole(-2), list(), whole(0), whole(0), whole(0), list(), list(), list(), list(
+					list(bulk("object|encoding"), whole(3), flags, whole(2), whole(2), whole(1)),
+				)),
+			))
+			assert spots(specs, "GET", "a") == "a"
+			assert specs["get"].readOnly && !specs["mset"].readOnly
+			assert spots(specs, "MSET", "a", "1", "b", "2") == "a,b"
+			assert spots(specs, "DEL", "a", "b", "c") == "a,b,c"
+			assert spots(specs, "PING") == ""
+			assert spots(specs, "NOSUCH", "a") == ""
+			assert spots(specs, "EVAL", "return 1", "2", "k1", "k2", "arg") == "k1,k2"
+			assert spots(specs, "EVAL", "return 1", "0") == ""
+			assert spots(specs, "ZUNIONSTORE", "dest", "2", "a", "b", "WEIGHTS", "1", "2") == "dest,a,b"
+			assert spots(specs, "XREAD", "COUNT", "5", "STREAMS", "s1", "s2", "0", "0") == "s1,s2"
+			assert spots(specs, "LMPOP", "2", "a", "b", "LEFT") == "a,b"
+			assert spots(specs, "BLMPOP", "0", "2", "a", "b", "LEFT") == "a,b"
+			assert spots(specs, "SORT", "list", "STORE", "out") == "list"
+			assert spots(specs, "OBJECT", "ENCODING", "k") == "k"
+			assert spots(specs, "MIGRATE", "h", "1", "k", "0", "10") == "ask"
+			return none
+		}
+
+		@test()
+		def TestRedirectionsAndLayouts() !none {
+			let (slot, host, port) = redirection("MOVED 3999 10.0.0.5:6381")
+			assert slot == 3999 && host == "10.0.0.5" && port == 6381
+			(slot, host, port) = redirection("ASK 12 [2001:db8::7]:7002")
+			assert slot == 12 && host == "2001:db8::7" && port == 7002
+			(slot, host, port) = redirection("MOVED 5 :7001")
+			assert slot == 5 && host == "" && port == 7001
+			(slot, host, port) = redirection("MOVED")
+			assert port == 0
+			assert addressOf("2001:db8::7", 7002) == "[2001:db8::7]:7002"
+			let (h, p) = hostAndPort("cache.internal", 6379)
+			assert h == "cache.internal" && p == 6379
+			let named = new Value(ValueKind.Array)
+			named.items = [bulk("hostname"), bulk("n3.example")]
+			let layout = layoutOf(list(
+				list(whole(0), whole(99), list(bulk("10.0.0.1"), whole(7000), bulk("id1")), list(bulk("10.0.0.4"), whole(7003), bulk("id4"))),
+				list(whole(100), whole(16383), list(bulk(""), whole(7001), bulk("id2"))),
+				list(whole(200), whole(300), list(bulk("10.0.0.3"), whole(7002), bulk("id3"), named)),
+			), "seed.example", false)
+			assert layout.masters.join(" ") == "10.0.0.1:7000 seed.example:7001 10.0.0.3:7002"
+			assert layout.replicas[0].join(" ") == "10.0.0.4:7003"
+			assert layout.slots[0] == 0 && layout.slots[99] == 0 && layout.slots[100] == 1 && layout.slots[250] == 2 && layout.slots[16383] == 1
+			let byName = layoutOf(list(list(whole(0), whole(1), list(bulk("10.0.0.3"), whole(7002), bulk("id3"), named))), "x", true)
+			assert byName.masters[0] == "n3.example:7002"
+			assert byName.slots[2] == -1
+			return none
+		}
+
+		@test()
+		def TestClusterCommands() !none {
+			return none when testCluster == ""
+			let r = try cluster()
+			assert r.serverInfo().hasKey("version")
+			for let i = 0; i < 300; i++ {
+				try r.set("key:{i}", "value {i}")
+			}
+			for let i = 0; i < 300; i += 7 {
+				assert text(try r.get("key:{i}")) == "value {i}"
+			}
+			assert (try r.dbSize()) == 300
+			assert (try r.keys("key:1*")).len() == 111
+			assert (try r.scan("key:2*", 50).all()).len() == 111
+			assert !((try r.randomKey()) is none)
+			// Keys with a common tag live in one slot and go in one command.
+			try r.mset({"\{u7\}:name": "Ana", "\{u7\}:city": "Cluj"})
+			let both = try r.mget("\{u7\}:name", "\{u7\}:city")
+			assert both["\{u7\}:name"] == "Ana" && both["\{u7\}:city"] == "Cluj"
+			assert (try r.del("\{u7\}:name", "\{u7\}:city")) == 2
+			let kind = ErrorKind.Server
+			r.del("key:1", "key:2", "key:3") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover 0
+			}
+			assert kind == ErrorKind.Cluster
+			// Scripts and commands that count their keys.
+			let sum = new Script("return redis.call('INCRBY', KEYS[1], ARGV[1])")
+			assert (try r.run(sum, ["counter"], 5)).toInt() == 5
+			assert (try r.run(sum, ["counter"], 5)).toInt() == 10
+			assert (try r.eval("return #KEYS", ["\{t\}a", "\{t\}b"])).toInt() == 2
+			try r.rpush("\{q\}one", "a", "b")
+			assert (try r.command("LMPOP", 2, "\{q\}none", "\{q\}one", "LEFT")).items.len() == 2
+			assert (try r.command("OBJECT", "ENCODING", "key:1")).text() != ""
+			let sha = try r.scriptLoad("return 7")
+			assert (try r.scriptExists(sha))[0]
+			assert (try r.evalSha(sha, ["anywhere"])).toInt() == 7
+			try r.flushDb()
+			assert (try r.dbSize()) == 0
+			try r.close()
+			kind = ErrorKind.Server
+			r.get("key:1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			return none
+		}
+
+		@test()
+		def TestClusterPipelineAndTransaction() !none {
+			return none when testCluster == ""
+			let r = try cluster()
+			let p = r.pipeline()
+			for let i = 0; i < 200; i++ {
+				try p.add("SET", "p:{i}", i)
+			}
+			try p.add("DEL", "p:1", "p:2", "p:3")
+			for let i = 0; i < 200; i++ {
+				try p.add("INCRBY", "p:{i}", 1000)
+			}
+			try p.add("LPUSH", "p:5", "x")
+			let replies = try p.run()
+			assert replies.len() == 402
+			assert replies[0].text() == "OK"
+			assert replies[200].isError() && replies[200].text().startsWith("CROSSSLOT")
+			for let i = 0; i < 200; i++ {
+				assert replies[201 + i].toInt() == 1000 + i
+			}
+			assert replies[401].isError() && replies[401].text().startsWith("WRONGTYPE")
+			// A transaction runs on the node of its first key.
+			let tx = try r.multi()
+			try tx.queue("SET", "\{acct\}:a", 10)
+			try tx.queue("INCRBY", "\{acct\}:a", 5)
+			try tx.queue("SET", "\{acct\}:b", "x")
+			let done = try tx.exec()
+			assert done.len() == 3 && done[1].toInt() == 15
+			assert text(try r.get("\{acct\}:b")) == "x"
+			let watching = try r.multi("\{acct\}:a")
+			try r.set("\{acct\}:a", 99)
+			try watching.queue("SET", "\{acct\}:a", 1)
+			let kind = ErrorKind.Server
+			watching.exec() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Value[]
+			}
+			assert kind == ErrorKind.Aborted
+			assert text(try r.get("\{acct\}:a")) == "99"
+			let bare = try r.multi()
+			try bare.queue("PING")
+			assert (try bare.exec())[0].text() == "PONG"
+			try r.close()
+			return none
+		}
+
+		@test()
+		def TestClusterReplicasAndPubSub() !none {
+			return none when testCluster == ""
+			let writer = try cluster()
+			let reader = new Client()
+			reader.readFromReplicas = true
+			try reader.connectCluster(testCluster)
+			for let i = 0; i < 50; i++ {
+				try writer.set("r:{i}", i)
+			}
+			// Replicas follow their master a moment later.
+			time.sleep(300ms)
+			for let i = 0; i < 50; i++ {
+				assert text(try reader.get("r:{i}")) == "{i}"
+			}
+			try reader.set("r:own", "w")
+			assert text(try writer.get("r:own")) == "w"
+			let link = reader.link
+			fail "not a cluster link" unless link is ClusterLink
+			let replicas = 0
+			for let id in link.nodes.keys() {
+				replicas++ when id.endsWith(" r")
+			}
+			assert replicas > 0
+			let sub = try writer.subscribe("news")
+			let shard = try writer.ssubscribe("\{shard\}:events")
+			assert (try reader.publish("news", "hello")) >= 0
+			try reader.spublish("\{shard\}:events", "moved")
+			let heard = try sub.receive(5s)
+			fail "no message" when heard is none
+			assert heard.channel == "news" && heard.text() == "hello"
+			let sharded = try shard.receive(5s)
+			fail "no shard message" when sharded is none
+			assert sharded.channel == "\{shard\}:events" && sharded.text() == "moved"
+			try shard.close()
+			try sub.close()
+			try reader.close()
+			try writer.close()
+			return none
+		}
+
+		// A slot moves from one node to another under a client that goes on
+		// reading and writing its keys: ASK while it moves, MOVED after.
+		@test()
+		def TestClusterSlotMoves() !none {
+			return none when testCluster == ""
+			let r = try cluster()
+			let (owner, other) = try ownerAndOther(r, "\{mig\}:old")
+			let from = try connect("redis://{owner}")
+			let to = try connect("redis://{other}")
+			let (toHost, toPort) = hostAndPort(other, 6379)
+			let fromId = (try from.command("CLUSTER", "MYID")).text()
+			let toId = (try to.command("CLUSTER", "MYID")).text()
+			let slot = slotOf("\{mig\}:old".bytes())
+			try r.set("\{mig\}:old", "before")
+			try to.command("CLUSTER", "SETSLOT", slot, "IMPORTING", fromId)
+			try from.command("CLUSTER", "SETSLOT", slot, "MIGRATING", toId)
+			// A key that is still at the old node is answered there; one that
+			// is not is asked for at the new node.
+			assert text(try r.get("\{mig\}:old")) == "before"
+			assert (try r.get("\{mig\}:new")) is none
+			try r.set("\{mig\}:new", "during")
+			assert text(try r.get("\{mig\}:new")) == "during"
+			assert (try to.command("CLUSTER", "COUNTKEYSINSLOT", slot)).toInt() == 1
+			let p = r.pipeline()
+			try p.add("GET", "\{mig\}:new")
+			try p.add("GET", "\{mig\}:old")
+			let piped = try p.run()
+			assert piped[0].text() == "during" && piped[1].text() == "before"
+			try from.command("MIGRATE", toHost, toPort, "", 0, 5000, "KEYS", "\{mig\}:old")
+			try to.command("CLUSTER", "SETSLOT", slot, "NODE", toId)
+			try from.command("CLUSTER", "SETSLOT", slot, "NODE", toId)
+			// The client still has the old map: the old node says MOVED.
+			assert text(try r.get("\{mig\}:old")) == "before"
+			assert text(try r.get("\{mig\}:new")) == "during"
+			try r.set("\{mig\}:old", "after")
+			let link = r.link
+			fail "not a cluster link" unless link is ClusterLink
+			assert link.current().masters[link.current().slots[slot]] == other
+			try from.close()
+			try to.close()
+			try r.close()
+			return none
+		}
+
+		// A replica takes over from its master while a client keeps
+		// writing to the shard.
+		@test()
+		def TestClusterFailover() !none {
+			return none when testCluster == ""
+			let r = try cluster()
+			let (owner, _) = try ownerAndOther(r, "f:0")
+			let link = r.link
+			fail "not a cluster link" unless link is ClusterLink
+			let layout = link.current()
+			let spare = layout.replicas[layout.slots[slotOf("f:0".bytes())]]
+			fail "the shard of f:0 has no replica" when spare.len() == 0
+			try r.set("f:0", "kept")
+			let replica = try connect("redis://{spare[0]}")
+			try replica.command("CLUSTER", "FAILOVER")
+			for let i = 1; i <= 40; i++ {
+				try r.set("f:0", "write {i}")
+				assert text(try r.get("f:0")) == "write {i}"
+				time.sleep(50ms)
+			}
+			let (after, _) = try ownerAndOther(r, "f:0")
+			assert after == spare[0] && after != owner
+			try replica.close()
+			if testHard == "1" {
+				// The new master stops for good: the cluster promotes the
+				// old one again, and commands wait for that.
+				let doomed = try connect("redis://{after}")
+				doomed.command("SHUTDOWN", "NOSAVE") onerror recover new Value()
+				try r.set("f:0", "survived")
+				assert text(try r.get("f:0")) == "survived"
+				let (last, _) = try ownerAndOther(r, "f:0")
+				assert last == owner
+			}
+			try r.close()
+			return none
+		}
+	}
+
+	check "Sentinel" {
+		@test()
+		def TestSentinel() !none {
+			return none when testSentinel == ""
+			let parts = testSentinel.split("@")
+			let sentinels = parts[1].split(",")
+			let kind = ErrorKind.Server
+			connectSentinel("nosuchmaster", ...sentinels) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Connection
+			let r = try connectSentinel(parts[0], "127.0.0.1:1", ...sentinels)
+			try r.set("s:key", "one")
+			assert text(try r.get("s:key")) == "one"
+			assert (try r.command("ROLE")).items[0].text() == "master"
+			let before = try r.info("server")
+			let p = r.pipeline()
+			try p.add("INCR", "s:n")
+			try p.add("INCR", "s:n")
+			assert (try p.run())[1].toInt() >= 2
+			// The sentinels promote a replica; the client follows.
+			let guard = try connect("redis://{sentinels[0]}")
+			try guard.command("SENTINEL", "FAILOVER", parts[0])
+			try guard.close()
+			// The old master goes on answering until the sentinels make it a
+			// replica, some seconds after they promoted the new one.
+			let moved = false
+			for let i = 0; i < 600 && !moved; i++ {
+				try r.set("s:key", "write {i}")
+				assert text(try r.get("s:key")) == "write {i}"
+				let now = try r.info("server")
+				moved = now["tcp_port"] != before["tcp_port"]
+				time.sleep(50ms)
+			}
+			assert moved
+			assert (try r.command("ROLE")).items[0].text() == "master"
+			let tx = try r.multi()
+			try tx.queue("SET", "s:tx", 1)
+			assert (try tx.exec()).len() == 1
+			try r.close()
+			// Let the group settle before another failover is asked for.
+			time.sleep(2s)
+			return none
+		}
+	}
+}

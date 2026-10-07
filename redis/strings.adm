@@ -1,0 +1,198 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// SetMode says when `set` writes.
+	enum SetMode {
+		Always,
+		// Only when the key does not exist (NX).
+		IfMissing,
+		// Only when the key exists (XX).
+		IfExists,
+	}
+
+	// Commands on string values. A value is text, bytes, a number or a
+	// boolean. Each fails with a RedisError as `command` does, and with
+	// ErrorKind.WrongType when the key holds another kind of value.
+	partial type Client {
+		// The value of a key as text, none when the key does not exist.
+		// Fails as `command` does.
+		def get(key string) !?string {
+			return optional(try call(timeout, "GET", key))
+		}
+
+		// The value of a key as bytes, none when the key does not exist.
+		// Fails as `command` does.
+		def getBytes(key string) !?byte[] {
+			let v = try call(timeout, "GET", key)
+			return none when v.isNull()
+			return v.bytes()
+		}
+
+		// Sets a key, expiring after `expire` (0s: never; `keepTtl` keeps
+		// the expiry it has). Reports whether it wrote, which `mode` may
+		// prevent.
+		// Fails as `command` does.
+		def set(key string, value any, expire duration = 0s, mode SetMode = SetMode.Always, keepTtl bool = false) !bool {
+			let args any[] = ["SET", key, value]
+			args.push("PX", millis(expire)) when expire > 0s
+			args.push("KEEPTTL") when keepTtl
+			args.push("NX") when mode == SetMode.IfMissing
+			args.push("XX") when mode == SetMode.IfExists
+			return !(try call(timeout, ...args)).isNull()
+		}
+
+		// Sets a key and returns the value it held, none when it held none.
+		// Fails as `command` does.
+		def swap(key string, value any) !?string {
+			return optional(try call(timeout, "SET", key, value, "GET"))
+		}
+
+		// The value of a key, deleting the key.
+		// Fails as `command` does.
+		def getDel(key string) !?string {
+			return optional(try call(timeout, "GETDEL", key))
+		}
+
+		// The value of a key, making it expire after `expire` (0s removes
+		// its expiry).
+		// Fails as `command` does.
+		def get(key string, expire duration) !?string {
+			return optional(try call(timeout, "GETEX", key, "PERSIST")) when expire <= 0s
+			return optional(try call(timeout, "GETEX", key, "PX", millis(expire)))
+		}
+
+		// The values of several keys, by key; a key that does not exist or
+		// holds no string is left out.
+		// Fails as `command` does.
+		def mget(keys ...string) !map<string, string> {
+			let out = new map<string, string>()
+			return out when keys.len() == 0
+			let reply = try call(timeout, ...joined(["MGET"], keys))
+			for let (i, item) in reply.items {
+				out.set(keys[i], item.text()) unless item.isNull()
+			}
+			return out
+		}
+
+		// Sets several keys at once.
+		// Fails as `command` does.
+		def mset(values map<string, any>) !none {
+			return none when values.len() == 0
+			try call(timeout, ...joinedPairs(["MSET"], values))
+			return none
+		}
+
+		// Sets several keys unless one of them exists. Reports whether it
+		// wrote.
+		// Fails as `command` does.
+		def msetNx(values map<string, any>) !bool {
+			return false when values.len() == 0
+			return (try call(timeout, ...joinedPairs(["MSETNX"], values))).toBool()
+		}
+
+		// Adds `by` to the number a key holds (0 when missing) and returns
+		// the result. Fails with the server's error when the value is not
+		// an integer.
+		def incr(key string, by int = 1) !int {
+			return (try call(timeout, "INCRBY", key, by)).toInt()
+		}
+
+		// Subtracts `by` from the number a key holds and returns the result.
+		// Fails as `incr` does.
+		def decr(key string, by int = 1) !int {
+			return (try call(timeout, "DECRBY", key, by)).toInt()
+		}
+
+		// Adds `by` to the float a key holds and returns the result. Fails
+		// with the server's error when the value is not a number.
+		def incrFloat(key string, by float) !float {
+			return (try call(timeout, "INCRBYFLOAT", key, by)).toFloat()
+		}
+
+		// Appends to a key's value. Returns the new length in bytes.
+		// Fails as `command` does.
+		def append(key string, value any) !int {
+			return (try call(timeout, "APPEND", key, value)).toInt()
+		}
+
+		// The length of a key's value in bytes, 0 when it does not exist.
+		// Fails as `command` does.
+		def strlen(key string) !int {
+			return (try call(timeout, "STRLEN", key)).toInt()
+		}
+
+		// The bytes `start` to `end` of a key's value, both included;
+		// negative positions count from the end.
+		// Fails as `command` does.
+		def getRange(key string, start int, end int) !byte[] {
+			return (try call(timeout, "GETRANGE", key, start, end)).bytes()
+		}
+
+		// Overwrites a key's value from byte `offset`. Returns the new
+		// length in bytes.
+		// Fails as `command` does.
+		def setRange(key string, offset int, value any) !int {
+			return (try call(timeout, "SETRANGE", key, offset, value)).toInt()
+		}
+
+		// Sets one bit of a key's value. Returns the bit it replaced.
+		// Fails as `command` does.
+		def setBit(key string, offset int, on bool) !bool {
+			return (try call(timeout, "SETBIT", key, offset, on)).toBool()
+		}
+
+		// One bit of a key's value.
+		// Fails as `command` does.
+		def getBit(key string, offset int) !bool {
+			return (try call(timeout, "GETBIT", key, offset)).toBool()
+		}
+
+		// How many bits are set in a key's value.
+		// Fails as `command` does.
+		def bitCount(key string) !int {
+			return (try call(timeout, "BITCOUNT", key)).toInt()
+		}
+
+		// How many bits are set in bytes `start` to `end` of a key's value.
+		// Fails as `command` does.
+		def bitCount(key string, start int, end int) !int {
+			return (try call(timeout, "BITCOUNT", key, start, end)).toInt()
+		}
+
+		// The position of the first bit that is set (or clear, with `on`
+		// false) in a key's value, -1 when there is none.
+		// Fails as `command` does.
+		def bitPos(key string, on bool) !int {
+			return (try call(timeout, "BITPOS", key, on)).toInt()
+		}
+
+		// Stores in `to` the result of a bitwise operation over the values
+		// of keys: `AND`, `OR`, `XOR`, or `NOT` of one key. Returns the
+		// result's length in bytes.
+		// Fails as `command` does.
+		def bitOp(operation string, to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["BITOP", operation, to], keys))).toInt()
+		}
+
+		// Adds elements to a HyperLogLog. Reports whether its estimate
+		// changed.
+		// Fails as `command` does.
+		def pfAdd(key string, elements ...any) !bool {
+			return (try call(timeout, ...joinedAny(["PFADD", key], elements))).toBool()
+		}
+
+		// The estimated number of distinct elements added to the
+		// HyperLogLogs, taken together.
+		// Fails as `command` does.
+		def pfCount(keys ...string) !int {
+			return (try call(timeout, ...joined(["PFCOUNT"], keys))).toInt()
+		}
+
+		// Merges HyperLogLogs into `to`.
+		// Fails as `command` does.
+		def pfMerge(to string, keys ...string) !none {
+			try call(timeout, ...joined(["PFMERGE", to], keys))
+			return none
+		}
+	}
+}

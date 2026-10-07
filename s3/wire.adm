@@ -1,0 +1,657 @@
+// How a request reaches the server: addressing, signing, sending, and
+// reading replies and error replies.
+internal partial module adm.network.s3.wire {
+	use (
+		std.crypto.hash
+		std.data.encoding
+		std.data.encoding::(XMLNode)
+		std.io
+		std.net
+		std.net.http
+		std.net.url
+		std.time
+		adm.network.s3::*
+		adm.network.s3.sigv4::*
+	)
+
+	// Call is one request before it is addressed and signed.
+	type Call {
+		method  string
+		// "" for a request on the service itself (listing buckets).
+		bucket  string
+		key     string
+		query   Field[]
+		headers Field[]
+		// The body when it is in memory.
+		body    byte[]
+		// A body to stream instead, `size` bytes long.
+		stream  ?io.Reader = none
+		size    int
+
+		def new(method string, bucket string = "", key string = "") {
+			self.method = method
+			self.bucket = bucket
+			self.key = key
+		}
+
+		// Adds a query parameter; a subresource such as `uploads` has no
+		// value.
+		def param(name string, value string = "") Call {
+			query.push(Field{name: name, value: value})
+			return self
+		}
+
+		// Adds a header, unless its value is empty.
+		def header(name string, value string) Call {
+			headers.push(Field{name: name, value: value}) when value != ""
+			return self
+		}
+
+		// What the call is about, for an error message.
+		def subject() string {
+			return "{method} /" when bucket == ""
+			return "{method} {bucket}" when key == ""
+			return "{method} {bucket}/{key}"
+		}
+	}
+
+	// Refuses every redirect: a redirected request needs a new signature.
+	type NoRedirects {
+		def new() {}
+
+		def follow(next http.Request, via http.Request[]) !bool {
+			return false
+		}
+	}
+
+	// Engine sends calls to one endpoint. Any number of tasks share it.
+	type Engine {
+		scheme         string              = "https"
+		// The endpoint's `host[:port]`.
+		host           string
+		// True for AWS's own endpoint, whose host names the region.
+		aws            bool
+		region         string              = "us-east-1"
+		addressing     Addressing          = Addressing.Auto
+		accessKey      string
+		secretKey      string
+		token          string
+		web            http.Client
+		partSize       int                 = 16 * 1024 * 1024
+		uploadTasks    int                 = 4
+		// The region of each bucket found to live outside `region`.
+		atomic regions map<string, string>
+
+		def new() {
+			web = new http.Client()
+			web.decompress = false
+			web.redirects = new NoRedirects()
+		}
+
+		atomic def regionOf(bucket string) string {
+			let found = regions.get(bucket)
+			return region when found is none
+			return found
+		}
+
+		atomic def learn(bucket string, found string) {
+			regions.set(bucket, found)
+		}
+
+		// Whether the bucket goes into the host name rather than the path.
+		def virtual(bucket string) bool {
+			match addressing {
+				case Addressing.Path:
+					return false
+				case Addressing.VirtualHost:
+					return true
+				default:
+			}
+			return false unless hostIsName(host) && bucketIsName(bucket)
+			// A dot in the name breaks the wildcard certificate.
+			return !(scheme == "https" && bucket.contains("."))
+		}
+
+		// The `host[:port]` a call for the bucket goes to.
+		def authority(bucket string) string {
+			let base = host
+			base = "s3.{regionOf(bucket)}.amazonaws.com" when aws
+			return base when bucket == "" || !virtual(bucket)
+			return "{bucket}.{base}"
+		}
+
+		// The path of a call as it is sent: encoded once, `/` kept in keys.
+		def path(bucket string, key string) string {
+			return "/" when bucket == ""
+			return "/{uriEncode(key, true)}" when virtual(bucket)
+			return "/{uriEncode(bucket)}" when key == ""
+			return "/{uriEncode(bucket)}/{uriEncode(key, true)}"
+		}
+
+		def signer(bucket string) Signer {
+			return Signer{accessKey: accessKey, secretKey: secretKey, token: token, region: regionOf(bucket)}
+		}
+
+		// Builds the signed request of a call.
+		def request(call Call) !http.Request {
+			let endpoint = authority(call.bucket)
+			let sent = path(call.bucket, call.key)
+			let amzDate = amzDateOf(time.now())
+			let source = call.stream
+			let digest = emptyHash
+			let headers Field[] = [Field{name:"Host", value:endpoint}, Field{name:"x-amz-date", value:amzDate}]
+			headers.push(Field{name: "x-amz-security-token", value: token}) when token != ""
+			if source is none {
+				digest = sha256Hex(call.body) when call.body.len() > 0
+			} else {
+				digest = streamingPayload
+				headers.push(Field{name: "x-amz-decoded-content-length", value: call.size.str()})
+			}
+			headers.push(Field{name: "x-amz-content-sha256", value: digest})
+			for let h in call.headers {
+				if h.name.lower() == "content-encoding" && !(source is none) {
+					headers.push(Field{name: "Content-Encoding", value: "aws-chunked,{h.value}"})
+					continue
+				}
+				headers.push(h)
+			}
+			headers.push(Field{name: "Content-Encoding", value: "aws-chunked"}) unless source is none || hasHeader(call.headers, "content-encoding")
+			let query = canonicalQuery(call.query)
+			let stamp = sign(signer(call.bucket), call.method, sent, query, headers, digest, amzDate)
+
+			let target = new url.URL()
+			target.scheme = scheme
+			target.host = endpoint
+			target.path = plainPath(call.bucket, call.key, virtual(call.bucket))
+			target.rawPath = sent
+			target.rawQuery = query
+			let req = http.newRequest(http.parseMethod(call.method), target) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "s3: {call.subject()} cannot be sent: {err.message}", err)
+			}
+			for let h in headers {
+				req.headers.add(h.name, h.value) unless h.name == "Host"
+			}
+			req.headers.set("Authorization", stamp.authorization)
+			if source is none {
+				req.replaceBody(call.body) when call.body.len() > 0 || (call.method := "PUT" || "POST")
+			} else {
+				req.body = new SignedChunks(source, call.size, stamp)
+				req.contentLength = chunkedLength(call.size)
+			}
+			return req
+		}
+
+		// send sends a call and returns the response when its status is 2xx
+		// or `tolerated`; the caller reads or closes the body. A reply that
+		// names another region for the bucket is followed once, signed for
+		// that region.
+		// Fails with an S3Error: the server's error reply, or
+		// ErrorKind.Connection and ErrorKind.TimedOut when none came.
+		def send(call Call, tolerated int = 0) !http.Response {
+			for let attempt = 0; attempt < 2; attempt++ {
+				let req = try request(call)
+				let failure ?error = none
+				let res = attemptSend(req) onerror (err error) {
+					failure = err
+					recover none
+				}
+				fail transportError(call, failure) when res is none
+				return res when (res.status >= 200 && res.status < 300) || res.status == tolerated
+				let refusal = refusalOf(res, call)
+				let elsewhere = refusal.region
+				let movable = call.bucket != "" && call.stream is none && attempt == 0
+				if movable && elsewhere != "" && elsewhere != regionOf(call.bucket) {
+					learn(call.bucket, elsewhere)
+					continue
+				}
+				fail refusal.error
+			}
+			fail errorOf(ErrorKind.Protocol, "s3: {call.subject()} was not sent")
+		}
+
+		def attemptSend(req http.Request) !?http.Response {
+			return try web.do(req)
+		}
+
+		// done sends a call whose reply has no body worth reading.
+		// Fails as `send` does.
+		def done(call Call) !http.Response {
+			let res = try send(call)
+			res.close() onerror recover none
+			return res
+		}
+
+		// document sends a call and parses the XML of its reply.
+		// Fails as `send` does, and with ErrorKind.Protocol when the reply
+		// is not XML.
+		def document(call Call) !XMLNode {
+			let res = try send(call)
+			let data = res.bytes() onerror (err error) {
+				fail transportError(call, err)
+			}
+			return try parseXML(data, call)
+		}
+	}
+
+	// A refused request: the error to fail with, and the region the reply
+	// says the bucket lives in ("" when it names none).
+	struct Refusal {
+		error  S3Error
+		region string
+	}
+
+	def parseXML(data byte[], call Call) !XMLNode {
+		let codec = new encoding.XML()
+		let root = codec.parse(data) onerror (err error) {
+			fail errorOf(ErrorKind.Protocol, "s3: the reply to {call.subject()} is not XML: {err.message}", err)
+		}
+		// A 200 reply may still hold an error (CompleteMultipartUpload,
+		// CopyObject answer before the work is done).
+		fail refusalIn(root, 200, call).error when root.localName == "Error"
+		return root
+	}
+
+	def refusalOf(res http.Response, call Call) Refusal {
+		let data byte[] = []
+		data = res.bytes() onerror recover data
+		res.close() onerror recover none
+		let named = res.headers.get("x-amz-bucket-region")
+		if data.len() > 0 {
+			let codec = new encoding.XML()
+			let root ?XMLNode = none
+			root = parsedOrNone(codec, data) onerror recover none
+			if !(root is none) && root.localName == "Error" {
+				let refusal = refusalIn(root, res.status, call)
+				refusal.region = named when refusal.region == ""
+				refusal.error.requestId = res.headers.get("x-amz-request-id") when refusal.error.requestId == ""
+				return refusal
+			}
+		}
+		// HEAD replies and proxies in front of S3 send no error document.
+		let code = "Error"
+		match res.status {
+			case 301, 307:
+				code = "PermanentRedirect"
+			case 304:
+				code = "NotModified"
+			case 400:
+				code = "BadRequest"
+			case 403:
+				code = "AccessDenied"
+			case 404:
+				code = call.key == "" ?? ("NoSuchBucket", "NoSuchKey")
+			case 409:
+				code = "Conflict"
+			case 412:
+				code = "PreconditionFailed"
+			case 416:
+				code = "InvalidRange"
+			case 503:
+				code = "SlowDown"
+			default:
+		}
+		let out = S3Error{message: "s3: {call.subject()} failed with status {res.status} ({code})", kind: kindOf(code, res.status), status: res.status, serverCode: code}
+		out.code = out.kind.value
+		out.requestId = res.headers.get("x-amz-request-id")
+		return Refusal{error: out, region: named}
+	}
+
+	def parsedOrNone(codec encoding.XML, data byte[]) !?XMLNode {
+		return try codec.parse(data)
+	}
+
+	// Reads an `<Error>` document.
+	def refusalIn(root XMLNode, status int, call Call) Refusal {
+		let code = textOf(root, "Code")
+		let kind = kindOf(code, status)
+		let out = S3Error{message: "s3: {call.subject()}: {textOf(root, "Message")} ({code})", code: kind.value, kind: kind, status: status, serverCode: code}
+		out.requestId = textOf(root, "RequestId")
+		return Refusal{error: out, region: textOf(root, "Region")}
+	}
+
+	// The kind an S3 error code stands for.
+	def kindOf(code string, status int) ErrorKind {
+		match code {
+			case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken", "TokenRefreshRequired", "AccountProblem", "AllAccessDisabled", "InvalidSecurity", "RequestTimeTooSkewed", "AuthorizationHeaderMalformed", "AuthorizationQueryParametersError":
+				return ErrorKind.Denied
+			case "NoSuchBucket":
+				return ErrorKind.NoBucket
+			case "NoSuchKey", "NoSuchVersion":
+				return ErrorKind.NoObject
+			case "NoSuchUpload":
+				return ErrorKind.NoUpload
+			case "BucketAlreadyExists", "BucketAlreadyOwnedByYou":
+				return ErrorKind.Exists
+			case "BucketNotEmpty":
+				return ErrorKind.NotEmpty
+			case "PreconditionFailed", "ConditionalRequestConflict":
+				return ErrorKind.Precondition
+			case "NotModified":
+				return ErrorKind.NotModified
+			case "InvalidRange":
+				return ErrorKind.Range
+			case "SlowDown", "ServiceUnavailable", "RequestLimitExceeded", "Throttling", "ThrottlingException":
+				return ErrorKind.Throttled
+			case "RequestTimeout":
+				return ErrorKind.TimedOut
+			case "InvalidArgument", "InvalidBucketName", "InvalidRequest", "MalformedXML", "KeyTooLongError", "EntityTooLarge", "EntityTooSmall", "InvalidPart", "InvalidPartOrder", "InvalidDigest", "BadDigest", "MetadataTooLarge", "InvalidTag", "MalformedPolicy":
+				return ErrorKind.Argument
+			default:
+		}
+		return ErrorKind.Throttled when status == 503
+		return ErrorKind.Denied when status == 403
+		return ErrorKind.Server
+	}
+
+	// errorOf builds the S3Error the library fails with.
+	def errorOf(kind ErrorKind, message string, cause ?error = none) S3Error {
+		return S3Error{message: message, code: kind.value, kind: kind, cause: cause}
+	}
+
+	// The S3Error for a request that got no reply.
+	def transportError(call Call, err ?error) S3Error {
+		return errorOf(ErrorKind.Protocol, "s3: {call.subject()} got no reply") when err is none
+		return err when err is S3Error
+		let kind = ErrorKind.Connection
+		if err is http.HttpError {
+			kind = ErrorKind.TimedOut when err.op == "timeout"
+		}
+		kind = ErrorKind.TimedOut when err.code := "timeout" || "canceled"
+		return errorOf(kind, "s3: {call.subject()}: {err.message}", err)
+	}
+
+	def hasHeader(headers Field[], lowerName string) bool {
+		for let h in headers {
+			return true when h.name.lower() == lowerName
+		}
+		return false
+	}
+
+	// The path of a call before encoding.
+	def plainPath(bucket string, key string, virtual bool) string {
+		return "/" when bucket == ""
+		return "/{key}" when virtual
+		return "/{bucket}" when key == ""
+		return "/{bucket}/{key}"
+	}
+
+	// Whether a `host[:port]` is a DNS name a bucket label can go in front
+	// of: not an IP address and not `localhost`.
+	def hostIsName(host string) bool {
+		return false when host.startsWith("[")
+		let colon = host.indexOf(":")
+		let name = colon < 0 ?? (host, host.slice(0, colon))
+		return false when name := "localhost" || ""
+		return !/^[0-9.]+$/.test(name)
+	}
+
+	// Whether a bucket name can be a DNS label: 3 to 63 lower-case
+	// letters, digits, hyphens and dots, a letter or digit at each end.
+	def bucketIsName(bucket string) bool {
+		return /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket) && !bucket.contains("..")
+	}
+
+	// The text of a child element; "" when there is none.
+	def textOf(node XMLNode, name string) string {
+		let found = node.child(name)
+		return "" when found is none
+		return found.text()
+	}
+
+	// A child element as a number; 0 when it is missing or not one.
+	def numberOf(node XMLNode, name string) int {
+		let text = textOf(node, name)
+		return 0 unless /^[0-9]{1,18}$/.test(text)
+		return text.toInt<int>()
+	}
+
+	// A child element as a time (`2026-10-07T12:00:00.000Z`); the zero
+	// time when it is missing or unreadable.
+	def timeOf(node XMLNode, name string) time.Time {
+		return readTime(textOf(node, name))
+	}
+
+	def readTime(text string) time.Time {
+		let zero = new time.Time()
+		return zero when text == ""
+		return time.parse(text, time.TimeFormat.RFC3339) onerror recover zero
+	}
+
+	// An entity tag without its quotes.
+	def bareTag(tag string) string {
+		return tag.trim().trim("\"")
+	}
+
+	// Base64 of the MD5 digest: the `Content-MD5` of a body.
+	def md5Of(data byte[]) string {
+		return new hash.MD5().hash(data).base64()
+	}
+
+	const xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
+	const minPartSize = 5 * 1024 * 1024
+	const maxPartSize = 5 * 1024 * 1024 * 1024
+	const maxParts = 10000
+
+	// Sets the headers of an object being written.
+	def applyWrite(call Call, contentType string, options ?WriteOptions) {
+		call.header("Content-Type", contentType)
+		return when options is none
+		for let (name, value) in options.metadata {
+			call.header("x-amz-meta-{name}", value)
+		}
+		call.header("Cache-Control", options.cacheControl)
+		call.header("Content-Disposition", options.contentDisposition)
+		call.header("Content-Encoding", options.contentEncoding)
+		call.header("Content-Language", options.contentLanguage)
+		let expires = options.expires
+		call.header("Expires", time.formatHTTPDate(expires)) unless expires is none
+		call.header("x-amz-storage-class", options.storageClass)
+		call.header("x-amz-acl", options.acl)
+		call.header("x-amz-tagging", labelQuery(options.labels))
+		call.header("x-amz-server-side-encryption", options.encryption)
+		call.header("x-amz-server-side-encryption-aws-kms-key-id", options.kmsKey)
+		applyCustomerKey(call, options.customerKey, "x-amz-server-side-encryption-customer-")
+		call.header("If-Match", quotedTag(options.ifMatch))
+		call.header("If-None-Match", quotedTag(options.ifNoneMatch))
+	}
+
+	// Sets the query and the headers of an object being read.
+	def applyRead(call Call, options ?ReadOptions) {
+		return when options is none
+		call.param("versionId", options.version) when options.version != ""
+		call.param("partNumber", options.part.str()) when options.part > 0
+		if options.offset < 0 {
+			call.header("Range", "bytes={options.offset}")
+		} else if options.length >= 0 {
+			call.header("Range", "bytes={options.offset}-{options.offset + options.length - 1}")
+		} else if options.offset > 0 {
+			call.header("Range", "bytes={options.offset}-")
+		}
+		call.header("If-Match", quotedTag(options.ifMatch))
+		call.header("If-None-Match", quotedTag(options.ifNoneMatch))
+		let since = options.ifModifiedSince
+		call.header("If-Modified-Since", time.formatHTTPDate(since)) unless since is none
+		let until = options.ifUnmodifiedSince
+		call.header("If-Unmodified-Since", time.formatHTTPDate(until)) unless until is none
+		applyCustomerKey(call, options.customerKey, "x-amz-server-side-encryption-customer-")
+	}
+
+	// The three headers that hand S3 a key of the caller's own.
+	def applyCustomerKey(call Call, key byte[], prefix string) {
+		return when key.len() == 0
+		call.header("{prefix}algorithm", "AES256")
+		call.header("{prefix}key", key.base64())
+		call.header("{prefix}key-MD5", md5Of(key))
+	}
+
+	// An entity tag as conditions name it: quoted, `*` as it is.
+	def quotedTag(tag string) string {
+		return tag when tag == "" || tag == "*" || tag.startsWith("\"") || tag.startsWith("W/")
+		return "\"{tag}\""
+	}
+
+	// Tags as the `x-amz-tagging` header carries them.
+	def labelQuery(labels map<string, string>) string {
+		let parts string[] = []
+		for let (name, value) in labels {
+			parts.push("{uriEncode(name)}={uriEncode(value)}")
+		}
+		return parts.join("&")
+	}
+
+	// What the headers of a reply say about an object.
+	def infoOf(res http.Response, key string) ObjectInfo {
+		let info = ObjectInfo{key: key, latest: true}
+		info.size = res.contentLength when res.contentLength > 0
+		let span = res.headers.get("Content-Range")
+		let slash = span.indexOf("/")
+		if slash >= 0 {
+			let total = span.slice(slash + 1)
+			info.size = total.toInt<int>() when /^[0-9]{1,18}$/.test(total)
+		}
+		let length = res.headers.get("Content-Length")
+		info.size = length.toInt<int>() when slash < 0 && /^[0-9]{1,18}$/.test(length)
+		info.etag = bareTag(res.headers.get("ETag"))
+		let modified = res.lastModified()
+		info.modified = modified unless modified is none
+		info.contentType = res.headers.get("Content-Type")
+		info.version = res.headers.get("x-amz-version-id")
+		info.version = "" when info.version == "null"
+		info.storageClass = res.headers.get("x-amz-storage-class")
+		info.cacheControl = res.headers.get("Cache-Control")
+		info.contentDisposition = res.headers.get("Content-Disposition")
+		info.contentEncoding = res.headers.get("Content-Encoding")
+		info.contentLanguage = res.headers.get("Content-Language")
+		info.encryption = res.headers.get("x-amz-server-side-encryption")
+		info.deleteMarker = res.headers.get("x-amz-delete-marker") == "true"
+		let count = res.headers.get("x-amz-mp-parts-count")
+		info.parts = count.toInt<int>() when /^[0-9]{1,6}$/.test(count)
+		let tagged = res.headers.get("x-amz-tagging-count")
+		info.tagCount = tagged.toInt<int>() when /^[0-9]{1,6}$/.test(tagged)
+		for let name in res.headers.keys() {
+			let lower = name.lower()
+			info.metadata.set(lower.slice(11), res.headers.get(name)) when lower.startsWith("x-amz-meta-")
+		}
+		return info
+	}
+
+	// The value of `x-amz-copy-source` for an object.
+	def copySource(bucket string, key string, version string) string {
+		let out = "/{uriEncode(bucket)}/{uriEncode(key, true)}"
+		return out when version == ""
+		return "{out}?versionId={uriEncode(version)}"
+	}
+
+	// The S3Error an error is; one of ErrorKind.Protocol around any other.
+	def asS3Error(err error) S3Error {
+		return err when err is S3Error
+		return errorOf(ErrorKind.Protocol, err.message, err)
+	}
+
+	// Reads a `<Tagging>` document.
+	def labelsIn(root XMLNode) map<string, string> {
+		let out map<string, string>
+		let set = root.child("TagSet")
+		return out when set is none
+		for let node in set.elements("Tag") {
+			out.set(textOf(node, "Key"), textOf(node, "Value"))
+		}
+		return out
+	}
+
+	// Writes a `<Tagging>` document.
+	def labelsDocument(labels map<string, string>) byte[] {
+		let doc = new encoding.XMLWriter()
+		doc.start("Tagging")
+		doc.attribute("xmlns", xmlns)
+		doc.start("TagSet")
+		for let (name, value) in labels {
+			doc.start("Tag")
+			doc.element("Key", name)
+			doc.element("Value", value)
+			doc.end()
+		}
+		doc.end()
+		doc.end()
+		return doc.bytes()
+	}
+
+	// Uploads one part of a multipart upload.
+	def sendPart(engine Engine, bucket string, key string, id string, number int, data byte[]) !Part {
+		fail errorOf(ErrorKind.Argument, "s3: part number {number} is not 1 to {maxParts}") when number < 1 || number > maxParts
+		let call = new Call("PUT", bucket, key)
+		call.param("partNumber", number.str())
+		call.param("uploadId", id)
+		call.body = data
+		let res = try engine.done(call)
+		return Part{number: number, etag: bareTag(res.headers.get("ETag")), size: data.len()}
+	}
+
+	// How a part sent on a task of its own ended.
+	struct PartOutcome {
+		part    Part
+		failure ?error
+	}
+
+	async def sendPartTask(engine Engine, bucket string, key string, id string, number int, data byte[]) async PartOutcome {
+		let failure ?error = none
+		let part = sendPart(engine, bucket, key, id, number, data) onerror (err error) {
+			failure = err
+			recover Part{}
+		}
+		return PartOutcome{part: part, failure: failure}
+	}
+
+	// Reads up to `size` bytes: fewer only at the end of the stream.
+	def readPiece(body io.Reader, size int) !byte[] {
+		let data byte[] = []
+		data.len(size)
+		let n = 0
+		for n < size {
+			let got = try body.read(data[n:])
+			break when got == 0
+			n += got
+		}
+		return data when n == size
+		return data[:n].clone()
+	}
+
+	// Sends a stream as the parts of a multipart upload, `uploadTasks` at
+	// a time; `first` is its first part, already read.
+	def sendPieces(engine Engine, bucket string, key string, id string, first byte[], body io.Reader) !Part[] {
+		let parts Part[] = []
+		let flying array<async PartOutcome> = []
+		let failure ?error = none
+		let piece = first
+		let number = 1
+		for piece.len() > 0 {
+			if number > maxParts {
+				failure = errorOf(ErrorKind.Argument, "s3: {key} needs more than {maxParts} parts of {engine.partSize} bytes; raise partSize")
+				break
+			}
+			if flying.len() >= engine.uploadTasks {
+				let oldest = flying.shift()
+				let outcome = await oldest
+				failure = outcome.failure
+				break unless failure is none
+				parts.push(outcome.part)
+			}
+			flying.push(sendPartTask(engine, bucket, key, id, number, piece))
+			number++
+			break when piece.len() < engine.partSize
+			let none_ byte[] = []
+			piece = readPiece(body, engine.partSize) onerror (err error) {
+				failure = errorOf(ErrorKind.Argument, "s3: reading the body of {key}: {err.message}", err)
+				recover none_
+			}
+			break unless failure is none
+		}
+		for let task in flying {
+			let outcome = await task
+			failure = outcome.failure when failure is none
+			parts.push(outcome.part) when outcome.failure is none
+		}
+		fail failure unless failure is none
+		return parts
+	}
+}

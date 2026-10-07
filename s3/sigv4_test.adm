@@ -1,0 +1,101 @@
+// Signature Version 4 against the examples of the S3 API reference
+// ("Authenticating Requests: Using the Authorization Header", "Using
+// Query Parameters", "Transferring Payload in Multiple Chunks").
+partial module adm.network.s3 {
+	use (
+		std.bytes
+		std.io
+		std.testing
+		adm.network.s3.sigv4::*
+	)
+
+	internal const exampleDate = "20130524T000000Z"
+
+	internal def exampleSigner() Signer {
+		return Signer{accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1"}
+	}
+
+	internal def exampleHeaders(payloadHash string) Field[] {
+		return [
+			Field{name: "Host", value: "examplebucket.s3.amazonaws.com"},
+			Field{name: "x-amz-content-sha256", value: payloadHash},
+			Field{name: "x-amz-date", value: exampleDate},
+		]
+	}
+
+	check "SigV4" {
+		@test()
+		def TestEncoding() {
+			assert uriEncode("AZaz09-._~") == "AZaz09-._~"
+			assert uriEncode("a b/c+d=é") == "a%20b%2Fc%2Bd%3D%C3%A9"
+			assert uriEncode("photos/2026/a b.jpg", true) == "photos/2026/a%20b.jpg"
+			assert canonicalQuery([Field{name:"prefix", value:"J"}, Field{name:"max-keys", value:"2"}]) == "max-keys=2&prefix=J"
+			assert canonicalQuery([Field{name:"a-b", value:""}, Field{name:"a", value:"2"}, Field{name:"a", value:"1"}]) == "a=1&a=2&a-b="
+			let headers = canonicalHeaders([Field{name:"X-Amz-Meta-B", value:"  two   words "}, Field{name:"Host", value:"h"}, Field{name:"x-amz-meta-b", value:"more"}])
+			assert signedNames(headers) == "host;x-amz-meta-b"
+			assert headers[1].value == "two words,more"
+		}
+
+		@test()
+		def TestGetObject() {
+			let headers = exampleHeaders(emptyHash)
+			headers.push(Field{name: "Range", value: "bytes=0-9"})
+			let stamp = sign(exampleSigner(), "GET", "/test.txt", "", headers, emptyHash, exampleDate)
+			assert stamp.signature == "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+			assert stamp.authorization == "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+		}
+
+		@test()
+		def TestPutObject() {
+			let body = "Welcome to Amazon S3."
+			let digest = sha256Hex(body.bytes())
+			assert digest == "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072"
+			let headers = exampleHeaders(digest)
+			headers.push(Field{name: "Date", value: "Fri, 24 May 2013 00:00:00 GMT"})
+			headers.push(Field{name: "x-amz-storage-class", value: "REDUCED_REDUNDANCY"})
+			let stamp = sign(exampleSigner(), "PUT", "/" + uriEncode("test$file.text", true), "", headers, digest, exampleDate)
+			assert stamp.signature == "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+		}
+
+		@test()
+		def TestQueries() {
+			let lifecycle = sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"lifecycle", value:""}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
+			assert lifecycle.signature == "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
+			let list = sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"prefix", value:"J"}, Field{name:"max-keys", value:"2"}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
+			assert list.signature == "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+		}
+
+		@test()
+		def TestPresign() {
+			let query = presignedQuery(exampleSigner(), "GET", "/test.txt", [], [Field{name:"Host", value:"examplebucket.s3.amazonaws.com"}], exampleDate, 86400)
+			assert query == "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+		}
+
+		@test()
+		def TestSignedChunks() !none {
+			let size = 65 * 1024
+			let headers = [
+				Field{name: "Host", value: "s3.amazonaws.com"},
+				Field{name: "x-amz-date", value: exampleDate},
+				Field{name: "x-amz-storage-class", value: "REDUCED_REDUNDANCY"},
+				Field{name: "x-amz-content-sha256", value: streamingPayload},
+				Field{name: "Content-Encoding", value: "aws-chunked"},
+				Field{name: "x-amz-decoded-content-length", value: size.str()},
+				Field{name: "Content-Length", value: chunkedLength(size, 64 * 1024).str()},
+			]
+			assert chunkedLength(size, 64 * 1024) == 66824
+			let stamp = sign(exampleSigner(), "PUT", "/examplebucket/chunkObject.txt", "", headers, streamingPayload, exampleDate)
+			assert stamp.signature == "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
+			let payload byte[] = []
+			payload.len(size)
+			payload.fill(byte(97))
+			let framed = try io.readAll(new SignedChunks(new bytes.Buffer(payload), size, stamp, 64 * 1024))
+			assert framed.len() == 66824
+			let text = string(framed)
+			assert text.startsWith("10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n")
+			assert text.contains("\r\n400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n")
+			assert text.endsWith("\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n")
+			return none
+		}
+	}
+}

@@ -1,0 +1,134 @@
+// Where commands go: one server (a Pool), the nodes of a cluster, or the
+// master a group of sentinels names.
+internal partial module adm.network.redis.resp {
+	use adm.network.redis::*
+
+	// Hold is a connection lent for more than one exchange, with the pool
+	// it goes back to.
+	struct Hold {
+		pool Pool
+		conn Conn
+	}
+
+	// Link is what a client sends its commands through.
+	interface Link {
+		// call sends one command and returns its reply, waiting up to
+		// `wait` for it. Fails with a RedisError: the server's error reply,
+		// ErrorKind.Connection, ErrorKind.TimedOut or ErrorKind.Closed.
+		def call(wait duration, args any[]) !Value
+
+		// run sends commands without waiting for each reply and returns
+		// the replies in order, error replies as values.
+		def run(commands any[][], wait duration) !Value[]
+
+		// hold lends a connection to the server that serves the keys of a
+		// command; none when the command names no key and `now` is false,
+		// and the link has several servers to choose from.
+		def hold(args any[], now bool) !?Hold
+
+		// The server a connection of its own goes to for a command.
+		def place(args any[]) !Target
+
+		// The pools of every server that holds keys.
+		def pools() !Pool[]
+
+		def isOpen() bool
+
+		def isClosed() bool
+
+		def close()
+	}
+
+	// Reach is what asking a pool for a connection gave: the connection,
+	// or why the server cannot be reached.
+	struct Reach {
+		conn   ?Conn
+		reason string
+	}
+
+	def lent(pool Pool) !?Conn {
+		return try pool.borrow()
+	}
+
+	// reach borrows a connection. A server that cannot be reached is not a
+	// failure here: nothing was sent, so the caller may look for another.
+	// Fails with a RedisError as `Pool.borrow` does for any other reason.
+	def reach(pool Pool) !Reach {
+		let out = Reach{reason: ""}
+		out.conn = lent(pool) onerror (err error) {
+			let lost = false
+			lost = err.kind == ErrorKind.Connection when err is RedisError
+			fail err unless lost
+			out.reason = err.message.trimPrefix("redis: ")
+			recover none
+		}
+		return out
+	}
+
+	def ran(conn Conn, batch Batch, wait duration) !?Value[] {
+		return try conn.run(batch, wait)
+	}
+
+	// sendOnce runs a batch on a borrowed connection and gives the
+	// connection back. None when the connection had sat idle and broke
+	// before any reply: the server dropped it meanwhile, nothing ran, and
+	// the batch can be sent again, to this server or to the one that took
+	// over from it. The pool's other idle connections are closed then.
+	// Fails with a RedisError as `Conn.run` does for any other failure.
+	def sendOnce(pool Pool, conn Conn, batch Batch, wait duration) !?Value[] {
+		let stale = conn.reused
+		let replies = ran(conn, batch, wait) onerror (err error) {
+			pool.giveBack(conn)
+			let lost = false
+			lost = err.kind == ErrorKind.Connection when err is RedisError
+			fail err unless stale && lost
+			for let old in pool.takeAll() {
+				old.close()
+			}
+			recover none
+		}
+		pool.giveBack(conn) unless replies is none
+		return replies
+	}
+
+	// The node a redirection names: `MOVED 3999 10.0.0.5:6381` gives the
+	// slot, the host and the port. The host is "" when the server left it
+	// out, which means the one that answered.
+	def redirection(text string) (int, string, int) {
+		let words = text.split(" ")
+		return (-1, "", 0) when words.len() < 3
+		let (host, port) = hostAndPort(words[2], 0)
+		return (decimalOf(words[1].bytes(), 0, words[1].len()), host, port)
+	}
+
+	// Splits `host:port` at its last colon; an address without a port
+	// gets `fallback`. Brackets around an IPv6 host are dropped.
+	def hostAndPort(address string, fallback int) (string, int) {
+		let raw = address.bytes()
+		let colon = -1
+		for let i = raw.len() - 1; i >= 0; i-- {
+			break when raw[i] == byte(']')
+			if raw[i] == byte(':') {
+				colon = i
+				break
+			}
+		}
+		let host = colon < 0 ?? (address, address.slice(0, colon))
+		host = host.slice(1, host.len() - 1) when host.startsWith("[") && host.endsWith("]")
+		return (host, fallback) when colon < 0
+		return (host, decimalOf(raw, colon + 1, raw.len()))
+	}
+
+	// `host:port`, with brackets around a host that has colons of its own.
+	def addressOf(host string, port int) string {
+		return host.contains(":") ?? ("[{host}]:{port}", "{host}:{port}")
+	}
+
+	// An error reply made here, for a command of a batch that could not be
+	// sent.
+	def errorValue(text string) Value {
+		let v = new Value(ValueKind.Error)
+		v.data = text.bytes()
+		return v
+	}
+}

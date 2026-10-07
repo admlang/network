@@ -1,0 +1,637 @@
+// Redis Cluster: the hash slot of a key, which keys a command names, the
+// map of slots to nodes, and following the redirections a node answers
+// with while slots move.
+internal partial module adm.network.redis.resp {
+	use (
+		std.sync
+		std.time
+		adm.network.redis::*
+	)
+
+	const slotCount = 16384
+	// How many times one command is sent again after redirections, busy
+	// slots and nodes that do not answer.
+	const maxHops = 16
+
+	// CRC-16/XMODEM (polynomial 0x1021), a byte at a time.
+	const slotTable int[] = [
+		0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
+		0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
+		0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
+		0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
+		0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
+		0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
+		0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
+		0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
+		0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
+		0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
+		0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
+		0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
+		0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
+		0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
+		0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
+		0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
+		0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
+		0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
+		0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
+		0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
+		0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
+		0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+		0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
+		0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
+		0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
+		0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
+		0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
+		0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
+		0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
+		0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
+		0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
+		0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0,
+	]
+
+	// The hash slot of a key: of what stands between its first `{` and the
+	// next `}` when that is not empty, else of the whole key.
+	def slotOf(key byte[]) int {
+		let from = 0
+		let to = key.len()
+		for let i = 0; i < key.len(); i++ {
+			continue when key[i] != byte('{')
+			for let j = i + 1; j < key.len(); j++ {
+				continue when key[j] != byte('}')
+				if j > i + 1 {
+					from = i + 1
+					to = j
+				}
+				break
+			}
+			break
+		}
+		let crc = 0
+		for let i = from; i < to; i++ {
+			crc = ((crc << 8) & 0xFFFF) ^ slotTable[((crc >> 8) ^ int(key[i])) & 0xFF]
+		}
+		return crc % slotCount
+	}
+
+	// KeySpec says where a command's keys are among its arguments.
+	struct KeySpec {
+		// The first key, the last (negative: counted from the end) and
+		// the distance between keys; first 0 for a command without keys.
+		first    int
+		last     int
+		step     int
+		// The keys are found some other way.
+		movable  bool
+		readOnly bool
+	}
+
+	// Reads the reply of COMMAND into specs by lower-case name; a
+	// subcommand goes under `command|subcommand`.
+	def keySpecs(reply Value) map<string, KeySpec> {
+		let out = new map<string, KeySpec>()
+		for let item in reply.items {
+			addSpec(out, item)
+		}
+		return out
+	}
+
+	def addSpec(out map<string, KeySpec>, item Value) {
+		return when item.items.len() < 6
+		let spec = KeySpec{first: item.items[3].toInt(), last: item.items[4].toInt(), step: item.items[5].toInt()}
+		for let flag in item.items[2].items {
+			match flag.text() {
+				case "movablekeys":
+					spec.movable = true
+				case "readonly":
+					spec.readOnly = true
+			}
+		}
+		out.set(item.items[0].text().lower(), spec)
+		return when item.items.len() < 10
+		for let sub in item.items[9].items {
+			addSpec(out, sub)
+		}
+	}
+
+	// The positions of a command's keys among its arguments; none when
+	// only the server can tell.
+	def keyPositions(specs map<string, KeySpec>, name string, words string[]) ?int[] {
+		let out int[] = []
+		let spec = specs.get(name)
+		if words.len() > 1 {
+			let sub = specs.get("{name}|{words[1].lower()}")
+			spec = sub unless sub is none
+		}
+		return out when spec is none
+		if !spec.movable {
+			return out when spec.first <= 0
+			let last = spec.last < 0 ?? (words.len() + spec.last, spec.last)
+			let step = spec.step < 1 ?? (1, spec.step)
+			for let i = spec.first; i <= last && i < words.len(); i += step {
+				out.push(i)
+			}
+			return out
+		}
+		// Commands that count their keys, by where the count is.
+		let count = -1
+		let from = 0
+		match name {
+			case "eval", "evalsha", "eval_ro", "evalsha_ro", "fcall", "fcall_ro", "blmpop", "bzmpop":
+				count = 2
+				from = 3
+			case "zunion", "zinter", "zdiff", "sintercard", "zintercard", "lmpop", "zmpop":
+				count = 1
+				from = 2
+			case "zunionstore", "zinterstore", "zdiffstore":
+				out.push(1) when words.len() > 1
+				count = 2
+				from = 3
+			case "xread", "xreadgroup":
+				for let i = 1; i < words.len(); i++ {
+					continue when words[i].lower() != "streams"
+					let keys = (words.len() - i - 1) / 2
+					for let k = 0; k < keys; k++ {
+						out.push(i + 1 + k)
+					}
+					break
+				}
+				return out
+			case "sort", "sort_ro", "georadius", "georadiusbymember", "georadius_ro", "georadiusbymember_ro":
+				out.push(1) when words.len() > 1
+				return out
+			default:
+				return none
+		}
+		return out when words.len() <= count
+		let keys = decimalOf(words[count].bytes(), 0, words[count].len())
+		for let k = 0; k < keys && from + k < words.len(); k++ {
+			out.push(from + k)
+		}
+		return out
+	}
+
+	// Layout is which node serves each slot.
+	type Layout {
+		// Per slot the shard that serves it; -1 for a slot nobody serves.
+		slots    int[]
+		// Per shard the address of its master and of its replicas.
+		masters  string[]
+		replicas string[][]
+
+		def new() {
+			slots.len(slotCount)
+			slots.fill(-1)
+		}
+
+		// The shard of a master, added when it is new.
+		def shard(master string) int {
+			let at = masters.indexOf(master)
+			return at when at >= 0
+			masters.push(master)
+			let nobody string[] = []
+			replicas.push(nobody)
+			return masters.len() - 1
+		}
+	}
+
+	// Reads the reply of CLUSTER SLOTS. `asked` is the host of the node
+	// that answered: a node that does not know its own address leaves the
+	// host empty. `named` prefers the host names nodes announce, for TLS.
+	def layoutOf(reply Value, asked string, named bool) Layout {
+		let layout = new Layout()
+		for let range in reply.items {
+			continue when range.items.len() < 3
+			let master = nodeAddress(range.items[2], asked, named)
+			continue when master == ""
+			let shard = layout.shard(master)
+			let low = range.items[0].toInt()
+			let high = range.items[1].toInt()
+			for let slot = low; slot <= high && slot < slotCount; slot++ {
+				layout.slots[slot] = shard when slot >= 0
+			}
+			for let i = 3; i < range.items.len(); i++ {
+				let replica = nodeAddress(range.items[i], asked, named)
+				layout.replicas[shard].push(replica) unless replica == "" || layout.replicas[shard].includes(replica)
+			}
+		}
+		return layout
+	}
+
+	def nodeAddress(node Value, asked string, named bool) string {
+		return "" when node.items.len() < 2
+		let host = node.items[0].text()
+		if named && node.items.len() > 3 {
+			let announced = node.items[3].get("hostname")
+			if !(announced is none) {
+				host = announced.text() unless announced.text() == ""
+			}
+		}
+		host = asked when host := "" || "?"
+		return addressOf(host, node.items[1].toInt())
+	}
+
+	// ClusterLink sends each command to the node that serves its keys.
+	type ClusterLink {
+		base         Target
+		limit        int
+		// Read-only commands go to a replica of the shard when it has one.
+		readReplicas bool
+		seeds        string[]
+		specs        map<string, KeySpec>
+		// Guards `nodes`, `layout`, `turn` and `refreshed`.
+		lock         sync.Mutex
+		// One refresh at a time; the others wait for its result.
+		refreshing   sync.Mutex
+		nodes        map<string, Pool>
+		layout       Layout
+		refreshed    time.Time
+		turn         int
+		atomic shut  bool                 = false
+
+		def new(base Target, seeds string[], limit int, readReplicas bool) {
+			self.base = base
+			self.seeds = seeds
+			self.limit = limit
+			self.readReplicas = readReplicas
+			lock = new sync.Mutex()
+			refreshing = new sync.Mutex()
+			layout = new Layout()
+			refreshed = time.fromUnixNs(int64(0))
+		}
+
+		// open reads the slot map from the first seed that answers, and
+		// the key positions of the server's commands.
+		// Fails with a RedisError: ErrorKind.Connection when no seed
+		// answers, ErrorKind.Cluster when the server is not in cluster
+		// mode.
+		def open() !none {
+			try refresh(true)
+			let failure ?error = none
+			for let pool in try pools() {
+				failure = none
+				let reply = pool.call(base.timeout, ["COMMAND"]) onerror (err error) {
+					failure = err
+					recover new Value()
+				}
+				continue unless failure is none
+				specs = keySpecs(reply)
+				return none
+			}
+			fail failure unless failure is none
+			fail errorOf(ErrorKind.Cluster, "redis: the cluster serves no slots")
+		}
+
+		def current() Layout {
+			lock.lock()
+			let now = layout
+			lock.unlock()
+			return now
+		}
+
+		// The pool of a node, made when it is first asked for. A replica
+		// that answers reads has a pool of its own.
+		def poolFor(address string, reading bool) Pool {
+			let id = reading ?? ("{address} r", address)
+			lock.lock()
+			let known = nodes.get(id)
+			if !(known is none) {
+				lock.unlock()
+				return known
+			}
+			let (host, port) = hostAndPort(address, 6379)
+			let target = retarget(base, host, port)
+			target.replica = reading
+			let pool = new Pool()
+			pool.prepare(target, limit)
+			pool.close() when shut
+			nodes.set(id, pool)
+			lock.unlock()
+			return pool
+		}
+
+		// refresh asks the nodes for the slot map until one answers.
+		// Without `force` a map younger than 100 ms is kept.
+		// Fails with a RedisError: ErrorKind.Connection when no node
+		// answers, ErrorKind.Cluster when the answer is not a slot map.
+		def refresh(force bool) !none {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+			refreshing.lock()
+			lock.lock()
+			let fresh = time.now().since(refreshed) < 100ms
+			let candidates = layout.masters.clone()
+			for let shard in layout.replicas {
+				candidates.push(...shard)
+			}
+			lock.unlock()
+			if fresh && !force {
+				refreshing.unlock()
+				return none
+			}
+			for let seed in seeds {
+				candidates.push(seed) unless candidates.includes(seed)
+			}
+			let failure ?error = none
+			for let address in candidates {
+				let reply = poolFor(address, false).call(base.timeout, ["CLUSTER", "SLOTS"]) onerror (err error) {
+					failure = err
+					recover new Value()
+				}
+				continue unless reply.kind == ValueKind.Array
+				let (host, _) = hostAndPort(address, 6379)
+				let next = layoutOf(reply, host, base.secure)
+				continue when next.masters.len() == 0
+				adopt(next)
+				refreshing.unlock()
+				return none
+			}
+			refreshing.unlock()
+			fail failure unless failure is none
+			fail errorOf(ErrorKind.Cluster, "redis: no node of the cluster serves a slot")
+		}
+
+		// Makes a slot map the current one and closes the pools of nodes
+		// that left the cluster.
+		def adopt(next Layout) {
+			let live string[] = next.masters.clone()
+			for let shard in next.replicas {
+				live.push(...shard)
+			}
+			let gone Pool[] = []
+			lock.lock()
+			layout = next
+			refreshed = time.now()
+			for let id in nodes.keys() {
+				continue when live.includes(id.trimSuffix(" r"))
+				let pool = nodes.get(id)
+				gone.push(pool) unless pool is none
+				nodes.delete(id)
+			}
+			lock.unlock()
+			for let pool in gone {
+				pool.close()
+			}
+		}
+
+		// The slot a command's keys hash to, -1 when it names none, and
+		// whether the command only reads.
+		// Fails with a RedisError of ErrorKind.Cluster when the keys hash
+		// to different slots, and as `Batch.add` does.
+		def slotFor(args any[]) !(int, bool) {
+			fail errorOf(ErrorKind.Argument, "redis: a command needs a name") when args.len() == 0
+			let words string[] = []
+			let raw byte[][] = []
+			for let (i, arg) in args {
+				let data = try bytesOf(arg, i)
+				raw.push(data)
+				// Only the short arguments can be names, counts or options.
+				words.push(data.len() <= 64 ?? (string(data), ""))
+			}
+			let name = words[0].lower()
+			let reading = false
+			let spec = specs.get(name)
+			reading = spec.readOnly unless spec is none
+			let positions = keyPositions(specs, name, words)
+			let keys byte[][] = []
+			if positions is none {
+				let ask any[] = ["COMMAND", "GETKEYS"]
+				ask.push(...args)
+				let reply = anyPool().call(base.timeout, ask) onerror recover new Value()
+				for let item in reply.items {
+					keys.push(item.bytes())
+				}
+			} else {
+				for let at in positions {
+					keys.push(raw[at]) when at < raw.len()
+				}
+			}
+			let slot = -1
+			for let key in keys {
+				let own = slotOf(key)
+				fail errorOf(ErrorKind.Cluster, "redis: CROSSSLOT the keys of {words[0]} hash to different slots; give them a common \{tag\}", "CROSSSLOT") when slot >= 0 && own != slot
+				slot = own
+			}
+			return (slot, reading)
+		}
+
+		def anyPool() Pool {
+			let now = current()
+			lock.lock()
+			turn++
+			let pick = turn
+			lock.unlock()
+			return poolFor(seeds[0], false) when now.masters.len() == 0
+			return poolFor(now.masters[pick % now.masters.len()], false)
+		}
+
+		// The pool a command for a slot goes to.
+		// Fails with a RedisError of ErrorKind.Cluster for a slot no node
+		// serves.
+		def poolOf(slot int, reading bool) !Pool {
+			return anyPool() when slot < 0
+			let now = current()
+			let shard = now.slots[slot]
+			if shard < 0 {
+				try refresh(false)
+				now = current()
+				shard = now.slots[slot]
+			}
+			fail errorOf(ErrorKind.Cluster, "redis: CLUSTERDOWN no node serves slot {slot}", "CLUSTERDOWN") when shard < 0
+			let spare = now.replicas[shard]
+			if reading && readReplicas && spare.len() > 0 {
+				lock.lock()
+				turn++
+				let pick = turn
+				lock.unlock()
+				return poolFor(spare[pick % spare.len()], true)
+			}
+			return poolFor(now.masters[shard], false)
+		}
+
+		// attempt sends one command to the node of its slot and follows
+		// what the node answers: MOVED to the slot's new node, ASK to the
+		// node a slot is moving to, TRYAGAIN and CLUSTERDOWN after a
+		// pause, a node that cannot be reached to whoever took its slots
+		// over. The reply may be an error reply.
+		// Fails with a RedisError: ErrorKind.Cluster after `maxHops`
+		// tries, ErrorKind.Connection, ErrorKind.TimedOut,
+		// ErrorKind.Closed.
+		def attempt(wait duration, args any[]) !Value {
+			let (slot, reading) = try slotFor(args)
+			let pool = try poolOf(slot, reading)
+			let asking = false
+			let last = ""
+			for let hop = 0; hop < maxHops; hop++ {
+				fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+				let batch = new Batch()
+				try batch.add(["ASKING"]) when asking
+				try batch.add(args)
+				let got = try reach(pool)
+				let conn = got.conn
+				if conn is none {
+					// Nothing was sent, so the command can go elsewhere: to
+					// the replica the cluster promotes, once it has.
+					last = got.reason
+					pause(hop)
+					refresh(true) onerror recover none
+					pool = try poolOf(slot, reading)
+					asking = false
+					continue
+				}
+				let replies = sendOnce(pool, conn, batch, wait) onerror (err error) {
+					refresh(false) onerror recover none
+					fail err
+				}
+				// A connection the node dropped while it sat idle: the next
+				// try opens one, or finds the node gone.
+				continue when replies is none
+				let reply = replies[replies.len() - 1]
+				return reply unless reply.isError()
+				let text = reply.text()
+				let prefix = text.split(" ")[0]
+				last = text
+				match prefix {
+					case "MOVED", "ASK":
+						let (_, host, port) = redirection(text)
+						return reply when port <= 0
+						host = pool.target.host when host == ""
+						asking = prefix == "ASK"
+						if !asking {
+							refresh(true) onerror recover none
+						}
+						pool = poolFor(addressOf(host, port), false)
+					case "TRYAGAIN", "CLUSTERDOWN":
+						pause(hop)
+						refresh(prefix == "CLUSTERDOWN") onerror recover none
+						pool = try poolOf(slot, reading)
+						asking = false
+					case "READONLY":
+						// A replica that was asked to write: the map is old.
+						return reply unless reading && readReplicas
+						refresh(true) onerror recover none
+						pool = try poolOf(slot, false)
+						asking = false
+					default:
+						return reply
+				}
+			}
+			fail errorOf(ErrorKind.Cluster, "redis: gave up after {maxHops} tries: {last}", "CLUSTERDOWN")
+		}
+
+		// Waits a little longer each time, up to 800 ms.
+		def pause(hop int) {
+			time.sleep(duration(int(25ms) * (1 << hop.min(5))))
+		}
+
+		def call(wait duration, args any[]) !Value {
+			let reply = try attempt(wait, args)
+			fail serverError(reply.text()) when reply.isError()
+			return reply
+		}
+
+		// run sends each command to the node of its slot, the commands of
+		// one node as one batch and in their order, and then follows the
+		// redirections single commands were answered with.
+		def run(commands any[][], wait duration) !Value[] {
+			let out Value[] = []
+			let again int[] = []
+			let groups = new map<Pool, int[]>()
+			for let (i, command) in commands {
+				out.push(new Value())
+				let refused = ""
+				let pool = routed(command) onerror (err error) {
+					refused = err.message.trimPrefix("redis: ")
+					recover none
+				}
+				if pool is none {
+					out[i] = errorValue(refused)
+					continue
+				}
+				let members = groups.get(pool)
+				if members is none {
+					groups.set(pool, [i])
+				} else {
+					members.push(i)
+				}
+			}
+			for let (pool, members) in groups {
+				let batch = new Batch()
+				for let i in members {
+					try batch.add(commands[i])
+				}
+				let conn = (try reach(pool)).conn
+				if conn is none {
+					again.push(...members)
+					continue
+				}
+				let replies = try sendOnce(pool, conn, batch, wait)
+				if replies is none {
+					again.push(...members)
+					continue
+				}
+				for let (k, i) in members {
+					out[i] = replies[k]
+					continue unless replies[k].isError()
+					again.push(i) when replies[k].text().split(" ")[0] := "MOVED" || "ASK" || "TRYAGAIN" || "CLUSTERDOWN"
+				}
+			}
+			for let i in again {
+				out[i] = try attempt(wait, commands[i])
+			}
+			return out
+		}
+
+		// The pool a command goes to.
+		def routed(args any[]) !?Pool {
+			let (slot, reading) = try slotFor(args)
+			return try poolOf(slot, reading)
+		}
+
+		def hold(args any[], now bool) !?Hold {
+			let slot = -1
+			(slot, _) = try slotFor(args) when args.len() > 0
+			return none when slot < 0 && !now
+			for let hop = 0; hop < maxHops; hop++ {
+				let pool = try poolOf(slot, false)
+				let conn = (try reach(pool)).conn
+				return Hold{pool: pool, conn: conn} unless conn is none
+				pause(hop)
+				refresh(true) onerror recover none
+			}
+			fail errorOf(ErrorKind.Connection, "redis: no node serves the keys of the transaction")
+		}
+
+		def place(args any[]) !Target {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+			let slot = -1
+			(slot, _) = try slotFor(args) when args.len() > 0
+			return (try poolOf(slot, false)).target
+		}
+
+		def pools() !Pool[] {
+			fail errorOf(ErrorKind.Closed, "redis: the client is closed") when shut
+			let out Pool[] = []
+			for let master in current().masters {
+				out.push(poolFor(master, false))
+			}
+			return out
+		}
+
+		def isOpen() bool {
+			return true
+		}
+
+		def isClosed() bool {
+			return shut
+		}
+
+		def close() {
+			shut = true
+			lock.lock()
+			let all = nodes.values()
+			lock.unlock()
+			for let pool in all {
+				pool.close()
+			}
+		}
+	}
+}

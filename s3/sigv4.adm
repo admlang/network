@@ -1,0 +1,295 @@
+// AWS Signature Version 4 as S3 takes it: header signatures, presigned
+// URLs, signed chunked bodies and POST policies.
+internal partial module adm.network.s3.sigv4 {
+	use (
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+		std.io
+		std.time
+		adm.network.s3::*
+	)
+
+	const algorithm = "AWS4-HMAC-SHA256"
+	const chunkAlgorithm = "AWS4-HMAC-SHA256-PAYLOAD"
+	// Values of `x-amz-content-sha256` that stand for a body the signature
+	// does not cover, and for one signed chunk by chunk.
+	const unsignedPayload = "UNSIGNED-PAYLOAD"
+	const streamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	// SHA-256 of no bytes.
+	const emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// Payload bytes per signed chunk. S3 wants at least 8 KiB in every
+	// chunk but the last.
+	const chunkSize = 256 * 1024
+
+	// Field is one query parameter or one header.
+	struct Field {
+		name  string
+		value string
+	}
+
+	// Signer holds what a signature is made from.
+	struct Signer {
+		accessKey string
+		secretKey string
+		// The session token of temporary credentials; "" without one.
+		token     string
+		region    string
+		// The service name of the credential scope: `s3`.
+		product   string = "s3"
+	}
+
+	// Stamp is a finished signature and what later chunk signatures chain
+	// from.
+	struct Stamp {
+		// The value of the `Authorization` header.
+		authorization string
+		signature     string
+		key           byte[]
+		scope         string
+		amzDate       string
+	}
+
+	// uriEncode percent-encodes every byte but the unreserved characters
+	// of RFC 3986 (`A-Z a-z 0-9 - . _ ~`), in upper-case hex. With
+	// `keepSlash` a `/` stays, as in an object key used as a path.
+	def uriEncode(text string, keepSlash bool = false) string {
+		let digits = "0123456789ABCDEF".bytes()
+		let out byte[] = []
+		for let b in text.bytes() {
+			let c = int(b)
+			let plain = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || (c := 45 || 46 || 95 || 126)
+			if plain || (keepSlash && c == 47) {
+				out.push(b)
+				continue
+			}
+			out.push(byte(37), digits[c >> 4], digits[c & 15])
+		}
+		return string(out)
+	}
+
+	// canonicalQuery encodes the parameters and orders them by name, then
+	// value: the query string as it is signed and sent.
+	def canonicalQuery(fields Field[]) string {
+		let encoded Field[] = []
+		for let f in fields {
+			encoded.push(Field{name: uriEncode(f.name), value: uriEncode(f.value)})
+		}
+		let ordered = encoded.sort(def (a, b Field) bool {
+			let byName = a.name.compare(b.name)
+			return byName < 0 || (byName == 0 && a.value.compare(b.value) < 0)
+		})
+		let parts string[] = []
+		for let f in ordered {
+			parts.push("{f.name}={f.value}")
+		}
+		return parts.join("&")
+	}
+
+	// canonicalHeaders lower-cases the names, trims the values and folds
+	// their runs of spaces, joins the values of one name with commas and
+	// orders the result by name.
+	def canonicalHeaders(fields Field[]) Field[] {
+		let names string[] = []
+		let values map<string, string>
+		for let f in fields {
+			let name = f.name.lower()
+			let value = foldSpaces(f.value)
+			if values.hasKey(name) {
+				values.set(name, "{values[name]},{value}")
+				continue
+			}
+			names.push(name)
+			values.set(name, value)
+		}
+		let ordered = names.sort((a, b string) => a.compare(b) < 0)
+		let out Field[] = []
+		for let name in ordered {
+			out.push(Field{name: name, value: values[name]})
+		}
+		return out
+	}
+
+	// A header value without the spaces and tabs around it, each run of
+	// them inside it as one space.
+	def foldSpaces(value string) string {
+		let out byte[] = []
+		let gap = false
+		for let b in value.bytes() {
+			if b == byte(32) || b == byte(9) {
+				gap = out.len() > 0
+				continue
+			}
+			out.push(byte(32)) when gap
+			gap = false
+			out.push(b)
+		}
+		return string(out)
+	}
+
+	// The names of canonical headers as `SignedHeaders` lists them.
+	def signedNames(headers Field[]) string {
+		let names string[] = []
+		for let h in headers {
+			names.push(h.name)
+		}
+		return names.join(";")
+	}
+
+	// canonicalRequest is the text whose digest is signed. `path` and
+	// `query` are already encoded, `headers` canonical.
+	def canonicalRequest(method string, path string, query string, headers Field[], payloadHash string) string {
+		let lines string[] = [method, path, query]
+		for let h in headers {
+			lines.push("{h.name}:{h.value}")
+		}
+		lines.push("", signedNames(headers), payloadHash)
+		return lines.join("\n")
+	}
+
+	// Lower-case hex of the SHA-256 digest.
+	def sha256Hex(data byte[]) string {
+		return hash.digest(Hash.SHA256, data).hex().lower()
+	}
+
+	// `20130524T000000Z` for a time: the form of `x-amz-date`. Its first
+	// eight characters are the day of the credential scope.
+	def amzDateOf(at time.Time) string {
+		let whole = time.fromUnixNs(at.unixNs() / 1000000000 * 1000000000)
+		return whole.str(time.TimeFormat.ISO8601Basic)
+	}
+
+	def scopeOf(signer Signer, amzDate string) string {
+		return "{amzDate.slice(0, 8)}/{signer.region}/{signer.product}/aws4_request"
+	}
+
+	// The key a day's signatures in one region are made with.
+	def signingKey(signer Signer, amzDate string) byte[] {
+		let day = hash.hmac(Hash.SHA256, "AWS4{signer.secretKey}".bytes(), amzDate.slice(0, 8).bytes())
+		let region = hash.hmac(Hash.SHA256, day, signer.region.bytes())
+		let product = hash.hmac(Hash.SHA256, region, signer.product.bytes())
+		return hash.hmac(Hash.SHA256, product, "aws4_request".bytes())
+	}
+
+	def macHex(key byte[], text string) string {
+		return hash.hmac(Hash.SHA256, key, text.bytes()).hex().lower()
+	}
+
+	// sign signs a request for the `Authorization` header. `headers` are
+	// the headers to sign as they will be sent, `Host` and `x-amz-date`
+	// among them.
+	def sign(signer Signer, method string, path string, query string, headers Field[], payloadHash string, amzDate string) Stamp {
+		let canonical = canonicalHeaders(headers)
+		let request = canonicalRequest(method, path, query, canonical, payloadHash)
+		let scope = scopeOf(signer, amzDate)
+		let key = signingKey(signer, amzDate)
+		let signature = macHex(key, [algorithm, amzDate, scope, sha256Hex(request.bytes())].join("\n"))
+		let text = "{algorithm} Credential={signer.accessKey}/{scope}, SignedHeaders={signedNames(canonical)}, Signature={signature}"
+		return Stamp{authorization: text, signature: signature, key: key, scope: scope, amzDate: amzDate}
+	}
+
+	// presign returns the query string of a presigned URL: the given
+	// parameters, the `X-Amz-*` ones and the signature. The body is not
+	// signed. `headers` must hold `Host`.
+	def presignedQuery(signer Signer, method string, path string, query Field[], headers Field[], amzDate string, expires int) string {
+		let canonical = canonicalHeaders(headers)
+		let scope = scopeOf(signer, amzDate)
+		let all Field[] = []
+		all.push(...query)
+		all.push(Field{name: "X-Amz-Algorithm", value: algorithm})
+		all.push(Field{name: "X-Amz-Credential", value: "{signer.accessKey}/{scope}"})
+		all.push(Field{name: "X-Amz-Date", value: amzDate})
+		all.push(Field{name: "X-Amz-Expires", value: expires.str()})
+		all.push(Field{name: "X-Amz-SignedHeaders", value: signedNames(canonical)})
+		all.push(Field{name: "X-Amz-Security-Token", value: signer.token}) when signer.token != ""
+		let text = canonicalQuery(all)
+		let request = canonicalRequest(method, path, text, canonical, unsignedPayload)
+		let signature = macHex(signingKey(signer, amzDate), [algorithm, amzDate, scope, sha256Hex(request.bytes())].join("\n"))
+		return "{text}&X-Amz-Signature={signature}"
+	}
+
+	// The signature of one chunk of a signed chunked body, chained from
+	// the signature before it.
+	def chunkSignature(key byte[], amzDate string, scope string, previous string, chunk byte[]) string {
+		return macHex(key, [chunkAlgorithm, amzDate, scope, previous, emptyHash, sha256Hex(chunk)].join("\n"))
+	}
+
+	// How many bytes a body of `size` bytes takes once it is cut into
+	// signed chunks of `piece` bytes.
+	def chunkedLength(size int, piece int = chunkSize) int {
+		// A chunk is `<hex size>;chunk-signature=<64 hex>\r\n<data>\r\n`.
+		let overhead = 17 + 64 + 2 + 2
+		let whole = size / piece
+		let rest = size % piece
+		let total = whole * (piece.hex().len() + overhead + piece)
+		total += rest.hex().len() + overhead + rest when rest > 0
+		return total + 1 + overhead
+	}
+
+	// SignedChunks reads a body as S3's `aws-chunked` encoding: each chunk
+	// carries a signature chained from the request's own, so the body is
+	// signed without being read twice.
+	type SignedChunks {
+		source   io.Reader
+		// Payload bytes still to read from the source.
+		left     int
+		piece    int
+		key      byte[]
+		amzDate  string
+		scope    string
+		previous string
+		pending  byte[]
+		offset   int
+		ended    bool
+
+		def new(source io.Reader, size int, stamp Stamp, piece int = chunkSize) {
+			self.source = source
+			left = size
+			self.piece = piece
+			key = stamp.key
+			amzDate = stamp.amzDate
+			scope = stamp.scope
+			previous = stamp.signature
+		}
+
+		// Implements io.Reader. Fails when the source does, or ends before
+		// the size it was announced with.
+		def read(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			if offset >= pending.len() {
+				return 0 when ended
+				try fill()
+			}
+			let n = (pending[offset:]).copy(buf)
+			offset += n
+			return n
+		}
+
+		// Frames the next chunk into `pending`; the last one is empty.
+		def fill() !none {
+			let want = left.min(piece)
+			let data byte[] = []
+			data.len(want)
+			if want > 0 {
+				io.readFull(source, data) onerror (err error) {
+					fail S3Error{message: "s3: the body ended {left} bytes before its announced size", code: ErrorKind.Argument.value, kind: ErrorKind.Argument, cause: err}
+				}
+			}
+			left -= want
+			ended = want == 0
+			previous = chunkSignature(key, amzDate, scope, previous, data)
+			let frame = "{want.hex().lower()};chunk-signature={previous}\r\n".bytes()
+			frame.push(...data)
+			frame.push(byte(13), byte(10))
+			pending = frame
+			offset = 0
+			return none
+		}
+	}
+
+	// postPolicy signs a browser upload policy: the base64 of the policy
+	// document and its signature.
+	def signPolicy(signer Signer, amzDate string, policy string) (string, string) {
+		let encoded = policy.bytes().base64()
+		return (encoded, macHex(signingKey(signer, amzDate), encoded))
+	}
+}

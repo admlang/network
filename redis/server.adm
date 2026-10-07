@@ -1,0 +1,191 @@
+partial module adm.network.redis {
+	use (
+		std.crypto.hash
+		std.time
+		adm.network.redis.resp::*
+	)
+
+	// Script is a Lua script the server runs. `Client.run` sends its SHA-1
+	// digest and the source only when the server does not have it yet.
+	//
+	// ```
+	// let take = new redis.Script("return redis.call('DECRBY', KEYS[1], ARGV[1])")
+	// let left = (try r.run(take, ["stock"], 3)).toInt()
+	// ```
+	type Script {
+		source string
+		// The SHA-1 digest of the source in lowercase hex, the name the
+		// server knows the script by.
+		sha    string
+
+		def new(source string) {
+			self.source = source
+			sha = new hash.SHA1().hash(source.bytes()).hex().lower()
+		}
+	}
+
+	// Scripts, messages and the server itself. Each fails with a RedisError
+	// as `command` does.
+	partial type Client {
+		// Runs a Lua script with its KEYS and ARGV. Fails with the server's
+		// error when the script does not compile or raises one.
+		def eval(script string, keys string[] = [], args ...any) !Value {
+			return try call(timeout, ...joinedAny(joined(["EVAL", script, keys.len()], keys), args))
+		}
+
+		// Runs the script the server caches under a SHA-1 digest. Fails with
+		// ErrorKind.NoScript when it has none, and as `eval` does.
+		def evalSha(sha string, keys string[] = [], args ...any) !Value {
+			return try call(timeout, ...joinedAny(joined(["EVALSHA", sha, keys.len()], keys), args))
+		}
+
+		// Runs a Script by its digest, sending the source when the server
+		// does not have it. Fails as `eval` does.
+		def run(script Script, keys string[] = [], args ...any) !Value {
+			let missing = false
+			let reply = call(timeout, ...joinedAny(joined(["EVALSHA", script.sha, keys.len()], keys), args)) onerror (err error) {
+				missing = err.kind == ErrorKind.NoScript when err is RedisError
+				fail err unless missing
+				recover new Value()
+			}
+			return reply unless missing
+			return try call(timeout, ...joinedAny(joined(["EVAL", script.source, keys.len()], keys), args))
+		}
+
+		// Stores a script in the server's cache and returns its digest.
+		// Fails as `command` does.
+		def scriptLoad(script string) !string {
+			return (try everywhere("SCRIPT", "LOAD", script))[0].text()
+		}
+
+		// Whether the server caches a script under each digest.
+		// Fails as `command` does.
+		def scriptExists(shas ...string) !bool[] {
+			let out bool[] = []
+			for let (server, reply) in try everywhere(...joined(["SCRIPT", "EXISTS"], shas)) {
+				for let (i, item) in reply.items {
+					if server == 0 {
+						out.push(item.toBool())
+					} else if i < out.len() {
+						// In a cluster a script is there when every master
+						// has it.
+						out[i] = out[i] && item.toBool()
+					}
+				}
+			}
+			return out
+		}
+
+		// Empties the server's script cache.
+		// Fails as `command` does.
+		def scriptFlush() !none {
+			try everywhere("SCRIPT", "FLUSH")
+			return none
+		}
+
+		// Loads a library of functions (Redis 7) and returns its name.
+		// Fails with the server's error when the library exists and
+		// `replace` is not set, or the code does not compile.
+		def functionLoad(code string, replace bool = false) !string {
+			return (try everywhere("FUNCTION", "LOAD", "REPLACE", code))[0].text() when replace
+			return (try everywhere("FUNCTION", "LOAD", code))[0].text()
+		}
+
+		// Calls a function of a loaded library with its keys and arguments.
+		// Fails with the server's error when there is no such function or it
+		// raises one.
+		def fcall(function string, keys string[] = [], args ...any) !Value {
+			return try call(timeout, ...joinedAny(joined(["FCALL", function, keys.len()], keys), args))
+		}
+
+		// Sends a message to a channel. Returns how many subscribers got it.
+		// Fails as `command` does.
+		def publish(channel string, message any) !int {
+			return (try call(timeout, "PUBLISH", channel, message)).toInt()
+		}
+
+		// Sends a message to a shard channel (Redis 7). Returns how many
+		// subscribers got it.
+		// Fails as `command` does.
+		def spublish(channel string, message any) !int {
+			return (try call(timeout, "SPUBLISH", channel, message)).toInt()
+		}
+
+		// Asks the server to answer, and returns how long it took.
+		// Fails as `command` does.
+		def ping() !duration {
+			let started = time.now()
+			try call(timeout, "PING")
+			return time.now() - started
+		}
+
+		// How many keys the database holds.
+		// Fails as `command` does.
+		def dbSize() !int {
+			let total = 0
+			for let reply in try everywhere("DBSIZE") {
+				total += reply.toInt()
+			}
+			return total
+		}
+
+		// Deletes every key of the client's database.
+		// Fails as `command` does.
+		def flushDb() !none {
+			try everywhere("FLUSHDB")
+			return none
+		}
+
+		// Deletes every key of every database.
+		// Fails as `command` does.
+		def flushAll() !none {
+			try everywhere("FLUSHALL")
+			return none
+		}
+
+		// What the server reports about itself, by name: every section, or
+		// the one named (`server`, `memory`, `replication`, `keyspace`).
+		// Fails as `command` does.
+		def info(section string = "") !map<string, string> {
+			let reply = section == "" ?? (try call(timeout, "INFO"), try call(timeout, "INFO", section))
+			let out = new map<string, string>()
+			for let line in reply.text().split("\n") {
+				let entry = line.trim()
+				continue when entry == "" || entry.startsWith("#")
+				let colon = entry.indexOf(":")
+				continue when colon <= 0
+				out.set(entry.slice(0, colon), entry.slice(colon + 1, entry.len()))
+			}
+			return out
+		}
+
+		// The server's clock.
+		// Fails as `command` does.
+		def serverTime() !time.Time {
+			let reply = try call(timeout, "TIME")
+			fail errorOf(ErrorKind.Protocol, "redis: a TIME reply without seconds and microseconds") when reply.items.len() < 2
+			return time.fromUnixNs(int64(reply.items[0].toInt()) * 1000000000 + int64(reply.items[1].toInt()) * 1000)
+		}
+
+		// The server's settings whose names match a glob pattern.
+		// Fails as `command` does.
+		def configGet(pattern string) !map<string, string> {
+			return textMap(try call(timeout, "CONFIG", "GET", pattern))
+		}
+
+		// Changes a setting of the running server. Fails with the server's
+		// error for a setting or a value it does not take.
+		def configSet(name string, value any) !none {
+			try everywhere("CONFIG", "SET", name, value)
+			return none
+		}
+
+		// Waits until the writes sent so far on this connection reached
+		// `replicas` replicas or `limit` passed (0s: without end). Returns
+		// how many replicas have them.
+		// Fails as `command` does.
+		def waitReplicas(replicas int, limit duration) !int {
+			return (try call(patience(timeout, limit), "WAIT", replicas, millis(limit))).toInt()
+		}
+	}
+}

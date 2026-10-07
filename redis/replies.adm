@@ -1,0 +1,106 @@
+// How arguments are assembled and replies become ADM values.
+internal partial module adm.network.redis.resp {
+	use adm.network.redis::*
+
+	// A command's arguments: `head`, then every member of `tail`.
+	def joined(head any[], tail string[]) any[] {
+		for let item in tail {
+			head.push(item)
+		}
+		return head
+	}
+
+	// A command's arguments: `head`, then every member of `tail`.
+	def joinedAny(head any[], tail any[]) any[] {
+		for let item in tail {
+			head.push(item)
+		}
+		return head
+	}
+
+	// A command's arguments: `head`, then each key of `pairs` and its value.
+	def joinedPairs(head any[], pairs map<string, any>) any[] {
+		for let (key, value) in pairs {
+			head.push(key)
+			head.push(value)
+		}
+		return head
+	}
+
+	// A duration in whole milliseconds, as PX and PEXPIRE take it.
+	def millis(d duration) int {
+		return int(int64(d) / 1000000)
+	}
+
+	// A duration in seconds, as the blocking commands take it.
+	def seconds(d duration) float {
+		return float(int64(d)) / 1000000000.0
+	}
+
+	// How long a command that waits `block` on the server may take to
+	// answer: without end when either wait is.
+	def patience(timeout duration, block duration) duration {
+		return 0s when timeout == 0s || block == 0s
+		return timeout + block
+	}
+
+	// The text of a reply, none for null.
+	def optional(v Value) ?string {
+		return none when v.isNull()
+		return v.text()
+	}
+
+	// A map or flat pair list as text by key.
+	def textMap(v Value) map<string, string> {
+		let out = new map<string, string>()
+		for let (key, value) in v.entries() {
+			out.set(key, value.text())
+		}
+		return out
+	}
+
+	// The integers of an array reply.
+	def ints(v Value) int[] {
+		let out int[] = []
+		for let item in v.items {
+			out.push(item.toInt())
+		}
+		return out
+	}
+
+	// Members with scores: RESP2 answers them one after the other, RESP3
+	// as two-member arrays.
+	def scoredOf(v Value) Scored[] {
+		let out Scored[] = []
+		if v.items.len() > 0 && v.items[0].kind == ValueKind.Array {
+			for let pair in v.items {
+				out.push(Scored{member: pair.items[0].text(), score: pair.items[1].toFloat()}) when pair.items.len() == 2
+			}
+			return out
+		}
+		for let i = 0; i + 1 < v.items.len(); i += 2 {
+			out.push(Scored{member: v.items[i].text(), score: v.items[i + 1].toFloat()})
+		}
+		return out
+	}
+
+	// The entries of one stream: arrays of an id and its fields.
+	def entriesOf(v Value) StreamEntry[] {
+		let out StreamEntry[] = []
+		for let item in v.items {
+			continue when item.items.len() < 2
+			out.push(StreamEntry{id: item.items[0].text(), fields: textMap(item.items[1])})
+		}
+		return out
+	}
+
+	// The entries of several streams by key: a map in RESP3, an array of
+	// key and entries pairs in RESP2; null when the read found nothing.
+	def streamsOf(v Value) map<string, StreamEntry[]> {
+		let out = new map<string, StreamEntry[]>()
+		for let (key, entries) in v.entries() {
+			out.set(key, entriesOf(entries))
+		}
+		return out
+	}
+}

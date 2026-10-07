@@ -1,0 +1,184 @@
+partial module adm.network.s3 {
+	use (
+		std.io
+		std.net.http
+		std.os
+		std.time
+		adm.network.s3.wire::*
+	)
+
+	// ObjectInfo describes an object: what `info`, `get`, `put`, `copy`
+	// and the listings say about it. A listing fills `key`, `size`, `etag`,
+	// `modified` and `storageClass` only (and `version`, `latest` and
+	// `deleteMarker` when it lists versions); a write fills `key`, `etag`
+	// and `version`.
+	struct ObjectInfo {
+		key                string
+		// The size of the whole object in bytes, also when a range of it
+		// was read.
+		size               int
+		// The entity tag without its quotes: the MD5 of the content in hex
+		// for an object written in one piece and not encrypted with a key.
+		etag               string
+		modified           time.Time
+		contentType        string
+		// The `x-amz-meta-` values, their names in lower case without the
+		// prefix.
+		metadata           map<string, string>
+		// The version id in a bucket that keeps versions; "" otherwise.
+		version            string
+		// "" stands for STANDARD.
+		storageClass       string
+		cacheControl       string
+		contentDisposition string
+		contentEncoding    string
+		contentLanguage    string
+		// How the object is encrypted at rest (`AES256`, `aws:kms`); ""
+		// when the server does not say.
+		encryption         string
+		// How many parts the object was uploaded in; 0 for one piece.
+		parts              int
+		// How many tags the object carries.
+		tagCount           int
+		// In a listing of versions: whether this is the current one, and
+		// whether it marks a deletion instead of holding content.
+		latest             bool
+		deleteMarker       bool
+	}
+
+	// WriteOptions are the settings of an object being written, for `put`,
+	// `upload`, `multipart` and `copy`. Every field left as it is sends
+	// nothing.
+	struct WriteOptions {
+		// Stored with the object and sent back as `x-amz-meta-` headers.
+		metadata           map<string, string>
+		cacheControl       string
+		contentDisposition string
+		contentEncoding    string
+		contentLanguage    string
+		// When a cache stops trusting the object (`Expires`).
+		expires            ?time.Time          = none
+		// `STANDARD_IA`, `GLACIER`, ...; "" leaves the bucket's default.
+		storageClass       string
+		// A canned ACL: `private`, `public-read`, ...
+		acl                string
+		// Tags set with the write.
+		labels             map<string, string>
+		// Encryption at rest: `AES256` (keys S3 manages) or `aws:kms`,
+		// with `kmsKey` naming the key when it is not the default one.
+		encryption         string
+		kmsKey             string
+		// A 32-byte key of one's own (SSE-C): S3 encrypts with it and
+		// forgets it, so every later read names it again. HTTPS only.
+		customerKey        byte[]
+		// Write only if the object has this entity tag, or (`*` in
+		// `ifNoneMatch`) only if there is no object yet. A write that
+		// loses fails with ErrorKind.Precondition.
+		ifMatch            string
+		ifNoneMatch        string
+	}
+
+	// ReadOptions narrow a `get` or an `info`.
+	struct ReadOptions {
+		// Read `length` bytes from `offset`; a length of -1 reads to the
+		// end, and a negative offset counts from the end (`offset = -100`
+		// is the last 100 bytes).
+		offset            int        = 0
+		length            int        = -1
+		// A version other than the current one.
+		version           string
+		// Read only if the entity tag is (not) this one, or the object
+		// changed (did not change) since a time. A read that the tag or
+		// the time rules out fails with ErrorKind.NotModified or
+		// ErrorKind.Precondition.
+		ifMatch           string
+		ifNoneMatch       string
+		ifModifiedSince   ?time.Time = none
+		ifUnmodifiedSince ?time.Time = none
+		// One part of an object uploaded in parts, from 1.
+		part              int        = 0
+		// The key of an object written with `WriteOptions.customerKey`.
+		customerKey       byte[]
+	}
+
+	// Object is an object being read: what S3 says about it, and its
+	// content still on the wire. Read it to the end or close it.
+	//
+	// ```
+	// let report = try bucket.get("reports/2026.csv")
+	// try report.save("/tmp/2026.csv")
+	// ```
+	type Object {
+		info         ObjectInfo
+		// How many bytes the body holds: the size of the object, or of the
+		// range that was asked for.
+		length       int
+		internal res http.Response
+
+		def new(info ObjectInfo, res http.Response) {
+			self.info = info
+			self.res = res
+			length = res.contentLength
+		}
+
+		// Implements io.Reader over the content.
+		// Fails with an S3Error of ErrorKind.Connection when the
+		// connection breaks.
+		def read(buf byte[]) !int {
+			let body = res.body
+			return 0 when body is none
+			let n = body.read(buf) onerror (err error) {
+				fail errorOf(ErrorKind.Connection, "s3: reading {info.key}: {err.message}", err)
+			}
+			return n
+		}
+
+		// The whole content. Fails as `read` does.
+		def bytes() !byte[] {
+			let data = res.bytes() onerror (err error) {
+				fail errorOf(ErrorKind.Connection, "s3: reading {info.key}: {err.message}", err)
+			}
+			return data
+		}
+
+		// The whole content as text. Fails as `read` does.
+		def text() !string {
+			return string(try bytes())
+		}
+
+		// Writes the content to `w` as it arrives and returns how many
+		// bytes went. Fails as `read` does, and when `w` does.
+		def copyTo(w io.Writer) !int {
+			return int(try io.copy(self, w))
+		}
+
+		// Writes the content to a file as it arrives, replacing the file.
+		// Fails as `read` does, and when the file cannot be written.
+		def save(path string) !none {
+			let file = try os.open(path, "w")
+			let failure ?error = none
+			io.copy(self, file) onerror (err error) {
+				failure = err
+				recover 0
+			}
+			try file.close()
+			fail failure unless failure is none
+			return none
+		}
+
+		// close gives the connection back. Never fails.
+		def close() !none {
+			res.close() onerror recover none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the object by its key and size.
+		def str() string {
+			return "s3.Object({info.key}, {info.size} bytes)"
+		}
+	}
+}

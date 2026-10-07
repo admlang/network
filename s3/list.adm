@@ -1,0 +1,134 @@
+partial module adm.network.s3 {
+	use (
+		std.data.encoding::(XMLNode)
+		std.net.url
+		adm.network.s3.wire::*
+	)
+
+	// Page is one page of a listing.
+	struct Page {
+		objects  ObjectInfo[]
+		// With a delimiter: the prefixes that stand for the keys beyond it
+		// (`photos/2026/` for everything under that "folder").
+		prefixes string[]
+	}
+
+	// Lister walks the keys of a bucket in order, a page per request.
+	type Lister {
+		internal engine    Engine
+		internal bucket    string
+		internal prefix    string
+		internal delimiter string
+		internal pageSize  int
+		internal versions  bool
+		// Where the next page starts.
+		internal token     string
+		internal after     string
+		internal versionAt string
+		internal ended     bool
+
+		def new(engine Engine, bucket string, prefix string, delimiter string, startAfter string, pageSize int, versions bool) {
+			self.engine = engine
+			self.bucket = bucket
+			self.prefix = prefix
+			self.delimiter = delimiter
+			self.pageSize = pageSize
+			self.versions = versions
+			after = startAfter
+		}
+
+		// The next page, at most a thousand entries; none once the listing
+		// is over.
+		// Fails with an S3Error as `Bucket` requests do.
+		def next() !?Page {
+			return none when ended
+			let call = new Call("GET", bucket)
+			if versions {
+				call.param("versions")
+				call.param("key-marker", after) when after != ""
+				call.param("version-id-marker", versionAt) when versionAt != ""
+			} else {
+				call.param("list-type", "2")
+				call.param("continuation-token", token) when token != ""
+				call.param("start-after", after) when after != "" && token == ""
+			}
+			call.param("encoding-type", "url")
+			call.param("prefix", prefix) when prefix != ""
+			call.param("delimiter", delimiter) when delimiter != ""
+			call.param("max-keys", pageSize.str()) when pageSize > 0
+			let root = try engine.document(call)
+			let page = Page{}
+			for let node in root.children {
+				match node.localName {
+					case "Contents":
+						page.objects.push(entryOf(node, false))
+					case "Version":
+						page.objects.push(entryOf(node, false))
+					case "DeleteMarker":
+						page.objects.push(entryOf(node, true))
+					case "CommonPrefixes":
+						page.prefixes.push(plain(textOf(node, "Prefix")))
+					default:
+				}
+			}
+			ended = textOf(root, "IsTruncated") != "true"
+			if versions {
+				after = plain(textOf(root, "NextKeyMarker"))
+				versionAt = textOf(root, "NextVersionIdMarker")
+			} else {
+				token = textOf(root, "NextContinuationToken")
+				ended = true when token == ""
+			}
+			return page
+		}
+
+		// Every object left of the listing in one array, the prefixes
+		// dropped.
+		// Fails with an S3Error as `Bucket` requests do.
+		def all() !ObjectInfo[] {
+			let out ObjectInfo[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page.objects)
+			}
+			return out
+		}
+
+		internal def entryOf(node XMLNode, marker bool) ObjectInfo {
+			let version = textOf(node, "VersionId")
+			let info = ObjectInfo{key: plain(textOf(node, "Key")), size: numberOf(node, "Size"), etag: bareTag(textOf(node, "ETag")), modified: timeOf(node, "LastModified"), storageClass: textOf(node, "StorageClass"), deleteMarker: marker}
+			info.version = version unless version == "null"
+			info.latest = !versions || textOf(node, "IsLatest") == "true"
+			return info
+		}
+
+		// A key as it is, from the URL encoding the listing asks for so
+		// that keys XML cannot hold survive.
+		internal def plain(text string) string {
+			return url.queryUnescape(text) onerror recover text
+		}
+	}
+
+	partial type Bucket {
+		// list walks the objects whose key starts with `prefix`, in key
+		// order. With a `delimiter` (usually `/`) keys that hold it after
+		// the prefix are rolled up into `Page.prefixes`, which lists one
+		// "folder" level. `startAfter` skips to the keys after it.
+		//
+		// ```
+		// let all = try bucket.list("photos/").all()
+		// let walk = bucket.list("photos/", "/")
+		// let first = try walk.next()            // ?Page
+		// ```
+		def list(prefix string = "", delimiter string = "", startAfter string = "", pageSize int = 0) Lister {
+			return new Lister(engine, name, prefix, delimiter, startAfter, pageSize, false)
+		}
+
+		// versions walks every version and delete marker of the objects
+		// whose key starts with `prefix`, the newest of each key first.
+		def versions(prefix string = "", delimiter string = "", pageSize int = 0) Lister {
+			return new Lister(engine, name, prefix, delimiter, "", pageSize, true)
+		}
+	}
+}

@@ -1,0 +1,228 @@
+partial module adm.network.s3 {
+	use (
+		std.data.encoding
+		std.io
+		std.time
+		adm.network.s3.sigv4::*
+		adm.network.s3.wire::*
+	)
+
+	// Part is one uploaded part of a multipart upload.
+	struct Part {
+		// From 1 to 10000; parts are joined in this order.
+		number   int
+		etag     string
+		size     int
+		modified time.Time
+	}
+
+	// UploadInfo is a multipart upload that was started and neither
+	// completed nor aborted. Its parts are stored, and paid for, until
+	// then.
+	struct UploadInfo {
+		key     string
+		id      string
+		started time.Time
+	}
+
+	// Upload is a multipart upload: an object sent in parts of 5 MiB to
+	// 5 GiB (the last may be smaller), in any order and from any number of
+	// tasks, then joined by `complete`.
+	//
+	// ```
+	// let upload = try bucket.multipart("backup.tar")
+	// let first = try upload.part(1, head)
+	// let second = try upload.part(2, tail)
+	// try upload.complete([first, second])
+	// ```
+	//
+	// `Bucket.upload` does all of this for a reader.
+	type Upload {
+		key             string
+		// The upload id; `Bucket.resume` takes it to go on later.
+		id              string
+		internal engine Engine
+		internal bucket string
+
+		def new(engine Engine, bucket string, key string, id string) {
+			self.engine = engine
+			self.bucket = bucket
+			self.key = key
+			self.id = id
+		}
+
+		// part uploads one part. Sending a number again replaces that part.
+		// Fails with an S3Error as `Bucket` requests do, with
+		// ErrorKind.NoUpload once the upload is completed or aborted, and
+		// ErrorKind.Argument for a number outside 1 to 10000.
+		def part(number int, data byte[]) !Part {
+			return try sendPart(engine, bucket, key, id, number, data)
+		}
+
+		// copyPart fills one part from an object already in S3: `length`
+		// bytes from `offset` of `sourceKey` (-1 for the whole object), in
+		// this bucket or `sourceBucket`.
+		// Fails as `part` does, and with ErrorKind.NoObject when the source
+		// does not exist.
+		def copyPart(number int, sourceKey string, sourceBucket string = "", sourceVersion string = "", offset int = 0, length int = -1) !Part {
+			fail errorOf(ErrorKind.Argument, "s3: part number {number} is not 1 to {maxParts}") when number < 1 || number > maxParts
+			let call = new Call("PUT", bucket, key)
+			call.param("partNumber", number.str())
+			call.param("uploadId", id)
+			call.header("x-amz-copy-source", copySource(sourceBucket == "" ?? (bucket, sourceBucket), sourceKey, sourceVersion))
+			call.header("x-amz-copy-source-range", "bytes={offset}-{offset + length - 1}") when length >= 0
+			let root = try engine.document(call)
+			return Part{number: number, etag: bareTag(textOf(root, "ETag")), size: length.max(0), modified: timeOf(root, "LastModified")}
+		}
+
+		// The parts uploaded so far, in order.
+		// Fails with an S3Error as `Bucket` requests do, and with
+		// ErrorKind.NoUpload.
+		def parts() !Part[] {
+			let out Part[] = []
+			let marker = ""
+			for {
+				let call = new Call("GET", bucket, key)
+				call.param("uploadId", id)
+				call.param("part-number-marker", marker) when marker != ""
+				let root = try engine.document(call)
+				for let node in root.elements("Part") {
+					out.push(Part{number: numberOf(node, "PartNumber"), etag: bareTag(textOf(node, "ETag")), size: numberOf(node, "Size"), modified: timeOf(node, "LastModified")})
+				}
+				marker = textOf(root, "NextPartNumberMarker")
+				break unless textOf(root, "IsTruncated") == "true" && marker != ""
+			}
+			return out
+		}
+
+		// complete joins the given parts, in the order of their numbers,
+		// into the object.
+		// Fails with an S3Error as `Bucket` requests do, with
+		// ErrorKind.NoUpload, and ErrorKind.Argument when a part is missing
+		// or one before the last is under 5 MiB.
+		def complete(parts Part[]) !ObjectInfo {
+			let ordered = parts.clone().sort((a, b Part) => a.number < b.number)
+			let doc = new encoding.XMLWriter()
+			doc.start("CompleteMultipartUpload")
+			doc.attribute("xmlns", xmlns)
+			let size = 0
+			for let p in ordered {
+				doc.start("Part")
+				doc.element("PartNumber", p.number.str())
+				doc.element("ETag", "\"{p.etag}\"")
+				doc.end()
+				size += p.size
+			}
+			doc.end()
+			let call = new Call("POST", bucket, key)
+			call.param("uploadId", id)
+			call.body = doc.bytes()
+			let res = try engine.send(call)
+			let version = res.headers.get("x-amz-version-id")
+			let data = res.bytes() onerror (err error) {
+				fail transportError(call, err)
+			}
+			let root = try parseXML(data, call)
+			return ObjectInfo{key: key, size: size, etag: bareTag(textOf(root, "ETag")), version: version == "null" ?? ("", version), parts: ordered.len(), latest: true}
+		}
+
+		// complete joins every part uploaded so far. Fails as
+		// `complete(parts)` does.
+		def complete() !ObjectInfo {
+			return try complete(try parts())
+		}
+
+		// abort drops the upload and its parts. Aborting one that is gone
+		// is not an error.
+		// Fails with an S3Error as `Bucket` requests do.
+		def abort() !none {
+			let call = new Call("DELETE", bucket, key)
+			call.param("uploadId", id)
+			let res = try engine.send(call, 404)
+			res.close() onerror recover none
+			return none
+		}
+
+		// Names the upload by its object and id.
+		def str() string {
+			return "s3.Upload({bucket}/{key}, {id})"
+		}
+	}
+
+	partial type Bucket {
+		// multipart starts a multipart upload of an object.
+		// Fails with an S3Error as the type says.
+		def multipart(key string, contentType string = "", options ?WriteOptions = none) !Upload {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let call = new Call("POST", name, key)
+			call.param("uploads")
+			applyWrite(call, contentType, options)
+			let root = try engine.document(call)
+			let id = textOf(root, "UploadId")
+			fail errorOf(ErrorKind.Protocol, "s3: starting the upload of {key} returned no upload id") when id == ""
+			return new Upload(engine, name, key, id)
+		}
+
+		// resume returns a multipart upload started earlier, by the id it
+		// was given. Nothing is sent.
+		def resume(key string, id string) Upload {
+			return new Upload(engine, name, key, id)
+		}
+
+		// The multipart uploads of the bucket that are neither completed
+		// nor aborted, those whose key starts with `prefix`.
+		// Fails with an S3Error as the type says.
+		def uploads(prefix string = "") !UploadInfo[] {
+			let out UploadInfo[] = []
+			let keyMarker = ""
+			let idMarker = ""
+			for {
+				let call = new Call("GET", name)
+				call.param("uploads")
+				call.param("prefix", prefix) when prefix != ""
+				call.param("key-marker", keyMarker) when keyMarker != ""
+				call.param("upload-id-marker", idMarker) when idMarker != ""
+				let root = try engine.document(call)
+				for let node in root.elements("Upload") {
+					out.push(UploadInfo{key: textOf(node, "Key"), id: textOf(node, "UploadId"), started: timeOf(node, "Initiated")})
+				}
+				keyMarker = textOf(root, "NextKeyMarker")
+				idMarker = textOf(root, "NextUploadIdMarker")
+				break unless textOf(root, "IsTruncated") == "true" && keyMarker != ""
+			}
+			return out
+		}
+
+		// upload writes an object from a reader of any length. A stream
+		// shorter than the client's `partSize` goes in one request; a longer
+		// one becomes a multipart upload whose parts travel `uploadTasks` at
+		// a time, aborted when anything fails. It holds `uploadTasks` parts
+		// in memory.
+		//
+		// ```
+		// let file = try os.open("backup.tar")
+		// try bucket.upload("backups/2026-10-07.tar", file)
+		// ```
+		//
+		// Fails with an S3Error as the type says, when `body` fails, and
+		// with ErrorKind.Argument for a stream of more than 10000 parts.
+		def upload(key string, body io.Reader, contentType string = "", options ?WriteOptions = none) !ObjectInfo {
+			let first = readPiece(body, engine.partSize) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "s3: reading the body of {key}: {err.message}", err)
+			}
+			return try put(key, first, contentType, options) when first.len() < engine.partSize
+			let started = try multipart(key, contentType, options)
+			let failure ?error = none
+			let none_ Part[] = []
+			let parts = sendPieces(engine, name, key, started.id, first, body) onerror (err error) {
+				failure = err
+				recover none_
+			}
+			if !(failure is none) {
+				started.abort() onerror recover none
+				fail failure
+			}
+			return try started.complete(parts)
+		}
+	}
+}

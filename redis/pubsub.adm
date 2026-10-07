@@ -1,0 +1,254 @@
+partial module adm.network.redis {
+	use (
+		std.time
+		adm.network.redis.resp::*
+	)
+
+	// Message is what a publisher sent to a channel.
+	type Message {
+		// The channel it was published to.
+		channel string
+		// The pattern of the subscription that matched it; "" for a
+		// subscription by name.
+		pattern string
+		payload byte[]
+
+		def new(channel string, pattern string, payload byte[]) {
+			self.channel = channel
+			self.pattern = pattern
+			self.payload = payload
+		}
+
+		// The payload as text.
+		def text() string {
+			return string(payload)
+		}
+	}
+
+	// Subscription receives the messages published to channels. It has a
+	// connection of its own, apart from the client's, and one task uses it
+	// at a time.
+	//
+	// ```
+	// let news = try r.subscribe("news", "alerts")
+	// for {
+	//     let m = try news.receive()
+	//     break when m is none
+	//     print("{m.channel}: {m.text()}")
+	// }
+	// ```
+	//
+	// Redis keeps nothing for a subscriber that is away: a message
+	// published while the connection is down is lost. Use a stream
+	// (`xadd`, `xreadGroup`) when every message must arrive.
+	type Subscription {
+		internal conn    Conn
+		internal timeout duration
+		internal pending Message[]
+		internal names   string[]
+		internal globs   string[]
+		internal shards  string[]
+		internal closing bool
+
+		def new(conn Conn, timeout duration) {
+			self.conn = conn
+			self.timeout = timeout
+		}
+
+		// subscribe adds channels by name.
+		// Fails with a RedisError: ErrorKind.Denied when the user may not
+		// read a channel, ErrorKind.Connection, ErrorKind.TimedOut,
+		// ErrorKind.Closed after `close`.
+		def subscribe(channels ...string) !none {
+			return none when channels.len() == 0
+			try change("SUBSCRIBE", "subscribe", channels, channels.len())
+			return none
+		}
+
+		// psubscribe adds every channel whose name matches a glob pattern
+		// (`news.*`, `user:?`, `log[ab]`).
+		// Fails as `subscribe` does.
+		def psubscribe(patterns ...string) !none {
+			return none when patterns.len() == 0
+			try change("PSUBSCRIBE", "psubscribe", patterns, patterns.len())
+			return none
+		}
+
+		// ssubscribe adds shard channels (Redis 7), which a cluster keeps to
+		// the shard that owns the channel's slot.
+		// Fails as `subscribe` does.
+		def ssubscribe(channels ...string) !none {
+			return none when channels.len() == 0
+			try change("SSUBSCRIBE", "ssubscribe", channels, channels.len())
+			return none
+		}
+
+		// unsubscribe leaves channels subscribed by name, all of them when
+		// none is given.
+		// Fails as `subscribe` does.
+		def unsubscribe(channels ...string) !none {
+			try change("UNSUBSCRIBE", "unsubscribe", channels, channels.len() == 0 ?? (atLeastOne(names.len()), channels.len()))
+			return none
+		}
+
+		// punsubscribe leaves patterns, all of them when none is given.
+		// Fails as `subscribe` does.
+		def punsubscribe(patterns ...string) !none {
+			try change("PUNSUBSCRIBE", "punsubscribe", patterns, patterns.len() == 0 ?? (atLeastOne(globs.len()), patterns.len()))
+			return none
+		}
+
+		// sunsubscribe leaves shard channels, all of them when none is
+		// given.
+		// Fails as `subscribe` does.
+		def sunsubscribe(channels ...string) !none {
+			try change("SUNSUBSCRIBE", "sunsubscribe", channels, channels.len() == 0 ?? (atLeastOne(shards.len()), channels.len()))
+			return none
+		}
+
+		// The channels subscribed by name.
+		def channels() string[] {
+			return names.clone()
+		}
+
+		// The patterns subscribed.
+		def patterns() string[] {
+			return globs.clone()
+		}
+
+		// The shard channels subscribed.
+		def shardChannels() string[] {
+			return shards.clone()
+		}
+
+		// receive returns the next message, waiting up to `wait` for it (0s:
+		// without end); none when the wait ends first.
+		// Fails with a RedisError: ErrorKind.Closed after `close`,
+		// ErrorKind.Connection when the connection breaks.
+		def receive(wait duration = 0s) !?Message {
+			let deadline = time.now() + wait
+			for {
+				return pending.shift() when pending.len() > 0
+				fail errorOf(ErrorKind.Closed, "redis: the subscription is closed") when closing
+				let left = 0s
+				if wait > 0s {
+					left = deadline - time.now()
+					return none when left <= 0s
+				}
+				let arrived = conn.ready(left) onerror (err error) {
+					fail errorOf(ErrorKind.Closed, "redis: the subscription is closed") when closing
+					fail err
+				}
+				return none unless arrived
+				try frame()
+			}
+			return none
+		}
+
+		// close leaves every channel and closes the connection. A task
+		// waiting in `receive` fails with ErrorKind.Closed. Never fails.
+		def close() !none {
+			closing = true
+			conn.close()
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Sends a subscription command and reads up to its confirmations,
+		// one per channel; messages that arrive meanwhile wait in `pending`.
+		internal def change(command string, confirmation string, channels string[], confirmations int) !none {
+			fail errorOf(ErrorKind.Closed, "redis: the subscription is closed") when closing
+			let batch = new Batch()
+			try batch.add(joined([command], channels))
+			conn.wire.timeout = timeout
+			conn.wire.send(batch.data) onerror (err error) {
+				conn.close()
+				fail err
+			}
+			let seen = 0
+			for seen < confirmations {
+				let kind = try frame()
+				seen++ when kind == confirmation
+			}
+			return none
+		}
+
+		// Reads one frame: a message goes to `pending`, a confirmation
+		// updates the lists of what is subscribed. Returns the frame's kind.
+		internal def frame() !string {
+			conn.wire.timeout = timeout
+			let v = conn.wire.read() onerror (err error) {
+				conn.close()
+				fail errorOf(ErrorKind.Closed, "redis: the subscription is closed") when closing
+				fail err
+			}
+			fail serverError(v.text()) when v.isError()
+			return "" when v.items.len() < 2
+			let kind = v.items[0].text()
+			let name = v.items[1].text()
+			match kind {
+				case "message", "smessage":
+					pending.push(new Message(name, "", v.items[2].bytes())) when v.items.len() >= 3
+				case "pmessage":
+					pending.push(new Message(v.items[2].text(), name, v.items[3].bytes())) when v.items.len() >= 4
+				case "subscribe":
+					names.push(name) unless names.includes(name)
+				case "psubscribe":
+					globs.push(name) unless globs.includes(name)
+				case "ssubscribe":
+					shards.push(name) unless shards.includes(name)
+				case "unsubscribe":
+					names = names.filter(n => n != name)
+				case "punsubscribe":
+					globs = globs.filter(n => n != name)
+				case "sunsubscribe":
+					shards = shards.filter(n => n != name)
+			}
+			return kind
+		}
+	}
+
+	// A server confirms an unsubscribe from everything once even when
+	// nothing was subscribed.
+	internal def atLeastOne(count int) int {
+		return count < 1 ?? (1, count)
+	}
+
+	partial type Client {
+		// subscribe opens a Subscription to channels by name.
+		// Fails with a RedisError as `connect` and `Subscription.subscribe`
+		// do.
+		def subscribe(channels ...string) !Subscription {
+			let sub = try listen([])
+			try sub.subscribe(...channels)
+			return sub
+		}
+
+		// psubscribe opens a Subscription to the channels matching glob
+		// patterns.
+		// Fails with a RedisError as `connect` and `Subscription.subscribe`
+		// do.
+		def psubscribe(patterns ...string) !Subscription {
+			let sub = try listen([])
+			try sub.psubscribe(...patterns)
+			return sub
+		}
+
+		// ssubscribe opens a Subscription to shard channels (Redis 7).
+		// Fails with a RedisError as `connect` and `Subscription.subscribe`
+		// do.
+		def ssubscribe(channels ...string) !Subscription {
+			let sub = try listen(joined(["SSUBSCRIBE"], channels))
+			try sub.ssubscribe(...channels)
+			return sub
+		}
+
+		// Opens the connection a subscription keeps.
+		internal def listen(command any[]) !Subscription {
+			return new Subscription(try dial(try link.place(command)), timeout)
+		}
+	}
+}

@@ -1,0 +1,374 @@
+partial module adm.network.s3 {
+	use (
+		std.data.encoding
+		std.io
+		std.net.http
+		adm.network.s3.sigv4::*
+		adm.network.s3.wire::*
+	)
+
+	// DeleteFailure is one object a batch delete could not remove.
+	struct DeleteFailure {
+		key        string
+		version    string
+		// The server's error code and what it says about it.
+		serverCode string
+		message    string
+	}
+
+	// Bucket reads and writes the objects of one bucket.
+	//
+	// ```
+	// let logs = store.bucket("logs")
+	// try logs.put("2026/10/07.txt", "started\n")
+	// for let entry in try logs.list("2026/").all() {
+	//     print("{entry.key} {entry.size}")
+	// }
+	// try logs.delete("2026/10/07.txt")
+	// ```
+	//
+	// Every method that sends a request fails with an S3Error:
+	// ErrorKind.NoBucket when the bucket does not exist, ErrorKind.Denied
+	// when the credentials may not do it, and as `Client` requests do.
+	partial type Bucket {
+		name            string
+		internal engine Engine
+
+		def new(engine Engine, name string) {
+			self.engine = engine
+			self.name = name
+		}
+
+		// put writes an object from memory, replacing the one under the key.
+		//
+		// ```
+		// try bucket.put("notes/today.md", text, "text/markdown")
+		// try bucket.put("lock", "", options = s3.WriteOptions{ifNoneMatch: "*"})
+		// ```
+		//
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.Precondition when a condition of `options` does not hold.
+		def put(key string, data byte[], contentType string = "", options ?WriteOptions = none) !ObjectInfo {
+			let call = new Call("PUT", name, key)
+			applyWrite(call, contentType, options)
+			call.body = data
+			return written(try engine.done(call), key, data.len())
+		}
+
+		// put writes text as UTF-8. Fails as `put` of bytes does.
+		def put(key string, text string, contentType string = "", options ?WriteOptions = none) !ObjectInfo {
+			return try put(key, text.bytes(), contentType, options)
+		}
+
+		// put writes an object of `size` bytes from a reader, in one request
+		// and without holding it in memory: at most 5 GiB. Use `upload` for a
+		// stream of unknown or greater length.
+		// Fails as `put` of bytes does, when `body` fails, and with
+		// ErrorKind.Argument when it ends before `size` bytes.
+		def put(key string, body io.Reader, size int, contentType string = "", options ?WriteOptions = none) !ObjectInfo {
+			fail errorOf(ErrorKind.Argument, "s3: the size of {key} is {size}; it cannot be negative") when size < 0
+			let call = new Call("PUT", name, key)
+			applyWrite(call, contentType, options)
+			call.stream = body
+			call.size = size
+			return written(try engine.done(call), key, size)
+		}
+
+		// get opens an object for reading: read the returned Object to the
+		// end or close it.
+		//
+		// ```
+		// let data = try (try bucket.get("notes/today.md")).bytes()
+		// let tail = try bucket.get("app.log", s3.ReadOptions{offset: -4096})
+		// ```
+		//
+		// Fails with an S3Error as the type says, with ErrorKind.NoObject
+		// when there is no such object or version, ErrorKind.Range for a
+		// range outside it, and ErrorKind.NotModified or
+		// ErrorKind.Precondition when a condition of `options` rules the
+		// read out.
+		def get(key string, options ?ReadOptions = none) !Object {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let call = new Call("GET", name, key)
+			applyRead(call, options)
+			let res = try engine.send(call)
+			return new Object(infoOf(res, key), res)
+		}
+
+		// info describes an object without reading it; none when there is no
+		// such object or version.
+		// Fails with an S3Error as the type says, and as `get` does for
+		// conditions.
+		def info(key string, options ?ReadOptions = none) !?ObjectInfo {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let call = new Call("HEAD", name, key)
+			applyRead(call, options)
+			let res = try engine.send(call, 404)
+			res.close() onerror recover none
+			return none when res.status == 404
+			return infoOf(res, key)
+		}
+
+		// Whether an object exists under the key.
+		// Fails with an S3Error as the type says.
+		def has(key string) !bool {
+			let found = try info(key)
+			return !(found is none)
+		}
+
+		// delete removes an object; one that is not there is not an error.
+		// In a bucket that keeps versions it adds a delete marker, or
+		// removes the one version named.
+		// Fails with an S3Error as the type says.
+		def delete(key string, version string = "") !none {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let call = new Call("DELETE", name, key)
+			call.param("versionId", version) when version != ""
+			try engine.done(call)
+			return none
+		}
+
+		// delete removes many objects, a thousand per request, and returns
+		// those it could not remove.
+		// Fails with an S3Error as the type says.
+		def delete(keys string[]) !DeleteFailure[] {
+			let failures DeleteFailure[] = []
+			for let start = 0; start < keys.len(); start += 1000 {
+				let doc = new encoding.XMLWriter()
+				doc.start("Delete")
+				doc.attribute("xmlns", xmlns)
+				doc.element("Quiet", "true")
+				for let i = start; i < keys.len() && i < start + 1000; i++ {
+					doc.start("Object")
+					doc.element("Key", keys[i])
+					doc.end()
+				}
+				doc.end()
+				let call = new Call("POST", name)
+				call.param("delete")
+				call.body = doc.bytes()
+				call.header("Content-MD5", md5Of(call.body))
+				let root = try engine.document(call)
+				for let node in root.elements("Error") {
+					failures.push(DeleteFailure{key: textOf(node, "Key"), version: textOf(node, "VersionId"), serverCode: textOf(node, "Code"), message: textOf(node, "Message")})
+				}
+			}
+			return failures
+		}
+
+		// copy copies an object inside S3 to the key `to`, in this bucket or
+		// in `toBucket`. The copy keeps the source's content type and
+		// metadata unless `options` is given, which then replaces them all.
+		// A source over 5 GiB is copied in parts.
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.NoObject when the source does not exist.
+		def copy(key string, to string, toBucket string = "", version string = "", options ?WriteOptions = none) !ObjectInfo {
+			let target = toBucket == "" ?? (name, toBucket)
+			let call = new Call("PUT", target, to)
+			call.header("x-amz-copy-source", copySource(name, key, version))
+			if !(options is none) {
+				applyWrite(call, "", options)
+				call.header("x-amz-metadata-directive", "REPLACE")
+				call.header("x-amz-tagging-directive", "REPLACE") when options.labels.len() > 0
+				applyCustomerKey(call, options.customerKey, "x-amz-copy-source-server-side-encryption-customer-")
+			}
+			let failure ?S3Error = none
+			let res = sendOrNone(call) onerror (err error) {
+				failure = asS3Error(err)
+				recover none
+			}
+			if res is none {
+				let refused = failure
+				fail errorOf(ErrorKind.Protocol, "s3: copying {key} got no reply") when refused is none
+				// S3 copies at most 5 GiB in one request.
+				fail refused unless refused.serverCode == "InvalidRequest" && refused.message.contains("copy source")
+				return try copyInParts(key, to, target, version, options)
+			}
+			let version2 = res.headers.get("x-amz-version-id")
+			let data = res.bytes() onerror (err error) {
+				fail transportError(call, err)
+			}
+			let root = try parseXML(data, call)
+			return ObjectInfo{key: to, etag: bareTag(textOf(root, "ETag")), modified: timeOf(root, "LastModified"), version: version2 == "null" ?? ("", version2), latest: true}
+		}
+
+		// tagging reads the tags of an object.
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.NoObject.
+		def tagging(key string) !map<string, string> {
+			let call = new Call("GET", name, key)
+			call.param("tagging")
+			return labelsIn(try engine.document(call))
+		}
+
+		// tagging replaces the tags of an object; an empty map removes them.
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.NoObject.
+		def tagging(key string, labels map<string, string>) !none {
+			let call = new Call(labels.len() == 0 ?? ("DELETE", "PUT"), name, key)
+			call.param("tagging")
+			call.body = labelsDocument(labels) when labels.len() > 0
+			call.header("Content-MD5", md5Of(call.body)) when labels.len() > 0
+			try engine.done(call)
+			return none
+		}
+
+		// tagging reads the tags of the bucket; empty when it has none.
+		// Fails with an S3Error as the type says.
+		def tagging() !map<string, string> {
+			let text = try configuration("tagging")
+			let none_ map<string, string>
+			return none_ when text is none
+			return labelsIn(try parseXML(text.bytes(), new Call("GET", name)))
+		}
+
+		// tagging replaces the tags of the bucket; an empty map removes them.
+		// Fails with an S3Error as the type says.
+		def tagging(labels map<string, string>) !none {
+			return try configuration("tagging", none) when labels.len() == 0
+			return try configuration("tagging", string(labelsDocument(labels)))
+		}
+
+		// The region the bucket lives in.
+		// Fails with an S3Error as the type says.
+		def region() !string {
+			let call = new Call("GET", name)
+			call.param("location")
+			let root = try engine.document(call)
+			let found = root.text().trim()
+			// The oldest region answers with nothing, and Ireland by its
+			// first name.
+			return "us-east-1" when found == ""
+			return "eu-west-1" when found == "EU"
+			return found
+		}
+
+		// Whether the bucket keeps every version of its objects.
+		// Fails with an S3Error as the type says.
+		def versioning() !bool {
+			let call = new Call("GET", name)
+			call.param("versioning")
+			return textOf(try engine.document(call), "Status") == "Enabled"
+		}
+
+		// versioning turns keeping versions on, or suspends it: versions
+		// already kept stay.
+		// Fails with an S3Error as the type says.
+		def versioning(enabled bool) !none {
+			let doc = new encoding.XMLWriter()
+			doc.start("VersioningConfiguration")
+			doc.attribute("xmlns", xmlns)
+			doc.element("Status", enabled ?? ("Enabled", "Suspended"))
+			doc.end()
+			return try configuration("versioning", doc.str())
+		}
+
+		// The bucket policy as JSON; none when it has none.
+		// Fails with an S3Error as the type says.
+		def policy() !?string {
+			return try configuration("policy")
+		}
+
+		// policy sets the bucket policy from JSON; none removes it.
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.Argument for a policy S3 does not take.
+		def policy(document ?string) !none {
+			return try configuration("policy", document)
+		}
+
+		// configuration reads one of the bucket's configuration documents
+		// by the name of its subresource (`lifecycle`, `cors`, `encryption`,
+		// `notification`, `replication`, `website`, `acl`, `object-lock`,
+		// `logging`, ...): XML as S3 sends it, JSON for `policy`. none when
+		// the bucket has no such configuration.
+		// Fails with an S3Error as the type says.
+		def configuration(subresource string) !?string {
+			let call = new Call("GET", name)
+			call.param(subresource)
+			let failure ?S3Error = none
+			let res = sendOrNone(call) onerror (err error) {
+				failure = asS3Error(err)
+				recover none
+			}
+			if res is none {
+				let refused = failure
+				fail errorOf(ErrorKind.Protocol, "s3: reading {subresource} of {name} got no reply") when refused is none
+				// A configuration that is not set is a 404 with a code of its
+				// own per kind (NoSuchBucketPolicy, NoSuchLifecycleConfiguration,
+				// NoSuchTagSet, ...).
+				return none when refused.status == 404 && refused.kind != ErrorKind.NoBucket
+				fail refused
+			}
+			let data = res.bytes() onerror (err error) {
+				fail transportError(call, err)
+			}
+			return string(data)
+		}
+
+		// configuration replaces one of the bucket's configuration documents;
+		// none removes it.
+		//
+		// ```
+		// try bucket.configuration("lifecycle", rulesXML)
+		// ```
+		//
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.Argument for a document S3 does not take.
+		def configuration(subresource string, document ?string) !none {
+			let call = new Call(document is none ?? ("DELETE", "PUT"), name)
+			call.param(subresource)
+			if !(document is none) {
+				call.body = document.bytes()
+				call.header("Content-MD5", md5Of(call.body))
+			}
+			try engine.done(call)
+			return none
+		}
+
+		// Names the bucket.
+		def str() string {
+			return "s3.Bucket({name})"
+		}
+
+		// ---- internals ----
+
+		internal def sendOrNone(call Call) !?http.Response {
+			return try engine.send(call)
+		}
+
+		// What a write's reply says about the object written.
+		internal def written(res http.Response, key string, size int) ObjectInfo {
+			let version = res.headers.get("x-amz-version-id")
+			return ObjectInfo{key: key, size: size, etag: bareTag(res.headers.get("ETag")), version: version == "null" ?? ("", version), encryption: res.headers.get("x-amz-server-side-encryption"), latest: true}
+		}
+
+		// Copies an object too large for one request: a multipart upload
+		// whose parts S3 fills from the source.
+		internal def copyInParts(key string, to string, target string, version string, options ?WriteOptions) !ObjectInfo {
+			let read ?ReadOptions = none
+			read = ReadOptions{version: version} when version != ""
+			let source = try info(key, read)
+			fail errorOf(ErrorKind.NoObject, "s3: there is no object {name}/{key} to copy") when source is none
+			let settings = options
+			settings = WriteOptions{metadata: source.metadata, cacheControl: source.cacheControl, contentDisposition: source.contentDisposition, contentEncoding: source.contentEncoding, contentLanguage: source.contentLanguage, storageClass: source.storageClass} when settings is none
+			let dest = new Bucket(engine, target)
+			let upload = try dest.multipart(to, options is none ?? (source.contentType, ""), settings)
+			let piece = maxPartSize
+			let parts Part[] = []
+			let failure ?error = none
+			for let offset = 0; offset < source.size; offset += piece {
+				let part = upload.copyPart(parts.len() + 1, key, name, version, offset, (source.size - offset).min(piece)) onerror (err error) {
+					failure = err
+					recover Part{}
+				}
+				break unless failure is none
+				parts.push(part)
+			}
+			if !(failure is none) {
+				upload.abort() onerror recover none
+				fail failure
+			}
+			return try upload.complete(parts)
+		}
+	}
+}

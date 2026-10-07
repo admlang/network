@@ -1,0 +1,370 @@
+// RESP, the Redis serialization protocol, versions 2 and 3: commands as
+// arrays of bulk strings going out, every reply type coming in.
+internal partial module adm.network.redis.resp {
+	use (
+		std.net
+		std.reflection
+		std.reflection::(FieldKind)
+		adm.network.redis::*
+	)
+
+	// The longest bulk string a server sends (its `proto-max-bulk-len`
+	// default), and how deep aggregates may nest before the reply is taken
+	// for garbage.
+	const maxBulk = 536870912
+	const maxDepth = 256
+
+	// Batch builds commands one after another, to be written in one piece.
+	type Batch {
+		data  byte[]
+		// How many commands it holds.
+		count int
+
+		def new() {}
+
+		// add appends one command: its name and arguments, each sent as a
+		// bulk string.
+		// Fails with a RedisError of ErrorKind.Argument for an argument that
+		// is not text, bytes, a number or a boolean.
+		def add(args any[]) !none {
+			fail errorOf(ErrorKind.Argument, "redis: a command needs a name") when args.len() == 0
+			let parts byte[][] = []
+			for let (i, arg) in args {
+				parts.push(try bytesOf(arg, i))
+			}
+			data.push(...("*{parts.len()}\r\n".bytes()))
+			for let part in parts {
+				data.push(...("${part.len()}\r\n".bytes()))
+				data.push(...part)
+				data.push(byte(13), byte(10))
+			}
+			count++
+			return none
+		}
+
+		def clear() {
+			data = []
+			count = 0
+		}
+	}
+
+	// The bytes an argument travels as.
+	// Fails with a RedisError of ErrorKind.Argument for a type that cannot
+	// be sent.
+	def bytesOf(v any, index int) !byte[] {
+		match v {
+			case string:
+				return v.bytes()
+			case byte[]:
+				return v
+			case int:
+				return v.str().bytes()
+			case float:
+				return doubleText(v).bytes()
+			case bool:
+				return (v ?? ("1", "0")).bytes()
+			case none:
+				fail errorOf(ErrorKind.Argument, "redis: argument {index} is none; a command takes text, bytes, numbers and booleans")
+			default:
+				match reflection.kindOf(v) {
+					case FieldKind.Int, FieldKind.Uint, FieldKind.Float:
+						return reflection.scalarText(v).bytes()
+					default:
+						fail errorOf(ErrorKind.Argument, "redis: argument {index} is a {reflection.typeName(v)}; a command takes text, bytes, numbers and booleans")
+				}
+		}
+	}
+
+	// Wire writes batches to a stream and reads replies from it.
+	type Wire {
+		stream  net.Stream
+		// How long one read or write may wait; 0s waits without end.
+		timeout duration
+		buf     byte[]
+		head    int
+		tail    int
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			self.timeout = timeout
+			buf.len(16384)
+		}
+
+		// send writes bytes whole.
+		// Fails with a RedisError of ErrorKind.Connection when the write does.
+		def send(data byte[]) !none {
+			let sent = 0
+			let n = data.len()
+			for sent < n {
+				let wrote = stream.write(data[sent:n], timeout) onerror (err error) {
+					fail errorOf(ErrorKind.Connection, "redis: write: {err.message}")
+				}
+				fail errorOf(ErrorKind.Connection, "redis: the connection closed while writing") when wrote <= 0
+				sent += wrote
+			}
+			return none
+		}
+
+		// buffered is how many bytes were read past the last reply.
+		def buffered() int {
+			return tail - head
+		}
+
+		// Makes `count` bytes available from `head`.
+		def need(count int) !none {
+			return none when tail - head >= count
+			if head + count > buf.len() {
+				let kept = tail - head
+				if head > 0 {
+					for let i = 0; i < kept; i++ {
+						buf[i] = buf[head + i]
+					}
+					head = 0
+					tail = kept
+				}
+				if buf.len() < count {
+					let size = buf.len()
+					for size < count {
+						size = size * 2
+					}
+					buf.len(size)
+				}
+			}
+			for tail - head < count {
+				let got = stream.read(buf[tail:buf.len()], timeout) onerror (err error) {
+					let late = false
+					late = err.kind == net.ErrorCode.TimedOut when err is net.NetError
+					fail errorOf(late ?? (ErrorKind.TimedOut, ErrorKind.Connection), "redis: read: {err.message}")
+				}
+				fail errorOf(ErrorKind.Connection, "redis: the server closed the connection") when got <= 0
+				tail += got
+			}
+			return none
+		}
+
+		// Reads one line and returns where its text starts and ends in
+		// `buf`, good until the next read.
+		def line() !(int, int) {
+			let scanned = 0
+			for {
+				let end = tail - 1
+				for let i = head + scanned; i < end; i++ {
+					if int(buf[i]) == 13 && int(buf[i + 1]) == 10 {
+						let start = head
+						head = i + 2
+						return (start, i)
+					}
+				}
+				scanned = tail - head - 1 when tail - head > 1
+				fail errorOf(ErrorKind.Protocol, "redis: a reply line longer than 64 KiB") when scanned > 65536
+				try need(tail - head + 1)
+			}
+			return (0, 0)
+		}
+
+		// Takes `size` bytes and the line end after them.
+		def take(size int) !byte[] {
+			try need(size + 2)
+			let out = buf[head:head + size].clone()
+			fail errorOf(ErrorKind.Protocol, "redis: a bulk string does not end in CRLF") unless int(buf[head + size]) == 13 && int(buf[head + size + 1]) == 10
+			head += size + 2
+			return out
+		}
+
+		// read reads the next reply, attributes and nested values included.
+		// Fails with a RedisError: ErrorKind.TimedOut when nothing arrives
+		// within the timeout, ErrorKind.Connection when the read fails or the
+		// server closes the connection, ErrorKind.Protocol when what arrives
+		// is not RESP.
+		def read() !Value {
+			return try value(0)
+		}
+
+		def value(depth int) !Value {
+			fail errorOf(ErrorKind.Protocol, "redis: a reply nested deeper than {maxDepth}") when depth > maxDepth
+			let (start, end) = try line()
+			fail errorOf(ErrorKind.Protocol, "redis: an empty reply line") when end <= start
+			let mark = int(buf[start])
+			let from = start + 1
+			match mark {
+				case 43:
+					return textValue(ValueKind.Status, buf[from:end].clone())
+				case 45:
+					return textValue(ValueKind.Error, buf[from:end].clone())
+				case 58:
+					let v = new Value(ValueKind.Integer)
+					v.number = decimalOf(buf, from, end)
+					return v
+				case 36, 33, 61:
+					return try bulk(mark, from, end)
+				case 42:
+					return try aggregate(ValueKind.Array, 1, from, end, depth)
+				case 126:
+					return try aggregate(ValueKind.Set, 1, from, end, depth)
+				case 62:
+					return try aggregate(ValueKind.Push, 1, from, end, depth)
+				case 37:
+					return try aggregate(ValueKind.Map, 2, from, end, depth)
+				case 124:
+					let attributes = try aggregate(ValueKind.Map, 2, from, end, depth)
+					let v = try value(depth + 1)
+					v.attributes = attributes
+					return v
+				case 95:
+					return new Value()
+				case 35:
+					let v = new Value(ValueKind.Bool)
+					v.number = int(buf[from]) == 116 ?? (1, 0) when end > from
+					return v
+				case 44:
+					let v = new Value(ValueKind.Double)
+					v.real = doubleOf(string(buf[from:end]))
+					return v
+				case 40:
+					return textValue(ValueKind.BigNumber, buf[from:end].clone())
+				default:
+					fail errorOf(ErrorKind.Protocol, "redis: unknown reply type byte {mark}")
+			}
+		}
+
+		// A bulk string (`$`), bulk error (`!`) or verbatim string (`=`):
+		// of a known length, or streamed in `;` chunks after `$?`.
+		def bulk(mark int, from int, end int) !Value {
+			let data byte[] = []
+			if end == from + 1 && int(buf[from]) == 63 {
+				for {
+					let (a, b) = try line()
+					fail errorOf(ErrorKind.Protocol, "redis: a streamed string chunk does not start with ';'") unless b > a && int(buf[a]) == 59
+					let size = decimalOf(buf, a + 1, b)
+					fail errorOf(ErrorKind.Protocol, "redis: a streamed string chunk of {size} bytes") when size < 0 || size > maxBulk
+					break when size == 0
+					data.push(...(try take(size)))
+					fail errorOf(ErrorKind.Protocol, "redis: a streamed string longer than {maxBulk} bytes") when data.len() > maxBulk
+				}
+			} else {
+				let size = decimalOf(buf, from, end)
+				return new Value() when size == -1 && mark == 36
+				fail errorOf(ErrorKind.Protocol, "redis: a bulk string of {size} bytes") when size < 0 || size > maxBulk
+				data = try take(size)
+			}
+			return textValue(ValueKind.Error, data) when mark == 33
+			return textValue(ValueKind.Bulk, data) when mark == 36
+			let v = new Value(ValueKind.Verbatim)
+			if data.len() >= 4 && int(data[3]) == 58 {
+				v.format = string(data[0:3])
+				v.data = data[4:data.len()].clone()
+			} else {
+				v.data = data
+			}
+			return v
+		}
+
+		// An array, set, push or map: `count` members of `width` values
+		// each, or members up to a `.` line after a `?` count.
+		def aggregate(kind ValueKind, width int, from int, end int, depth int) !Value {
+			let v = new Value(kind)
+			if end == from + 1 && int(buf[from]) == 63 {
+				for {
+					try need(3)
+					if int(buf[head]) == 46 && int(buf[head + 1]) == 13 && int(buf[head + 2]) == 10 {
+						head += 3
+						break
+					}
+					v.items.push(try value(depth + 1))
+				}
+				fail errorOf(ErrorKind.Protocol, "redis: a streamed map with a key and no value") when width == 2 && v.items.len() % 2 != 0
+				return v
+			}
+			let count = decimalOf(buf, from, end)
+			return new Value() when count == -1 && kind == ValueKind.Array
+			fail errorOf(ErrorKind.Protocol, "redis: an aggregate of {count} members") when count < 0
+			let total = count * width
+			for let i = 0; i < total; i++ {
+				v.items.push(try value(depth + 1))
+			}
+			return v
+		}
+	}
+
+	def textValue(kind ValueKind, data byte[]) Value {
+		let v = new Value(kind)
+		v.data = data
+		return v
+	}
+
+	// errorOf builds the RedisError the library fails with.
+	def errorOf(kind ErrorKind, message string, prefix string = "") RedisError {
+		return RedisError{message: message, code: kind.value, kind: kind, prefix: prefix}
+	}
+
+	// The RedisError an error reply stands for.
+	def serverError(text string) RedisError {
+		let space = text.indexOf(" ")
+		let prefix = space > 0 ?? (text.slice(0, space), text)
+		let kind = ErrorKind.Server
+		match prefix {
+			case "NOAUTH", "WRONGPASS", "NOPERM":
+				kind = ErrorKind.Denied
+			case "WRONGTYPE":
+				kind = ErrorKind.WrongType
+			case "NOSCRIPT":
+				kind = ErrorKind.NoScript
+			case "BUSY":
+				kind = ErrorKind.Busy
+			case "LOADING":
+				kind = ErrorKind.Loading
+			case "READONLY":
+				kind = ErrorKind.ReadOnly
+			case "OOM":
+				kind = ErrorKind.OutOfMemory
+			case "EXECABORT":
+				kind = ErrorKind.Aborted
+			case "MOVED", "ASK", "CROSSSLOT", "CLUSTERDOWN", "TRYAGAIN":
+				kind = ErrorKind.Cluster
+		}
+		return errorOf(kind, "redis: {text}", prefix)
+	}
+
+	// The decimal integer in data[from:to], 0 when it is not one.
+	def decimalOf(data byte[], from int, to int) int {
+		let i = from
+		let negative = false
+		if i < to && (int(data[i]) == 45 || int(data[i]) == 43) {
+			negative = int(data[i]) == 45
+			i++
+		}
+		return 0 when i >= to
+		let v = 0
+		for i < to {
+			let d = int(data[i]) - 48
+			return 0 when d < 0 || d > 9
+			v = v * 10 + d
+			i++
+		}
+		return negative ?? (-v, v)
+	}
+
+	// A float as Redis writes one: `inf`, `-inf`, `nan`, else decimal.
+	def doubleOf(text string) float {
+		match text.lower() {
+			case "inf", "+inf", "infinity", "+infinity":
+				return 1.0 / 0.0
+			case "-inf", "-infinity":
+				return -1.0 / 0.0
+			case "nan", "-nan":
+				return 0.0 / 0.0
+			case "":
+				return 0.0
+			default:
+				return parseFloat<float>(text)
+		}
+	}
+
+	// A float as Redis reads one.
+	def doubleText(v float) string {
+		return "nan" when v != v
+		return "inf" when v > 1.7976931348623157e308
+		return "-inf" when v < -1.7976931348623157e308
+		return v.str()
+	}
+}

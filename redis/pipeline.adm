@@ -1,0 +1,229 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// Pipeline collects commands and sends them in one write, then reads
+	// their replies: one round trip for any number of commands. The server
+	// may run other clients' commands between them; `Transaction` rules
+	// that out.
+	//
+	// ```
+	// let p = r.pipeline()
+	// for let (i, name) in names {
+	//     try p.add("HSET", "user:{i}", "name", name)
+	// }
+	// let replies = try p.run()
+	// ```
+	type Pipeline {
+		internal link     Link
+		internal timeout  duration
+		internal commands any[][]
+
+		def new(link Link, timeout duration) {
+			self.link = link
+			self.timeout = timeout
+		}
+
+		// add queues a command, its name first.
+		// Fails with a RedisError of ErrorKind.Argument for an argument that
+		// cannot be sent.
+		def add(args ...any) !none {
+			try new Batch().add(args)
+			commands.push(args)
+			return none
+		}
+
+		// How many commands are queued.
+		def len() int {
+			return commands.len()
+		}
+
+		// run sends the queued commands and returns their replies in order;
+		// the pipeline is empty afterwards. A command the server refused has
+		// an error reply in its place (`Value.isError`), and the others ran.
+		// Fails with a RedisError: ErrorKind.Connection, ErrorKind.TimedOut
+		// or ErrorKind.Closed, when it is not known which commands ran.
+		def run() !Value[] {
+			return Value[] when commands.len() == 0
+			let sent = commands
+			commands = []
+			return try link.run(sent, timeout)
+		}
+
+		// Drops the queued commands.
+		def clear() {
+			commands = []
+		}
+	}
+
+	// Transaction runs commands as one unit (MULTI/EXEC): the server runs
+	// them one after another with no other client's command in between.
+	// It holds one of the client's connections from `Client.multi`
+	// until `exec` or `discard`.
+	//
+	// Watched keys make it conditional: when one of them changes between
+	// `watch` and `exec`, nothing runs and `exec` fails with
+	// ErrorKind.Aborted, so the caller reads again and retries.
+	//
+	// ```
+	// let tx = try r.multi("stock")
+	// let stock = (try tx.command("GET", "stock")).toInt()
+	// try tx.queue("SET", "stock", stock - 1)
+	// try tx.queue("RPUSH", "orders", order)
+	// try tx.exec()
+	// ```
+	type Transaction {
+		internal link    Link
+		// The connection it runs on, once it is known which server serves
+		// its keys: at once on one server, with the first key in a cluster.
+		internal held    ?Hold
+		internal timeout duration
+		internal batch   Batch
+		internal watched bool
+		internal ended   bool
+
+		def new(link Link, timeout duration) {
+			self.link = link
+			self.timeout = timeout
+			batch = new Batch()
+		}
+
+		// watch adds keys whose change before `exec` discards the
+		// transaction.
+		// Fails with a RedisError as `Client.command` does.
+		def watch(keys ...string) !none {
+			// On one server the connection is taken here; a cluster waits
+			// for a key to say which node.
+			try bound([], false)
+			return none when keys.len() == 0
+			try command(...joined(["WATCH"], keys))
+			watched = true
+			return none
+		}
+
+		// command runs a command now, on the transaction's connection and
+		// outside the unit: for reading what the queued commands depend on.
+		// Fails with a RedisError as `Client.command` does, and with
+		// ErrorKind.Closed after `exec` or `discard`.
+		def command(args ...any) !Value {
+			fail errorOf(ErrorKind.Closed, "redis: the transaction has ended") when ended
+			let conn = try bound(args, true)
+			fail errorOf(ErrorKind.Closed, "redis: the transaction has no connection") when conn is none
+			let reply = one(conn, timeout, ...args) onerror (err error) {
+				release()
+				fail err
+			}
+			fail serverError(reply.text()) when reply.isError()
+			return reply
+		}
+
+		// queue adds a command to the unit; nothing is sent before `exec`.
+		// Fails with a RedisError of ErrorKind.Argument for an argument that
+		// cannot be sent, ErrorKind.Closed after `exec` or `discard`.
+		def queue(args ...any) !none {
+			fail errorOf(ErrorKind.Closed, "redis: the transaction has ended") when ended
+			try batch.add(args)
+			try bound(args, false)
+			return none
+		}
+
+		// How many commands are queued.
+		def len() int {
+			return batch.count
+		}
+
+		// exec runs the queued commands as one unit and returns their
+		// replies in order. A command that failed while running has an error
+		// reply in its place (`Value.isError`); the others still ran, as
+		// Redis has no rollback.
+		// Fails with a RedisError: ErrorKind.Aborted when a watched key
+		// changed or the server refused a queued command (nothing ran),
+		// ErrorKind.Closed after `exec` or `discard`, ErrorKind.Connection
+		// or ErrorKind.TimedOut when it is not known whether the unit ran.
+		def exec() !Value[] {
+			fail errorOf(ErrorKind.Closed, "redis: the transaction has ended") when ended
+			let unit = new Batch()
+			try unit.add(["MULTI"])
+			unit.data.push(...batch.data)
+			unit.count += batch.count
+			try unit.add(["EXEC"])
+			let conn = try bound([], true)
+			fail errorOf(ErrorKind.Closed, "redis: the transaction has no connection") when conn is none
+			let failure ?error = none
+			let replies = conn.run(unit, timeout) onerror (err error) {
+				failure = err
+				recover Value[]
+			}
+			release()
+			fail failure unless failure is none
+			let outcome = replies[replies.len() - 1]
+			if outcome.isError() {
+				// EXECABORT says only that a command was refused; the reply
+				// to that command says why.
+				let reason = outcome.text()
+				for let i = 1; i < replies.len() - 1; i++ {
+					if replies[i].isError() {
+						reason = "{reason} ({replies[i].text()})"
+						break
+					}
+				}
+				fail serverError(reason)
+			}
+			fail errorOf(ErrorKind.Aborted, "redis: a watched key changed; the transaction did not run") when outcome.isNull()
+			return outcome.items
+		}
+
+		// discard ends the transaction without running it and stops
+		// watching. Calling it after `exec` or twice changes nothing. Never
+		// fails.
+		def discard() !none {
+			return none when ended
+			let lent = held
+			if watched && !(lent is none) {
+				if !lent.conn.broken {
+					one(lent.conn, timeout, "UNWATCH") onerror recover new Value()
+				}
+			}
+			release()
+			return none
+		}
+
+		def dispose() {
+			discard() onerror recover none
+		}
+
+		// Returns the connection to the client.
+		internal def release() {
+			return when ended
+			ended = true
+			let lent = held
+			lent.pool.giveBack(lent.conn) unless lent is none
+		}
+
+		// The transaction's connection, taken from the server that serves
+		// the keys of `args` when it has none yet. With `now` unset a
+		// command without keys leaves the choice to a later one.
+		internal def bound(args any[], now bool) !?Conn {
+			let lent = held
+			return lent.conn unless lent is none
+			let taken = try link.hold(args, now)
+			return none when taken is none
+			held = taken
+			return taken.conn
+		}
+	}
+
+	partial type Client {
+		// pipeline starts an empty Pipeline.
+		def pipeline() Pipeline {
+			return new Pipeline(link, timeout)
+		}
+
+		// multi starts a Transaction, watching the keys given.
+		// Fails with a RedisError as `command` does.
+		def multi(watch ...string) !Transaction {
+			let tx = new Transaction(link, timeout)
+			try tx.watch(...watch)
+			return tx
+		}
+	}
+}

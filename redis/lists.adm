@@ -1,0 +1,163 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// Commands on lists. Each fails with a RedisError as `command` does,
+	// and with ErrorKind.WrongType when the key holds another kind of value.
+	partial type Client {
+		// Adds values at the head, the last one given ending up first.
+		// Returns the list's length.
+		// Fails as `command` does.
+		def lpush(key string, values ...any) !int {
+			return (try call(timeout, ...joinedAny(["LPUSH", key], values))).toInt()
+		}
+
+		// Adds values at the tail. Returns the list's length.
+		// Fails as `command` does.
+		def rpush(key string, values ...any) !int {
+			return (try call(timeout, ...joinedAny(["RPUSH", key], values))).toInt()
+		}
+
+		// As `lpush`, only when the list exists. Returns its length, 0 when
+		// it does not exist.
+		// Fails as `command` does.
+		def lpushX(key string, values ...any) !int {
+			return (try call(timeout, ...joinedAny(["LPUSHX", key], values))).toInt()
+		}
+
+		// As `rpush`, only when the list exists. Returns its length, 0 when
+		// it does not exist.
+		// Fails as `command` does.
+		def rpushX(key string, values ...any) !int {
+			return (try call(timeout, ...joinedAny(["RPUSHX", key], values))).toInt()
+		}
+
+		// Removes and returns the first value, none when the list is empty.
+		// Fails as `command` does.
+		def lpop(key string) !?string {
+			return optional(try call(timeout, "LPOP", key))
+		}
+
+		// Removes and returns up to `count` values from the head.
+		// Fails as `command` does.
+		def lpop(key string, count int) !string[] {
+			return (try call(timeout, "LPOP", key, count)).strings()
+		}
+
+		// Removes and returns the last value, none when the list is empty.
+		// Fails as `command` does.
+		def rpop(key string) !?string {
+			return optional(try call(timeout, "RPOP", key))
+		}
+
+		// Removes and returns up to `count` values from the tail.
+		// Fails as `command` does.
+		def rpop(key string, count int) !string[] {
+			return (try call(timeout, "RPOP", key, count)).strings()
+		}
+
+		// Waits up to `wait` (0s: without end) for a value in one of the
+		// lists and removes the first. Returns the list it came from and the
+		// value, none when the wait ends first.
+		// Fails as `command` does.
+		def blpop(keys string[], wait duration) !?Popped {
+			return popped(try call(patience(timeout, wait), ...joined(["BLPOP"], keys), seconds(wait)))
+		}
+
+		// As `blpop`, taking the last value.
+		// Fails as `command` does.
+		def brpop(keys string[], wait duration) !?Popped {
+			return popped(try call(patience(timeout, wait), ...joined(["BRPOP"], keys), seconds(wait)))
+		}
+
+		// Moves a value from one end of `from` to one end of `to` and
+		// returns it; none when `from` is empty.
+		// Fails as `command` does.
+		def lmove(from string, to string, fromHead bool = true, toHead bool = false) !?string {
+			return optional(try call(timeout, "LMOVE", from, to, fromHead ?? ("LEFT", "RIGHT"), toHead ?? ("LEFT", "RIGHT")))
+		}
+
+		// As `lmove`, waiting up to `wait` (0s: without end) for a value.
+		// Fails as `command` does.
+		def blmove(from string, to string, wait duration, fromHead bool = true, toHead bool = false) !?string {
+			return optional(try call(patience(timeout, wait), "BLMOVE", from, to, fromHead ?? ("LEFT", "RIGHT"), toHead ?? ("LEFT", "RIGHT"), seconds(wait)))
+		}
+
+		// The list's length, 0 when it does not exist.
+		// Fails as `command` does.
+		def llen(key string) !int {
+			return (try call(timeout, "LLEN", key)).toInt()
+		}
+
+		// The values at positions `start` to `stop`, both included;
+		// negative positions count from the end. The defaults return the
+		// whole list.
+		// Fails as `command` does.
+		def lrange(key string, start int = 0, stop int = -1) !string[] {
+			return (try call(timeout, "LRANGE", key, start, stop)).strings()
+		}
+
+		// The value at a position, none when the list is shorter.
+		// Fails as `command` does.
+		def lindex(key string, index int) !?string {
+			return optional(try call(timeout, "LINDEX", key, index))
+		}
+
+		// Replaces the value at a position. Fails with the server's error
+		// when the list is shorter or does not exist.
+		def lset(key string, index int, value any) !none {
+			try call(timeout, "LSET", key, index, value)
+			return none
+		}
+
+		// Removes values equal to `value`: the first `count` from the head,
+		// from the tail when `count` is negative, all when it is 0. Returns
+		// how many it removed.
+		// Fails as `command` does.
+		def lrem(key string, value any, count int = 0) !int {
+			return (try call(timeout, "LREM", key, count, value)).toInt()
+		}
+
+		// Keeps only positions `start` to `stop`, both included.
+		// Fails as `command` does.
+		def ltrim(key string, start int, stop int) !none {
+			try call(timeout, "LTRIM", key, start, stop)
+			return none
+		}
+
+		// Inserts a value before or after the first value equal to `pivot`.
+		// Returns the list's length, -1 when the pivot is not there, 0 when
+		// the list does not exist.
+		// Fails as `command` does.
+		def linsert(key string, pivot any, value any, before bool = true) !int {
+			return (try call(timeout, "LINSERT", key, before ?? ("BEFORE", "AFTER"), pivot, value)).toInt()
+		}
+
+		// The position of the first value equal to `value`, none when it is
+		// not in the list.
+		// Fails as `command` does.
+		def lpos(key string, value any) !?int {
+			let reply = try call(timeout, "LPOS", key, value)
+			return none when reply.isNull()
+			return reply.toInt()
+		}
+	}
+
+	// Popped is what a blocking pop took: the value, the key it came from
+	// and, out of a sorted set, the score it had.
+	struct Popped {
+		key   string
+		value string
+		score float
+	}
+
+	// Scored is a member of a sorted set with its score.
+	struct Scored {
+		member string
+		score  float
+	}
+
+	internal def popped(reply Value) ?Popped {
+		return none when reply.isNull() || reply.items.len() < 2
+		return Popped{key: reply.items[0].text(), value: reply.items[1].text()}
+	}
+}

@@ -1,0 +1,106 @@
+partial module adm.network.s3 {
+	use (
+		std.data.encoding
+		std.net.http
+		std.time
+		adm.network.s3.sigv4::*
+		adm.network.s3.wire::*
+	)
+
+	// PostForm is what an HTML form needs to upload a file straight to
+	// S3: the address the form posts to and its hidden fields. The file
+	// input, named `file`, goes last.
+	struct PostForm {
+		url    string
+		fields map<string, string>
+	}
+
+	partial type Bucket {
+		// presign returns a URL that lets whoever holds it do one thing to
+		// one object without credentials, until `expires` has passed (at
+		// most seven days): read it by default, write it with
+		// `http.Method.PUT`. Nothing is sent.
+		//
+		// `params` are added to the query, such as
+		// `response-content-disposition` or `versionId`. `headers` are
+		// signed into the URL: the request that uses it must send exactly
+		// them (`Content-Type` for an upload of one type only).
+		//
+		// ```
+		// let link = try bucket.presign("reports/2026.pdf", 1h)
+		// let drop = try bucket.presign("inbox/scan.png", 10min, http.Method.PUT)
+		// ```
+		//
+		// Fails with an S3Error of ErrorKind.Argument for an empty key or a
+		// time outside one second to seven days.
+		def presign(key string, expires duration = 15min, method http.Method = http.Method.GET, params ?map<string, string> = none, headers ?map<string, string> = none) !string {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let seconds = int(expires) / 1000000000
+			fail errorOf(ErrorKind.Argument, "s3: a presigned URL lasts one second to seven days") when seconds < 1 || seconds > 604800
+			let host = engine.authority(name)
+			let path = engine.path(name, key)
+			let query Field[] = []
+			if !(params is none) {
+				for let (param, value) in params {
+					query.push(Field{name: param, value: value})
+				}
+			}
+			let signed Field[] = [Field{name:"Host", value:host}]
+			if !(headers is none) {
+				for let (header, value) in headers {
+					signed.push(Field{name: header, value: value})
+				}
+			}
+			let text = presignedQuery(engine.signer(name), method.value, path, query, signed, amzDateOf(time.now()), seconds)
+			return "{engine.scheme}://{host}{path}?{text}"
+		}
+
+		// postForm signs a browser upload: a form posted to `url` with the
+		// returned fields and a file input stores the file under `key`. A
+		// key that ends in `$\{filename\}` takes the name of the file the
+		// visitor picks. `maxSize` above 0 refuses larger files, and
+		// `contentType` fixes the type the form must declare.
+		//
+		// Fails with an S3Error of ErrorKind.Argument for an empty key or a
+		// time outside one second to seven days.
+		def postForm(key string, expires duration = 15min, maxSize int = 0, contentType string = "") !PostForm {
+			fail errorOf(ErrorKind.Argument, "s3: an object needs a key") when key == ""
+			let seconds = int(expires) / 1000000000
+			fail errorOf(ErrorKind.Argument, "s3: a signed form lasts one second to seven days") when seconds < 1 || seconds > 604800
+			let signer = engine.signer(name)
+			let now = time.now()
+			let amzDate = amzDateOf(now)
+			let until = time.fromUnixNs((now.unixNs() / 1000000000 + int64(seconds)) * 1000000000)
+			let credential = "{signer.accessKey}/{scopeOf(signer, amzDate)}"
+			let marker = "$\{filename\}"
+			let conditions string[] = ["\{\"bucket\":{quoted(name)}\}"]
+			if key.endsWith(marker) {
+				conditions.push("[\"starts-with\",\"$key\",{quoted(key.slice(0, key.len() - marker.len()))}]")
+			} else {
+				conditions.push("[\"eq\",\"$key\",{quoted(key)}]")
+			}
+			let fields map<string, string>
+			fields.set("key", key)
+			fields.set("x-amz-algorithm", algorithm)
+			fields.set("x-amz-credential", credential)
+			fields.set("x-amz-date", amzDate)
+			fields.set("x-amz-security-token", signer.token) when signer.token != ""
+			fields.set("Content-Type", contentType) when contentType != ""
+			for let (field, value) in fields {
+				conditions.push("\{{quoted(field)}:{quoted(value)}\}") unless field == "key"
+			}
+			conditions.push("[\"content-length-range\",0,{maxSize}]") when maxSize > 0
+			let policy = "\{\"expiration\":{quoted(until.str(time.TimeFormat.RFC3339))},\"conditions\":[{conditions.join(",")}]\}"
+			let (encoded, signature) = signPolicy(signer, amzDate, policy)
+			fields.set("policy", encoded)
+			fields.set("x-amz-signature", signature)
+			return PostForm{url: "{engine.scheme}://{engine.authority(name)}{engine.path(name, "")}", fields: fields}
+		}
+
+		// Text as a JSON string.
+		internal def quoted(text string) string {
+			let codec = new encoding.JSON()
+			return string(codec.encode(text))
+		}
+	}
+}

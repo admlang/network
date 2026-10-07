@@ -1,0 +1,110 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// Commands on sets. Each fails with a RedisError as `command` does, and
+	// with ErrorKind.WrongType when the key holds another kind of value.
+	partial type Client {
+		// Adds members. Returns how many are new.
+		// Fails as `command` does.
+		def sadd(key string, members ...any) !int {
+			return (try call(timeout, ...joinedAny(["SADD", key], members))).toInt()
+		}
+
+		// Removes members. Returns how many were there.
+		// Fails as `command` does.
+		def srem(key string, members ...any) !int {
+			return (try call(timeout, ...joinedAny(["SREM", key], members))).toInt()
+		}
+
+		// Every member, in no order.
+		// Fails as `command` does.
+		def smembers(key string) !string[] {
+			return (try call(timeout, "SMEMBERS", key)).strings()
+		}
+
+		// Whether a value is a member.
+		// Fails as `command` does.
+		def sismember(key string, member any) !bool {
+			return (try call(timeout, "SISMEMBER", key, member)).toBool()
+		}
+
+		// Whether each value is a member, in the order given.
+		// Fails as `command` does.
+		def smismember(key string, members ...any) !bool[] {
+			let reply = try call(timeout, ...joinedAny(["SMISMEMBER", key], members))
+			let out bool[] = []
+			for let item in reply.items {
+				out.push(item.toBool())
+			}
+			return out
+		}
+
+		// How many members the set has.
+		// Fails as `command` does.
+		def scard(key string) !int {
+			return (try call(timeout, "SCARD", key)).toInt()
+		}
+
+		// Removes and returns a member picked at random, none when the set
+		// is empty.
+		// Fails as `command` does.
+		def spop(key string) !?string {
+			return optional(try call(timeout, "SPOP", key))
+		}
+
+		// Removes and returns up to `count` members picked at random.
+		// Fails as `command` does.
+		def spop(key string, count int) !string[] {
+			return (try call(timeout, "SPOP", key, count)).strings()
+		}
+
+		// Members picked at random and left in the set: `count` different
+		// ones, or with a negative count that many with repeats allowed.
+		// Fails as `command` does.
+		def srandMember(key string, count int = 1) !string[] {
+			return (try call(timeout, "SRANDMEMBER", key, count)).strings()
+		}
+
+		// Moves a member to another set. False when it is not in `from`.
+		// Fails as `command` does.
+		def smove(from string, to string, member any) !bool {
+			return (try call(timeout, "SMOVE", from, to, member)).toBool()
+		}
+
+		// The members of any of the sets.
+		// Fails as `command` does.
+		def sunion(keys ...string) !string[] {
+			return (try call(timeout, ...joined(["SUNION"], keys))).strings()
+		}
+
+		// The members all the sets share.
+		// Fails as `command` does.
+		def sinter(keys ...string) !string[] {
+			return (try call(timeout, ...joined(["SINTER"], keys))).strings()
+		}
+
+		// The members of the first set that are in none of the others.
+		// Fails as `command` does.
+		def sdiff(keys ...string) !string[] {
+			return (try call(timeout, ...joined(["SDIFF"], keys))).strings()
+		}
+
+		// Stores `sunion` of the sets in `to`. Returns its size.
+		// Fails as `command` does.
+		def sunionStore(to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["SUNIONSTORE", to], keys))).toInt()
+		}
+
+		// Stores `sinter` of the sets in `to`. Returns its size.
+		// Fails as `command` does.
+		def sinterStore(to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["SINTERSTORE", to], keys))).toInt()
+		}
+
+		// Stores `sdiff` of the sets in `to`. Returns its size.
+		// Fails as `command` does.
+		def sdiffStore(to string, keys ...string) !int {
+			return (try call(timeout, ...joined(["SDIFFSTORE", to], keys))).toInt()
+		}
+	}
+}

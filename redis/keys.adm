@@ -1,0 +1,257 @@
+partial module adm.network.redis {
+	use (
+		std.time
+		adm.network.redis.resp::*
+	)
+
+	// Commands on keys of any type. Each fails with a RedisError as
+	// `command` does.
+	partial type Client {
+		// Deletes keys. Returns how many existed.
+		// Fails as `command` does.
+		def del(keys ...string) !int {
+			return (try call(timeout, ...joined(["DEL"], keys))).toInt()
+		}
+
+		// Deletes keys, freeing their memory in the background. Returns how
+		// many existed.
+		// Fails as `command` does.
+		def unlink(keys ...string) !int {
+			return (try call(timeout, ...joined(["UNLINK"], keys))).toInt()
+		}
+
+		// How many of the keys exist; a key named twice counts twice.
+		// Fails as `command` does.
+		def exists(keys ...string) !int {
+			return (try call(timeout, ...joined(["EXISTS"], keys))).toInt()
+		}
+
+		// Sets the last access time of keys. Returns how many exist.
+		// Fails as `command` does.
+		def touch(keys ...string) !int {
+			return (try call(timeout, ...joined(["TOUCH"], keys))).toInt()
+		}
+
+		// Makes a key expire after `ttl`. False when the key does not exist.
+		// Fails as `command` does.
+		def expire(key string, ttl duration) !bool {
+			return (try call(timeout, "PEXPIRE", key, millis(ttl))).toBool()
+		}
+
+		// Makes a key expire at a moment. False when the key does not exist.
+		// Fails as `command` does.
+		def expireAt(key string, moment time.Time) !bool {
+			return (try call(timeout, "PEXPIREAT", key, int(moment.unixNs() / 1000000))).toBool()
+		}
+
+		// How long a key has left; none when it does not exist or never
+		// expires.
+		// Fails as `command` does.
+		def ttl(key string) !?duration {
+			let left = (try call(timeout, "PTTL", key)).toInt()
+			return none when left < 0
+			return duration(left * 1000000)
+		}
+
+		// Removes a key's expiry. False when it had none or does not exist.
+		// Fails as `command` does.
+		def persist(key string) !bool {
+			return (try call(timeout, "PERSIST", key)).toBool()
+		}
+
+		// Renames a key, replacing `to` when it exists. Fails with the
+		// server's error when `key` does not exist.
+		def rename(key string, to string) !none {
+			try call(timeout, "RENAME", key, to)
+			return none
+		}
+
+		// Renames a key unless `to` exists. Reports whether it did.
+		// Fails as `command` does.
+		def renameNx(key string, to string) !bool {
+			return (try call(timeout, "RENAMENX", key, to)).toBool()
+		}
+
+		// Copies a key's value to `to`, in `database` when given. False when
+		// `to` exists and `replace` is not set, or `key` does not exist.
+		// Fails as `command` does.
+		def copy(key string, to string, replace bool = false, database int = -1) !bool {
+			let args any[] = ["COPY", key, to]
+			args.push("DB", database) when database >= 0
+			args.push("REPLACE") when replace
+			return (try call(timeout, ...args)).toBool()
+		}
+
+		// Moves a key to another database. False when it is there already
+		// or does not exist here.
+		// Fails as `command` does.
+		def move(key string, database int) !bool {
+			return (try call(timeout, "MOVE", key, database)).toBool()
+		}
+
+		// The type of a key's value: `string`, `list`, `set`, `zset`,
+		// `hash`, `stream`, or `none` when the key does not exist.
+		// Fails as `command` does.
+		def typeOf(key string) !string {
+			return (try call(timeout, "TYPE", key)).text()
+		}
+
+		// The keys matching a glob pattern. It walks the whole keyspace in
+		// one command: on a large database use `scan`.
+		// Fails as `command` does.
+		def keys(pattern string = "*") !string[] {
+			let out string[] = []
+			for let reply in try everywhere("KEYS", pattern) {
+				out.push(...reply.strings())
+			}
+			return out
+		}
+
+		// A key picked at random, none when the database is empty.
+		// Fails as `command` does.
+		def randomKey() !?string {
+			for let reply in try everywhere("RANDOMKEY") {
+				return reply.text() unless reply.isNull()
+			}
+			return none
+		}
+
+		// A key's value in the server's own serialization, none when the key
+		// does not exist.
+		// Fails as `command` does.
+		def dump(key string) !?byte[] {
+			let v = try call(timeout, "DUMP", key)
+			return none when v.isNull()
+			return v.bytes()
+		}
+
+		// Creates a key from what `dump` returned, expiring after `ttl`
+		// (0s: never). Fails with the server's error when the key exists and
+		// `replace` is not set, or the bytes are not a dump.
+		def restore(key string, serialized byte[], ttl duration = 0s, replace bool = false) !none {
+			let args any[] = ["RESTORE", key, millis(ttl), serialized]
+			args.push("REPLACE") when replace
+			try call(timeout, ...args)
+			return none
+		}
+
+		// The members of a list, set or sorted set in order: by number, or
+		// as text with `alpha`; `limit` > 0 returns that many from `offset`.
+		// Fails as `command` does.
+		def sort(key string, descending bool = false, alpha bool = false, offset int = 0, limit int = 0) !string[] {
+			let args any[] = ["SORT", key]
+			args.push("LIMIT", offset, limit) when limit > 0
+			args.push("DESC") when descending
+			args.push("ALPHA") when alpha
+			return (try call(timeout, ...args)).strings()
+		}
+
+		// scan walks the keys of the database a page at a time without
+		// holding the server: those matching `pattern`, of the type `kind`
+		// when given. `count` hints how many keys the server looks at per
+		// page (0: its default).
+		//
+		// ```
+		// let sessions = r.scan("session:*")
+		// for {
+		//     let page = try sessions.next()
+		//     break when page is none
+		//     ...
+		// }
+		// ```
+		def scan(pattern string = "*", count int = 0, kind string = "") Scanner {
+			let tail any[] = []
+			tail.push("TYPE", kind) when kind != ""
+			return new Scanner(link, timeout, ["SCAN"], pattern, count, tail)
+		}
+
+		// sscan walks the members of a set as `scan` walks keys.
+		def sscan(key string, pattern string = "*", count int = 0) Scanner {
+			return new Scanner(link, timeout, ["SSCAN", key], pattern, count, [])
+		}
+
+		// hscan walks a hash as `scan` walks keys; a page holds fields and
+		// values one after the other.
+		def hscan(key string, pattern string = "*", count int = 0) Scanner {
+			return new Scanner(link, timeout, ["HSCAN", key], pattern, count, [])
+		}
+
+		// zscan walks a sorted set as `scan` walks keys; a page holds
+		// members and scores one after the other.
+		def zscan(key string, pattern string = "*", count int = 0) Scanner {
+			return new Scanner(link, timeout, ["ZSCAN", key], pattern, count, [])
+		}
+	}
+
+	// Scanner walks a keyspace, set, hash or sorted set with the SCAN
+	// family. An element may come back more than once, and one added or
+	// removed during the walk may or may not be seen.
+	type Scanner {
+		internal link    Link
+		// The servers a scan of the whole database still has to walk, the
+		// one being walked first.
+		internal servers Pool[]
+		internal spread  bool
+		internal timeout duration
+		internal head    any[]
+		internal tail    any[]
+		internal pattern string
+		internal count   int
+		internal cursor  string   = "0"
+		internal started bool
+		internal ended   bool
+
+		def new(link Link, timeout duration, head any[], pattern string, count int, tail any[]) {
+			self.link = link
+			self.timeout = timeout
+			self.head = head
+			self.pattern = pattern
+			self.count = count
+			self.tail = tail
+		}
+
+		// The next page, which may be empty; none once the walk is over.
+		// Fails with a RedisError as `Client.command` does.
+		def next() !?string[] {
+			return none when ended
+			let args any[] = []
+			joinedAny(args, head)
+			args.push(cursor)
+			args.push("MATCH", pattern) unless pattern := "*" || ""
+			args.push("COUNT", count) when count > 0
+			joinedAny(args, tail)
+			let whole = head.len() == 1
+			if whole && !started {
+				servers = try link.pools()
+				spread = servers.len() > 1
+			}
+			started = true
+			let reply = new Value()
+			if spread {
+				reply = try servers[0].call(timeout, args)
+			} else {
+				reply = try link.call(timeout, args)
+			}
+			fail errorOf(ErrorKind.Protocol, "redis: a scan reply without a cursor and a page") when reply.items.len() != 2
+			cursor = reply.items[0].text()
+			if cursor == "0" {
+				// A cluster's database is walked one master after another.
+				ended = !spread || servers.len() <= 1
+				servers = servers.slice(1, servers.len()) unless ended
+			}
+			return reply.items[1].strings()
+		}
+
+		// Everything left of the walk in one array.
+		// Fails with a RedisError as `Client.command` does.
+		def all() !string[] {
+			let out string[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+}

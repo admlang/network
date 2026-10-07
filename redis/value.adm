@@ -1,0 +1,218 @@
+partial module adm.network.redis {
+	use adm.network.redis.resp::*
+
+	// ValueKind is the RESP type of a reply.
+	enum ValueKind {
+		// No value: a missing key, RESP2's null bulk string and null array.
+		Null,
+		// A status line such as `OK` or `QUEUED`.
+		Status,
+		// An error reply. A command's own error reply fails the call; this
+		// kind is seen inside aggregates (the replies of `EXEC`).
+		Error,
+		Integer,
+		// A binary-safe string.
+		Bulk,
+		Array,
+		// The kinds below are RESP3's.
+		Bool,
+		Double,
+		// An integer too large for `int`, as its decimal digits.
+		BigNumber,
+		// A string with a three-letter format mark (`txt`, `mkd`).
+		Verbatim,
+		Map,
+		Set,
+		// A message the server sent on its own: pub/sub, key invalidation.
+		Push,
+	}
+
+	// Value is one reply of the server, as RESP carries it. The typed
+	// commands of `Client` return ADM values; `Client.command` returns a
+	// Value for commands the client has no method for.
+	//
+	// The readers convert where RESP2 and RESP3 answer differently, so the
+	// same code reads both: `toFloat` reads a double and a string holding
+	// one, `entries` reads a map and a flat array of pairs, `toBool` reads a
+	// boolean and the integers 0 and 1.
+	type Value {
+		kind       ValueKind = ValueKind.Null
+		// The bytes of a Status, Error, Bulk, Verbatim or BigNumber.
+		data       byte[]
+		// The value of an Integer, and 1 or 0 for a Bool.
+		number     int
+		// The value of a Double.
+		real       float
+		// The members of an Array, Set or Push; the keys and values of a Map
+		// one after the other.
+		items      Value[]
+		// The format mark of a Verbatim string.
+		format     string
+		// The attributes the server attached to the reply (RESP3 `|`), a Map.
+		attributes ?Value
+
+		def new(kind ValueKind = ValueKind.Null) {
+			self.kind = kind
+		}
+
+		// Whether the reply is the null value.
+		def isNull() bool {
+			return kind == ValueKind.Null
+		}
+
+		// Whether the reply is an error reply.
+		def isError() bool {
+			return kind == ValueKind.Error
+		}
+
+		// The reply as text: a string kind as it is, a number in decimal,
+		// a boolean as `true` or `false`, "" for null and aggregates.
+		def text() string {
+			match kind {
+				case ValueKind.Status, ValueKind.Error, ValueKind.Bulk, ValueKind.Verbatim, ValueKind.BigNumber:
+					return string(data)
+				case ValueKind.Integer:
+					return number.str()
+				case ValueKind.Double:
+					return doubleText(real)
+				case ValueKind.Bool:
+					return number != 0 ?? ("true", "false")
+				default:
+					return ""
+			}
+		}
+
+		// The reply's bytes: those of a string kind, else those of `text()`.
+		def bytes() byte[] {
+			match kind {
+				case ValueKind.Status, ValueKind.Error, ValueKind.Bulk, ValueKind.Verbatim, ValueKind.BigNumber:
+					return data
+				default:
+					return text().bytes()
+			}
+		}
+
+		// The reply as an integer: an Integer or Bool as it is, a Double
+		// truncated, a string kind parsed as decimal (0 when it is not one).
+		def toInt() int {
+			match kind {
+				case ValueKind.Integer, ValueKind.Bool:
+					return number
+				case ValueKind.Double:
+					return int(real)
+				case ValueKind.Status, ValueKind.Bulk, ValueKind.Verbatim, ValueKind.BigNumber:
+					return decimalOf(data, 0, data.len())
+				default:
+					return 0
+			}
+		}
+
+		// The reply as a float: a Double as it is, an Integer converted, a
+		// string kind parsed (`inf`, `-inf` and `nan` included; 0 when it is
+		// not a number).
+		def toFloat() float {
+			match kind {
+				case ValueKind.Double:
+					return real
+				case ValueKind.Integer, ValueKind.Bool:
+					return float(number)
+				case ValueKind.Status, ValueKind.Bulk, ValueKind.Verbatim, ValueKind.BigNumber:
+					return doubleOf(string(data))
+				default:
+					return 0.0
+			}
+		}
+
+		// The reply as a boolean: a Bool as it is, a number that is not 0,
+		// the status `OK`, a string that is `1` or `true`.
+		def toBool() bool {
+			match kind {
+				case ValueKind.Bool, ValueKind.Integer:
+					return number != 0
+				case ValueKind.Double:
+					return real != 0.0
+				case ValueKind.Status:
+					return string(data) == "OK"
+				case ValueKind.Bulk, ValueKind.Verbatim:
+					return string(data) := "1" || "true"
+				default:
+					return false
+			}
+		}
+
+		// The number of members: of an Array, Set or Push its items, of a
+		// Map its pairs, 0 for the other kinds.
+		def len() int {
+			return items.len() / 2 when kind == ValueKind.Map
+			return items.len()
+		}
+
+		// The text of every member of an Array, Set or Push, and of a Map's
+		// keys and values one after the other.
+		def strings() string[] {
+			let out string[] = []
+			for let item in items {
+				out.push(item.text())
+			}
+			return out
+		}
+
+		// The reply as pairs by key: a Map, or an Array holding keys and
+		// values one after the other (what RESP2 answers where RESP3 answers
+		// a map), or an Array of two-member arrays.
+		def entries() map<string, Value> {
+			let out = new map<string, Value>()
+			if kind == ValueKind.Array && items.len() > 0 && items[0].kind == ValueKind.Array {
+				for let pair in items {
+					out.set(pair.items[0].text(), pair.items[1]) when pair.items.len() == 2
+				}
+				return out
+			}
+			for let i = 0; i + 1 < items.len(); i += 2 {
+				out.set(items[i].text(), items[i + 1])
+			}
+			return out
+		}
+
+		// The value of a Map's key (or of a flat Array of pairs, as
+		// `entries` reads it), none when it has no such key.
+		def get(key string) ?Value {
+			for let i = 0; i + 1 < items.len(); i += 2 {
+				return items[i + 1] when items[i].text() == key
+			}
+			return none
+		}
+
+		// str renders the reply the way `redis-cli` does on one line.
+		def str() string {
+			match kind {
+				case ValueKind.Null:
+					return "(nil)"
+				case ValueKind.Error:
+					return "(error) {string(data)}"
+				case ValueKind.Integer:
+					return "(integer) {number}"
+				case ValueKind.Double:
+					return "(double) {doubleText(real)}"
+				case ValueKind.Bool:
+					return number != 0 ?? ("(true)", "(false)")
+				case ValueKind.Status, ValueKind.BigNumber:
+					return string(data)
+				case ValueKind.Bulk, ValueKind.Verbatim:
+					return "\"{string(data)}\""
+				case ValueKind.Map:
+					let parts string[] = []
+					for let i = 0; i + 1 < items.len(); i += 2 {
+						parts.push("{items[i].str()}: {items[i + 1].str()}")
+					}
+					return "\{" + parts.join(", ") + "\}"
+				default:
+					let parts string[] = []
+					for let item in items {
+						parts.push(item.str())
+					}
+					return "[" + parts.join(", ") + "]"
+			}
+		}
+	}
+}

@@ -1,0 +1,12 @@
+// A Redis client as an ADM library: RESP2 and RESP3 over std.net.
+@manifest(version = "0.1.0")
+library adm.network.redis {
+	use (
+		adm.network.redis
+		adm.network.redis.resp
+	)
+
+	export (
+		adm.network.redis
+	)
+}

@@ -1,0 +1,403 @@
+// A Redis client: RESP2 and RESP3 over TCP, TLS or a Unix socket, written
+// in ADM over std.net. It talks to Redis, Valkey and servers that speak
+// the same protocol.
+partial module adm.network.redis {
+	use (
+		std.net.tls
+		std.net.url
+		adm.network.redis.resp::*
+	)
+
+	// Client talks to one Redis server. It keeps a few connections open and
+	// lends one to each command, so any number of tasks may share it.
+	//
+	// ```
+	// let r = try redis.connect("redis://cache.internal:6379/0")
+	// try r.set("greeting", "hello", expire = 1min)
+	// let greeting = try r.get("greeting")     // ?string
+	// let hits = try r.incr("hits")
+	// try r.close()
+	// ```
+	//
+	// Every command has a method; `command` sends one the client has no
+	// method for and returns the reply as a Value. Commands fail with a
+	// RedisError: the server's error reply (`kind` names the common ones,
+	// `prefix` holds its first word), ErrorKind.Connection when the server
+	// cannot be reached or the connection breaks, ErrorKind.TimedOut when no
+	// reply comes within `timeout`, ErrorKind.Closed after `close`.
+	//
+	// A command that fails on a connection the server closed while it sat
+	// idle is sent once more on a new one.
+	partial type Client {
+		// The ACL user; empty for the default user.
+		username          string          = ""
+		password          ?Secret<string> = none
+		// The database every connection selects.
+		database          int             = 0
+		// The name connections give themselves (`CLIENT SETNAME`).
+		name              string          = ""
+		// The RESP version to ask for. With 3 the client still speaks RESP2
+		// to a server that does not know better.
+		protocol          int             = 3
+		// TLS settings for `rediss:`; none checks the certificate against
+		// the system's authorities and the host name.
+		tls               ?tls.Config     = none
+		// How long opening a connection may take.
+		connectTimeout    duration        = 30s
+		// How long a reply may take. Commands that wait on the server
+		// (`blpop`, `xread` with `block`) add their own wait to it.
+		timeout           duration        = 30s
+		// How many connections the client opens at most. A command that
+		// finds them all busy waits for one.
+		poolSize          int             = 8
+		// With a cluster: read-only commands go to a replica of the node
+		// that serves their keys when it has one. What a replica answers
+		// may be a little behind its master.
+		readFromReplicas  bool            = false
+		internal target   Target
+		internal pool     Pool
+		// Where commands go: `pool`, a cluster's nodes or a sentinel
+		// group's master.
+		internal link     Link
+		internal joined   bool
+		internal greeting Value           = new Value()
+
+		def new() {
+			pool = new Pool()
+			link = pool
+		}
+
+		// connect names the server and opens the first connection to it:
+		//
+		//     redis://[user:password@]host[:port][/database]
+		//     rediss://...                      the same under TLS
+		//     unix:///run/redis.sock[?db=2]     a Unix socket
+		//     host[:port]
+		//
+		// The port is 6379 when left out. The user, password and database
+		// of the URL replace the client's fields. Options in the query:
+		// `db`, `protocol` (2 or 3), `client_name`, `timeout` and
+		// `connect_timeout` in seconds, `pool_size`.
+		// Fails with a RedisError: ErrorKind.Argument for an address or an
+		// option the client does not take, and as `command` does.
+		def connect(address string) !none {
+			fail errorOf(ErrorKind.Protocol, "redis: the client is already connected") when joined
+			try locate(address)
+			try settle()
+			let conn = try pool.open(target, poolSize)
+			joined = true
+			protocol = conn.protocol
+			greeting = conn.hello
+			pool.giveBack(conn)
+			return none
+		}
+
+		// connectCluster joins a Redis Cluster through any of its nodes:
+		// one address is enough, more are tried in turn when it does not
+		// answer. The first address may be any form `connect` takes, with
+		// its user, password and options; they hold for every node. The
+		// others name a host and a port.
+		//
+		// ```
+		// let r = new redis.Client()
+		// try r.connectCluster("redis://app:secret@10.0.0.1:7000", "10.0.0.2:7000")
+		// try r.set("user:7:name", "Ana")       // goes to the node of its slot
+		// ```
+		//
+		// Every command goes to the node that serves its keys, and follows
+		// the cluster when slots move or a replica takes over. A command
+		// with several keys needs them in one slot: give them a common
+		// `{tag}` (`{user:7}:name`, `{user:7}:mail`), or it fails with
+		// ErrorKind.Cluster. Commands on the whole database (`keys`,
+		// `scan`, `dbSize`, `flushDb`, `flushAll`, `scriptLoad`,
+		// `scriptFlush`, `functionLoad`, `configSet`) go to every master.
+		// A cluster has one database, 0.
+		// Fails with a RedisError: ErrorKind.Argument as `connect` does and
+		// for a database other than 0, ErrorKind.Connection when no node
+		// answers, ErrorKind.Cluster when the server is not a cluster.
+		def connectCluster(nodes ...string) !none {
+			fail errorOf(ErrorKind.Protocol, "redis: the client is already connected") when joined
+			fail errorOf(ErrorKind.Argument, "redis: connectCluster needs the address of a node") when nodes.len() == 0
+			try locate(nodes[0])
+			try settle()
+			fail errorOf(ErrorKind.Argument, "redis: a cluster node is reached by host and port, not by a socket path") when target.path != ""
+			fail errorOf(ErrorKind.Argument, "redis: a cluster has one database, 0, not {database}") when database != 0
+			let seeds string[] = [addressOf(target.host, target.port)]
+			for let i = 1; i < nodes.len(); i++ {
+				let (host, port) = try seedOf(nodes[i])
+				seeds.push(addressOf(host, port))
+			}
+			let cluster = new ClusterLink(target, seeds, poolSize, readFromReplicas)
+			cluster.open() onerror (err error) {
+				cluster.close()
+				fail err
+			}
+			link = cluster
+			joined = true
+			try greeted()
+			return none
+		}
+
+		// connectSentinel finds the master a group of sentinels watches
+		// under a name, and connects to it. Each address names a sentinel,
+		// in any form `connect` takes (26379 when the port is left out);
+		// a user and a password in it are the sentinel's own. The client's
+		// fields (`username`, `password`, `database`, `tls`, ...) are for
+		// the master.
+		//
+		// ```
+		// let r = new redis.Client()
+		// r.password = "secret"
+		// try r.connectSentinel("mymaster", "10.0.0.1", "10.0.0.2", "10.0.0.3")
+		// ```
+		//
+		// When the master stops answering, or stops being the master, the
+		// client asks the sentinels again and goes on with the one they
+		// promoted. A command waits up to `connectTimeout` for that; one
+		// that was already sent when the connection broke fails, since it
+		// may have run.
+		// Fails with a RedisError: ErrorKind.Argument for an address the
+		// client does not take, ErrorKind.Connection when no sentinel
+		// answers or none names a master that does.
+		def connectSentinel(master string, sentinels ...string) !none {
+			fail errorOf(ErrorKind.Protocol, "redis: the client is already connected") when joined
+			fail errorOf(ErrorKind.Argument, "redis: connectSentinel needs the name of a master and the address of a sentinel") when master == "" || sentinels.len() == 0
+			target = Target{host: "", port: 0}
+			try settle()
+			let asked Target[] = []
+			for let address in sentinels {
+				// A sentinel has its own user, no database, and answers
+				// fast or not at all.
+				let guard = new Client()
+				guard.protocol = protocol
+				guard.tls = tls
+				guard.connectTimeout = connectTimeout > 5s ?? (5s, connectTimeout)
+				guard.timeout = guard.connectTimeout
+				try guard.locate(address, 26379)
+				try guard.settle()
+				fail errorOf(ErrorKind.Argument, "redis: '{address}' names a database; a sentinel has none") when guard.database != 0
+				asked.push(guard.target)
+			}
+			let group = new SentinelLink(target, master, asked, poolSize)
+			group.resolve(0) onerror (err error) {
+				group.close()
+				fail err
+			}
+			link = group
+			joined = true
+			try greeted()
+			return none
+		}
+
+		// command sends a command, its name first, and returns the reply.
+		// Arguments are text, bytes, numbers and booleans (sent as `1` and
+		// `0`).
+		//
+		// ```
+		// let reply = try r.command("OBJECT", "ENCODING", "greeting")
+		// print(reply.text())
+		// ```
+		//
+		// Fails with a RedisError: the server's error reply,
+		// ErrorKind.Argument for an argument that cannot be sent,
+		// ErrorKind.Connection, ErrorKind.TimedOut or ErrorKind.Closed.
+		def command(args ...any) !Value {
+			return try link.call(timeout, args)
+		}
+
+		// The RESP version the server agreed to: 3 or 2.
+		def version() int {
+			return protocol
+		}
+
+		// What the server said about itself when the first connection
+		// greeted it (`server`, `version`, `mode`, `role`); empty in RESP2.
+		def serverInfo() map<string, string> {
+			let out = new map<string, string>()
+			for let (key, value) in greeting.entries() {
+				out.set(key, value.text()) unless value.kind := ValueKind.Array || ValueKind.Map || ValueKind.Set
+			}
+			return out
+		}
+
+		// close closes every connection. Commands sent later fail with
+		// ErrorKind.Closed. Never fails.
+		def close() !none {
+			link.close()
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the client.
+		def str() string {
+			return "redis.Client({target.path})" when target.path != ""
+			return "redis.Client({target.host}:{target.port}/{target.database})"
+		}
+
+		// ---- internals ----
+
+		// Reads an address into `target` and the fields a URL may set.
+		internal def locate(address string, usualPort int = 6379) !none {
+			target = Target{host: "localhost", port: usualPort}
+			let text = address
+			text = "redis://{text}" unless text.contains("://") || text.startsWith("unix:")
+			let parsed = url.parse(text) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "redis: '{address}' is not an address: {err.message}")
+			}
+			match parsed.scheme {
+				case "redis":
+				case "rediss":
+					target.secure = true
+				case "unix", "redis+unix":
+					target.path = parsed.path
+					fail errorOf(ErrorKind.Argument, "redis: '{address}' names no socket path") when target.path == ""
+				default:
+					fail errorOf(ErrorKind.Argument, "redis: the scheme of '{address}' is not redis, rediss or unix")
+			}
+			if target.path == "" {
+				let host = parsed.hostname()
+				target.host = host unless host == ""
+				let port = parsed.port()
+				target.port = port when port > 0
+				let path = parsed.path
+				path = path.slice(1, path.len()) when path.startsWith("/")
+				if path != "" {
+					fail errorOf(ErrorKind.Argument, "redis: the database '{path}' of '{address}' is not a number") unless /^[0-9]{1,9}$/.test(path)
+					database = path.toInt<int>()
+				}
+			}
+			let info = parsed.user
+			if !(info is none) {
+				username = info.username
+				let given = info.password
+				if !(given is none) {
+					let secret Secret<string> = given
+					password = secret
+				}
+			}
+			for let (_, pair) in parsed.query().pairs() {
+				let numeric = /^[0-9]{1,9}$/.test(pair.value)
+				match pair.key {
+					case "db":
+						fail errorOf(ErrorKind.Argument, "redis: db '{pair.value}' is not a number") unless numeric
+						database = pair.value.toInt<int>()
+					case "protocol":
+						fail errorOf(ErrorKind.Argument, "redis: protocol '{pair.value}' is not 2 or 3") unless pair.value := "2" || "3"
+						protocol = pair.value.toInt<int>()
+					case "client_name":
+						name = pair.value
+					case "timeout":
+						fail errorOf(ErrorKind.Argument, "redis: timeout '{pair.value}' is not a number of seconds") unless numeric
+						timeout = duration(pair.value.toInt<int>() * 1000000000)
+					case "connect_timeout":
+						fail errorOf(ErrorKind.Argument, "redis: connect_timeout '{pair.value}' is not a number of seconds") unless numeric
+						connectTimeout = duration(pair.value.toInt<int>() * 1000000000)
+					case "pool_size":
+						fail errorOf(ErrorKind.Argument, "redis: pool_size '{pair.value}' is not a number") unless numeric
+						poolSize = pair.value.toInt<int>()
+					default:
+						fail errorOf(ErrorKind.Argument, "redis: unknown option '{pair.key}' in '{address}'")
+				}
+			}
+			return none
+		}
+
+		// Sends one command and returns its reply, waiting up to `wait` for
+		// it (0s without end).
+		internal def call(wait duration, args ...any) !Value {
+			return try link.call(wait, args)
+		}
+
+		// Copies the client's fields into `target` once they are checked.
+		internal def settle() !none {
+			fail errorOf(ErrorKind.Argument, "redis: poolSize is {poolSize}; it must be at least 1") when poolSize < 1
+			fail errorOf(ErrorKind.Argument, "redis: protocol is {protocol}; it is 2 or 3") unless protocol := 2 || 3
+			target.username = username
+			let secret = password
+			target.password = secret.reveal() unless secret is none
+			target.database = database
+			target.name = name
+			target.protocol = protocol
+			target.tlsConfig = tls
+			target.connectTimeout = connectTimeout
+			target.timeout = timeout
+			return none
+		}
+
+		// Reads the protocol version and the greeting off a connection of
+		// the link.
+		internal def greeted() !none {
+			let held = try link.hold([], true)
+			return none when held is none
+			protocol = held.conn.protocol
+			greeting = held.conn.hello
+			held.pool.giveBack(held.conn)
+			return none
+		}
+
+		// The host and port of one more node of a cluster.
+		internal def seedOf(address string) !(string, int) {
+			let other = new Client()
+			try other.locate(address)
+			fail errorOf(ErrorKind.Argument, "redis: '{address}' names no host and port") when other.target.path != ""
+			return (other.target.host, other.target.port)
+		}
+
+		// Sends a command to every server that holds keys and returns
+		// their replies.
+		internal def everywhere(args ...any) !Value[] {
+			let pools = try link.pools()
+			return [try link.call(timeout, args)] when pools.len() == 1
+			let out Value[] = []
+			for let server in pools {
+				out.push(try server.call(timeout, args))
+			}
+			return out
+		}
+	}
+
+	// connect opens a client for the server an address names; see
+	// `Client.connect` for the forms it takes.
+	//
+	// ```
+	// let r = try redis.connect("rediss://app:secret@cache.internal/2")
+	// ```
+	//
+	// Fails with a RedisError as `Client.connect` does.
+	def connect(address string) !Client {
+		let client = new Client()
+		try client.connect(address)
+		return client
+	}
+
+	// connectCluster opens a client for a Redis Cluster through any of its
+	// nodes; see `Client.connectCluster`.
+	//
+	// ```
+	// let r = try redis.connectCluster("10.0.0.1:7000", "10.0.0.2:7000")
+	// ```
+	//
+	// Fails with a RedisError as `Client.connectCluster` does.
+	def connectCluster(nodes ...string) !Client {
+		let client = new Client()
+		try client.connectCluster(...nodes)
+		return client
+	}
+
+	// connectSentinel opens a client for the master a group of sentinels
+	// watches under a name; see `Client.connectSentinel`.
+	//
+	// ```
+	// let r = try redis.connectSentinel("mymaster", "10.0.0.1", "10.0.0.2")
+	// ```
+	//
+	// Fails with a RedisError as `Client.connectSentinel` does.
+	def connectSentinel(master string, sentinels ...string) !Client {
+		let client = new Client()
+		try client.connectSentinel(master, ...sentinels)
+		return client
+	}
+}

@@ -1,0 +1,286 @@
+// An S3 client: Signature Version 4 over std.net.http, written in ADM. It
+// talks to Amazon S3 and to the servers that speak its API (MinIO, Ceph,
+// Garage, Cloudflare R2, Backblaze B2).
+partial module adm.network.s3 {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.time
+		adm.network.s3.sigv4::*
+		adm.network.s3.wire::*
+	)
+
+	// Addressing says where a bucket's name goes in a request.
+	enum Addressing {
+		// The host name when the endpoint is a DNS name and the bucket's
+		// name can be a label under its certificate, the path otherwise.
+		Auto,
+		// `https://endpoint/bucket/key`.
+		Path,
+		// `https://bucket.endpoint/key`.
+		VirtualHost,
+	}
+
+	// BucketInfo is one bucket of the account.
+	struct BucketInfo {
+		name    string
+		created time.Time
+		// "" when the server does not say.
+		region  string
+	}
+
+	// Client signs requests for one endpoint with one set of credentials.
+	// It holds no connection of its own (std.net.http keeps them), so any
+	// number of tasks may share it.
+	//
+	// ```
+	// let store = try s3.connect("https://s3.eu-central-1.amazonaws.com", accessKey, secretKey)
+	// let photos = store.bucket("photos")
+	// try photos.put("2026/cat.jpg", pixels, "image/jpeg")
+	// let cat = try photos.get("2026/cat.jpg")
+	// let data = try cat.bytes()
+	// ```
+	//
+	// Requests fail with an S3Error: the server's error reply (`kind`
+	// names the common ones, `serverCode` holds its code),
+	// ErrorKind.Connection when the server cannot be reached and
+	// ErrorKind.TimedOut when `timeout` passes.
+	//
+	// A request refused because the bucket lives in another region is sent
+	// once more, signed for the region the reply names.
+	partial type Client {
+		// The region requests are signed for. An AWS endpoint that names a
+		// region (`s3.eu-central-1.amazonaws.com`) sets it.
+		region          string             = "us-east-1"
+		accessKey       string             = ""
+		secretKey       ?Secret<string>    = none
+		// The session token of temporary credentials.
+		sessionToken    ?Secret<string>    = none
+		addressing      Addressing         = Addressing.Auto
+		// How long one request may take, its body included; 0s sets no
+		// limit.
+		timeout         duration           = 0s
+		// How many times a request is sent again after a 500, 502, 503 or
+		// 504, or a broken connection. A streamed body is never resent.
+		retries         int                = 3
+		// The size of the parts `Bucket.upload` cuts a stream into: 5 MiB
+		// to 5 GiB. An upload has at most 10000 parts.
+		partSize        int                = 16 * 1024 * 1024
+		// How many parts `Bucket.upload` sends at a time.
+		uploadTasks     int                = 4
+		// What sends the requests; none uses std.net.http's shared
+		// transport.
+		transport       ?http.RoundTripper = none
+		internal engine Engine
+
+		def new() {
+			engine = new Engine()
+		}
+
+		// connect names the endpoint. No request is sent.
+		//
+		//     https://s3.eu-central-1.amazonaws.com    Amazon S3, one region
+		//     https://s3.amazonaws.com                 Amazon S3, `region`
+		//     http://127.0.0.1:9000                    a server of one's own
+		//     https://key:secret@host[:port]           credentials in the address
+		//     host[:port]                              the same as https://host[:port]
+		//
+		// Options in the query: `region`, `addressing` (`path`, `virtual`
+		// or `auto`) and `timeout` in seconds.
+		// Fails with an S3Error of ErrorKind.Argument for an address or a
+		// setting the client does not take.
+		def connect(endpoint string) !none {
+			let text = endpoint
+			text = "https://{text}" unless text.contains("://")
+			let parsed = url.parse(text) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "s3: '{endpoint}' is not an address: {err.message}", err)
+			}
+			fail errorOf(ErrorKind.Argument, "s3: the scheme of '{endpoint}' is not http or https") unless parsed.scheme := "http" || "https"
+			fail errorOf(ErrorKind.Argument, "s3: '{endpoint}' names no host") when parsed.hostname() == ""
+			fail errorOf(ErrorKind.Argument, "s3: '{endpoint}' has a path; the endpoint is a host") unless parsed.path := "" || "/"
+			let info = parsed.user
+			if !(info is none) {
+				accessKey = info.username
+				let given = info.password
+				if !(given is none) {
+					let secret Secret<string> = given
+					secretKey = secret
+				}
+			}
+			let name = parsed.hostname()
+			let aws = false
+			if name.startsWith("s3.") && name.endsWith(".amazonaws.com") {
+				let middle = name.slice(3, name.len() - 14)
+				aws = middle == "" || !middle.contains(".")
+				aws = true when name == "s3.amazonaws.com"
+				region = middle when aws && middle != "" && name != "s3.amazonaws.com"
+			}
+			for let (_, pair) in parsed.query().pairs() {
+				match pair.key {
+					case "region":
+						region = pair.value
+					case "addressing":
+						match pair.value {
+							case "path":
+								addressing = Addressing.Path
+							case "virtual":
+								addressing = Addressing.VirtualHost
+							case "auto":
+								addressing = Addressing.Auto
+							default:
+								fail errorOf(ErrorKind.Argument, "s3: addressing '{pair.value}' is not path, virtual or auto")
+						}
+					case "timeout":
+						fail errorOf(ErrorKind.Argument, "s3: timeout '{pair.value}' is not a number of seconds") unless /^[0-9]{1,9}$/.test(pair.value)
+						timeout = duration(pair.value.toInt<int>() * 1000000000)
+					default:
+						fail errorOf(ErrorKind.Argument, "s3: unknown option '{pair.key}' in '{endpoint}'")
+				}
+			}
+			fail errorOf(ErrorKind.Argument, "s3: no region is set") when region == ""
+			fail errorOf(ErrorKind.Argument, "s3: partSize is {partSize}; it is 5 MiB to 5 GiB") when partSize < minPartSize || partSize > maxPartSize
+			fail errorOf(ErrorKind.Argument, "s3: uploadTasks is {uploadTasks}; it must be at least 1") when uploadTasks < 1
+			fail errorOf(ErrorKind.Argument, "s3: retries is {retries}; it cannot be negative") when retries < 0
+
+			let next = new Engine()
+			next.scheme = parsed.scheme
+			next.host = parsed.host
+			next.aws = aws
+			next.region = region
+			next.addressing = addressing
+			next.accessKey = accessKey
+			let secret = secretKey
+			next.secretKey = secret.reveal() unless secret is none
+			let session = sessionToken
+			next.token = session.reveal() unless session is none
+			next.partSize = partSize
+			next.uploadTasks = uploadTasks
+			next.web.timeout = timeout
+			next.web.transport = transport
+			next.web.retry = http.RetryPolicy{attempts: retries, statuses: [500, 502, 503, 504], allMethods: true}
+			engine = next
+			return none
+		}
+
+		// The bucket of that name. Nothing is sent: a bucket that does not
+		// exist fails its first request with ErrorKind.NoBucket.
+		def bucket(name string) Bucket {
+			return new Bucket(engine, name)
+		}
+
+		// Every bucket of the account.
+		// Fails with an S3Error as requests do.
+		def buckets() !BucketInfo[] {
+			let out BucketInfo[] = []
+			let token = ""
+			for {
+				let call = new Call("GET")
+				call.param("continuation-token", token) when token != ""
+				let root = try engine.document(call)
+				let list = root.child("Buckets")
+				if !(list is none) {
+					for let node in list.elements("Bucket") {
+						out.push(BucketInfo{name: textOf(node, "Name"), created: timeOf(node, "CreationDate"), region: textOf(node, "BucketRegion")})
+					}
+				}
+				token = textOf(root, "ContinuationToken")
+				break when token == ""
+			}
+			return out
+		}
+
+		// createBucket makes a bucket in the client's region. `objectLock`
+		// turns on Object Lock, which a bucket only takes when it is made.
+		// Fails with an S3Error: ErrorKind.Exists when the name is taken,
+		// ErrorKind.Argument for a name S3 does not take, and as requests do.
+		def createBucket(name string, objectLock bool = false) !Bucket {
+			let call = new Call("PUT", name)
+			call.header("x-amz-bucket-object-lock-enabled", "true") when objectLock
+			if engine.region != "us-east-1" {
+				let doc = new encoding.XMLWriter()
+				doc.start("CreateBucketConfiguration")
+				doc.attribute("xmlns", xmlns)
+				doc.element("LocationConstraint", engine.region)
+				doc.end()
+				call.body = doc.bytes()
+			}
+			try engine.done(call)
+			return new Bucket(engine, name)
+		}
+
+		// deleteBucket removes an empty bucket.
+		// Fails with an S3Error: ErrorKind.NotEmpty while it holds objects,
+		// versions or unfinished uploads, ErrorKind.NoBucket, and as
+		// requests do.
+		def deleteBucket(name string) !none {
+			try engine.done(new Call("DELETE", name))
+			return none
+		}
+
+		// Whether the bucket exists and these credentials may use it.
+		// Fails with an S3Error: ErrorKind.Denied for a bucket of someone
+		// else, and as requests do.
+		def hasBucket(name string) !bool {
+			let res = try engine.send(new Call("HEAD", name), 404)
+			res.close() onerror recover none
+			return res.status != 404
+		}
+
+		// request signs and sends a request the client has no method for,
+		// and returns the response with its body unread: read or close it.
+		//
+		// ```
+		// let res = try store.request("GET", "photos", query = {"accelerate": ""})
+		// print(try res.text())
+		// ```
+		//
+		// Fails with an S3Error as requests do; a status outside 2xx is the
+		// server's error reply.
+		def request(method string, bucket string = "", key string = "", query ?map<string, string> = none, headers ?map<string, string> = none, body byte[] = []) !http.Response {
+			let call = new Call(method.upper(), bucket, key)
+			if !(query is none) {
+				for let (name, value) in query {
+					call.param(name, value)
+				}
+			}
+			if !(headers is none) {
+				for let (name, value) in headers {
+					call.header(name, value)
+				}
+			}
+			call.body = body
+			return try engine.send(call)
+		}
+
+		// close drops the idle connections of a transport of the client's
+		// own. Never fails.
+		def close() !none {
+			engine.web.closeIdle() unless transport is none
+			return none
+		}
+
+		// Names the client by its endpoint.
+		def str() string {
+			return "s3.Client({engine.scheme}://{engine.host})"
+		}
+	}
+
+	// connect makes a client for an endpoint; see `Client.connect` for the
+	// forms it takes. No request is sent. `region` left out is the one the
+	// address names, else `us-east-1`.
+	//
+	// ```
+	// let store = try s3.connect("http://127.0.0.1:9000", "admin", secret)
+	// ```
+	//
+	// Fails with an S3Error as `Client.connect` does.
+	def connect(endpoint string, accessKey string = "", secretKey ?Secret<string> = none, region string = "") !Client {
+		let client = new Client()
+		client.accessKey = accessKey
+		client.secretKey = secretKey
+		client.region = region when region != ""
+		try client.connect(endpoint)
+		return client
+	}
+}

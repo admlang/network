@@ -1,0 +1,642 @@
+// These tests need a Redis server; without ADM_TEST_REDIS they pass
+// without running. See README.md for the server they expect.
+partial module adm.network.redis {
+	use (
+		std.testing
+		std.time
+	)
+
+	// The server's address as `host:port`. The tests empty its database 9.
+	@env("ADM_TEST_REDIS")
+	internal const testServer string
+
+	// A client on an emptied database 9.
+	def fresh(options string = "") !Client {
+		let r = try connect("redis://{testServer}/9{options}")
+		try r.command("FLUSHDB")
+		return r
+	}
+
+	def text(v ?string) string {
+		return "(none)" when v is none
+		return v
+	}
+
+	def number(v ?int) int {
+		return -1 when v is none
+		return v
+	}
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is RedisError
+		return ErrorKind.Server
+	}
+
+	check "Connect" {
+		@test()
+		def TestPing() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert r.version() == 3
+			let pong = try r.command("PING")
+			assert pong.text() == "PONG"
+			let echo = try r.command("ECHO", "héllo")
+			assert echo.text() == "héllo"
+			assert r.serverInfo().hasKey("version")
+			assert r.str() == "redis.Client({testServer}/9)"
+			try r.close()
+			let after = ErrorKind.Server
+			r.get("k") onerror (err error) {
+				after = kindOfFailure(err)
+				recover none
+			}
+			assert after == ErrorKind.Closed
+		}
+
+		@test()
+		def TestProtocolTwo() !none {
+			return none when testServer == ""
+			let r = try fresh("?protocol=2&client_name=adm-test")
+			assert r.version() == 2
+			assert (try r.command("CLIENT", "GETNAME")).text() == "adm-test"
+			try r.hset("h", {"a": 1, "b": "two"})
+			let all = try r.hgetAll("h")
+			assert all.len() == 2
+			assert all["b"] == "two"
+			try r.close()
+		}
+
+		@test()
+		def TestAddressErrors() !none {
+			let kind = ErrorKind.Server
+			connect("http://localhost") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("redis://localhost/x") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("redis://127.0.0.1:1?connect_timeout=2") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Connection
+		}
+
+		@test()
+		def TestServerErrors() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			try r.lpush("list", "a")
+			let kind = ErrorKind.Server
+			let prefix = ""
+			r.get("list") onerror (err error) {
+				kind = kindOfFailure(err)
+				prefix = err.prefix when err is RedisError
+				recover none
+			}
+			assert kind == ErrorKind.WrongType
+			assert prefix == "WRONGTYPE"
+			kind = ErrorKind.Closed
+			r.command("NOSUCHCOMMAND") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Value()
+			}
+			assert kind == ErrorKind.Server
+			// The connection is still good after an error reply.
+			assert (try r.llen("list")) == 1
+			try r.close()
+		}
+
+		@test()
+		def TestUsersAndPasswords() !none {
+			return none when testServer == ""
+			let admin = try fresh()
+			try admin.command("ACL", "SETUSER", "adm-test-user", "on", ">s3cret", "~*", "&*", "+@all", "-flushall")
+			for let options in ["", "?protocol=2"] {
+				let r = try connect("redis://adm-test-user:s3cret@{testServer}/9{options}")
+				assert (try r.command("ACL", "WHOAMI")).text() == "adm-test-user"
+				let kind = ErrorKind.Server
+				r.flushAll() onerror (err error) {
+					kind = kindOfFailure(err)
+					recover none
+				}
+				assert kind == ErrorKind.Denied
+				try r.close()
+
+				kind = ErrorKind.Server
+				connect("redis://adm-test-user:wrong@{testServer}/9{options}") onerror (err error) {
+					kind = kindOfFailure(err)
+					recover new Client()
+				}
+				assert kind == ErrorKind.Denied
+			}
+			try admin.command("ACL", "DELUSER", "adm-test-user")
+			try admin.close()
+		}
+
+		@test()
+		def TestDroppedIdleConnectionIsReplaced() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			try r.set("k", "v")
+			let other = try connect("redis://{testServer}/9")
+			assert (try other.command("CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes")).toInt() >= 1
+			assert text(try r.get("k")) == "v"
+			assert text(try r.get("k")) == "v"
+			try other.close()
+			try r.close()
+		}
+
+		@test()
+		def TestManyTasksShareAClient() !none {
+			return none when testServer == ""
+			let r = try fresh("?pool_size=3")
+			let group = new AsyncScope()
+			for let i = 0; i < 24; i++ {
+				async<group> r.incr("shared")
+			}
+			try await group
+			assert text(try r.get("shared")) == "24"
+			try r.close()
+		}
+	}
+
+	check "Commands" {
+		@test()
+		def TestStrings() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert (try r.get("missing")) is none
+			assert try r.set("k", "v")
+			assert text(try r.get("k")) == "v"
+			assert !(try r.set("k", "other", mode = SetMode.IfMissing))
+			assert try r.set("k", "w", mode = SetMode.IfExists)
+			assert text(try r.swap("k", "x")) == "w"
+			assert try r.set("n", 41)
+			assert (try r.incr("n")) == 42
+			assert (try r.decr("n", 2)) == 40
+			assert (try r.incrFloat("n", 0.5)) == 40.5
+			assert (try r.append("k", "yz")) == 3
+			assert (try r.strlen("k")) == 3
+			assert string(try r.getRange("k", 1, -1)) == "yz"
+
+			let raw byte[] = [byte(0), byte(255), byte(13), byte(10), byte(0)]
+			try r.set("bin", raw)
+			let back = try r.getBytes("bin")
+			fail "back is none" when back is none
+			assert back.equals(raw)
+
+			try r.set("big", "x".repeat(100000))
+			assert (try r.strlen("big")) == 100000
+			assert text(try r.get("big")).len() == 100000
+
+			try r.mset({"a": 1, "b": "two"})
+			let many = try r.mget("a", "nope", "b")
+			assert many.len() == 2
+			assert many["a"] == "1"
+			assert many["b"] == "two"
+			assert text(try r.get("b", 1min)) == "two"
+			assert !((try r.ttl("b")) is none)
+			assert text(try r.get("b", 0s)) == "two"
+			assert (try r.ttl("b")) is none
+			assert text(try r.getDel("a")) == "1"
+			assert (try r.get("a")) is none
+
+			assert try r.set("flag", true)
+			assert text(try r.get("flag")) == "1"
+			assert !(try r.setBit("bits", 7, true))
+			assert try r.getBit("bits", 7)
+			assert (try r.bitCount("bits")) == 1
+			assert (try r.bitPos("bits", true)) == 7
+			assert try r.pfAdd("hll", "a", "b", "c")
+			assert (try r.pfCount("hll")) == 3
+			try r.close()
+		}
+
+		@test()
+		def TestKeys() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			try r.set("a", 1, expire = 1min)
+			try r.set("b", 2)
+			assert (try r.exists("a", "b", "c")) == 2
+			let left = try r.ttl("a")
+			fail "left is none" when left is none
+			assert left > 50s && left <= 1min
+			assert (try r.ttl("b")) is none
+			assert try r.persist("a")
+			assert (try r.ttl("a")) is none
+			assert try r.expire("a", 10s)
+			assert try r.expireAt("b", time.now() + 1h)
+			assert (try r.typeOf("a")) == "string"
+			assert (try r.typeOf("zz")) == "none"
+			try r.rename("a", "a2")
+			assert !(try r.renameNx("a2", "b"))
+			assert try r.copy("b", "b2")
+			let blob = try r.dump("b")
+			fail "blob is none" when blob is none
+			try r.restore("b3", blob)
+			assert text(try r.get("b3")) == "2"
+			assert (try r.keys("b*")).len() == 3
+			assert (try r.del("a2", "b", "nope")) == 2
+			for let i = 0; i < 300; i++ {
+				try r.set("scan:{i}", i)
+			}
+			let found = try r.scan("scan:*", count = 50).all()
+			assert found.len() == 300
+			let walker = r.scan("scan:1*")
+			let first = try walker.next()
+			fail "first is none" when first is none
+			assert !((try r.randomKey()) is none)
+			try r.close()
+		}
+
+		@test()
+		def TestHashes() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert try r.hset("h", "name", "Ana")
+			assert !(try r.hset("h", "name", "Anna"))
+			assert (try r.hset("h", {"age": 30, "city": "Cluj"})) == 2
+			assert text(try r.hget("h", "name")) == "Anna"
+			assert (try r.hget("h", "nope")) is none
+			assert (try r.hlen("h")) == 3
+			assert try r.hexists("h", "age")
+			assert (try r.hincr("h", "age", 2)) == 32
+			assert (try r.hincrFloat("h", "score", 1.5)) == 1.5
+			let some = try r.hmget("h", "name", "nope", "city")
+			assert some.len() == 2
+			assert some["city"] == "Cluj"
+			let all = try r.hgetAll("h")
+			assert all.len() == 4
+			assert all["age"] == "32"
+			assert (try r.hkeys("h")).len() == 4
+			assert (try r.hvals("h")).includes("Cluj")
+			assert !(try r.hsetNx("h", "name", "x"))
+			assert (try r.hstrlen("h", "name")) == 4
+			assert (try r.hdel("h", "city", "nope")) == 1
+			assert (try r.hscan("h").all()).len() == 6
+			assert (try r.hgetAll("nope")).len() == 0
+			try r.close()
+		}
+
+		@test()
+		def TestLists() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert (try r.rpush("l", "a", "b", "c")) == 3
+			assert (try r.lpush("l", "z")) == 4
+			assert (try r.lrange("l")).join(",") == "z,a,b,c"
+			assert text(try r.lindex("l", 1)) == "a"
+			assert number(try r.lpos("l", "b")) == 2
+			assert (try r.lpos("l", "nope")) is none
+			try r.lset("l", 0, "y")
+			assert (try r.linsert("l", "a", "x")) == 5
+			assert text(try r.lpop("l")) == "y"
+			assert text(try r.rpop("l")) == "c"
+			assert (try r.lpop("l", 2)).join(",") == "x,a"
+			assert (try r.llen("l")) == 1
+			assert text(try r.lmove("l", "m")) == "b"
+			assert (try r.lpop("l")) is none
+			assert (try r.lpushX("nolist", "a")) == 0
+			try r.rpush("d", "a", "b", "a", "c", "a")
+			assert (try r.lrem("d", "a", 2)) == 2
+			try r.ltrim("d", 0, 0)
+			assert (try r.lrange("d")).join(",") == "b"
+
+			let got = try r.blpop(["empty", "m"], 1s)
+			fail "got is none" when got is none
+			assert got.key == "m" && got.value == "b"
+			let started = time.now()
+			assert (try r.brpop(["empty"], 200ms)) is none
+			assert time.now() - started >= 150ms
+
+			let waiter = async r.blpop(["later"], 5s)
+			time.sleep(100ms)
+			try r.rpush("later", "arrived")
+			let late = try await waiter
+			fail "late is none" when late is none
+			assert late.value == "arrived"
+			try r.close()
+		}
+
+		@test()
+		def TestSets() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert (try r.sadd("s", "a", "b", "c")) == 3
+			assert (try r.sadd("s", "a")) == 0
+			assert (try r.scard("s")) == 3
+			assert try r.sismember("s", "b")
+			let which = try r.smismember("s", "a", "x")
+			assert which[0] && !which[1]
+			assert (try r.srem("s", "c", "x")) == 1
+			try r.sadd("t", "b", "c")
+			assert (try r.sinter("s", "t")).join(",") == "b"
+			assert (try r.sunion("s", "t")).len() == 3
+			assert (try r.sdiff("s", "t")).join(",") == "a"
+			assert (try r.sunionStore("u", "s", "t")) == 3
+			assert (try r.sinterStore("i", "s", "t")) == 1
+			assert (try r.sdiffStore("d", "s", "t")) == 1
+			assert try r.smove("s", "t", "a")
+			assert (try r.smembers("t")).len() == 3
+			assert (try r.srandMember("t", 2)).len() == 2
+			assert !((try r.spop("t")) is none)
+			assert (try r.spop("t", 5)).len() == 2
+			assert (try r.sscan("u").all()).len() == 3
+			try r.close()
+		}
+
+		@test()
+		def TestSortedSets() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert try r.zadd("z", "a", 1.0)
+			assert !(try r.zadd("z", "a", 1.5))
+			assert (try r.zadd("z", {"b": 2.0, "c": 3.0, "d": 4.0})) == 3
+			assert (try r.zadd("z", {"a": 1.0, "e": 5.0}, mode = SetMode.IfExists, changed = true)) == 1
+			assert (try r.zcard("z")) == 4
+			let score = try r.zscore("z", "b")
+			fail "score is none" when score is none
+			assert score == 2.0
+			assert (try r.zscore("z", "nope")) is none
+			assert (try r.zincr("z", "b", 0.5)) == 2.5
+			assert number(try r.zrank("z", "c")) == 2
+			assert number(try r.zrank("z", "c", reverse = true)) == 1
+			assert (try r.zrank("z", "nope")) is none
+			assert (try r.zcount("z", 2.0, 3.0)) == 2
+			assert (try r.zrange("z")).join(",") == "a,b,c,d"
+			assert (try r.zrange("z", 0, 1, reverse = true)).join(",") == "d,c"
+			let scored = try r.zrangeScored("z", 0, 1)
+			assert scored.len() == 2 && scored[1].member == "b" && scored[1].score == 2.5
+			let byScore = try r.zrangeByScore("z", 2.0, 4.0, reverse = true, limit = 2)
+			assert byScore.len() == 2 && byScore[0].member == "d" && byScore[1].score == 3.0
+			try r.zadd("lex", {"apple": 0.0, "banana": 0.0, "cherry": 0.0})
+			assert (try r.zrangeByLex("lex", "[b", "+")).join(",") == "banana,cherry"
+			let low = try r.zpopMin("z")
+			assert low.len() == 1 && low[0].member == "a"
+			let high = try r.zpopMax("z", 2)
+			assert high.len() == 2 && high[0].member == "d"
+			let taken = try r.bzpopMin(["none", "z"], 1s)
+			fail "taken is none" when taken is none
+			assert taken.key == "z" && taken.value == "b" && taken.score == 2.5
+			assert (try r.bzpopMax(["none"], 100ms)) is none
+			try r.zadd("p", {"x": 1.0, "y": 2.0})
+			try r.zadd("q", {"y": 3.0, "w": 4.0})
+			let both = try r.zinter("p", "q")
+			assert both.len() == 1 && both[0].member == "y" && both[0].score == 5.0
+			assert (try r.zunion("p", "q")).len() == 3
+			assert (try r.zunionStore("u", "p", "q")) == 3
+			assert (try r.zinterStore("i", "p", "q")) == 1
+			assert (try r.zremRangeByScore("u", 0.0, 1.0)) == 1
+			assert (try r.zremRangeByRank("u", 0, 0)) == 1
+			assert (try r.zrem("u", "y", "nope")) == 1
+			assert (try r.zscan("p").all()).len() == 4
+
+			assert try r.geoAdd("geo", "Cluj", 23.5899, 46.7712)
+			assert try r.geoAdd("geo", "Bucharest", 26.1025, 44.4268)
+			let far = try r.geoDist("geo", "Cluj", "Bucharest", "km")
+			fail "far is none" when far is none
+			assert far > 300.0 && far < 340.0
+			assert (try r.geoDist("geo", "Cluj", "Nowhere")) is none
+			let at = try r.geoPos("geo", "Cluj")
+			fail "at is none" when at is none
+			assert (at.longitude - 23.5899).abs() < 0.001 && (at.latitude - 46.7712).abs() < 0.001
+			assert (try r.geoPos("geo", "Nowhere")) is none
+			let near = try r.geoSearch("geo", 23.6, 46.8, 50.0, "km")
+			assert near.len() == 1 && near[0].member == "Cluj" && near[0].distance < 5.0
+			try r.close()
+		}
+
+		@test()
+		def TestStreams() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			let first = try r.xadd("s", {"temp": 21, "room": "kitchen"})
+			let second = try r.xadd("s", {"temp": 22}, id = "9999999999999-1")
+			assert second == "9999999999999-1"
+			assert (try r.xlen("s")) == 2
+			let all = try r.xrange("s")
+			assert all.len() == 2 && all[0].id == first && all[0].fields["room"] == "kitchen"
+			let newest = try r.xrange("s", count = 1, reverse = true)
+			assert newest.len() == 1 && newest[0].fields["temp"] == "22"
+			let read = try r.xread({"s": "0"})
+			assert read["s"].len() == 2
+			assert (try r.xread({"s": "$"}, wait = 100ms)).len() == 0
+
+			try r.xgroupCreate("s", "workers", id = "0")
+			let mine = try r.xreadGroup("workers", "w1", {"s": ">"}, count = 1)
+			assert mine["s"].len() == 1 && mine["s"][0].id == first
+			let pending = try r.xpending("s", "workers")
+			assert pending.len() == 1 && pending[0].consumer == "w1" && pending[0].deliveries == 1
+			let claimed = try r.xclaim("s", "workers", "w2", 0s, first)
+			assert claimed.len() == 1 && claimed[0].id == first
+			let auto = try r.xautoClaim("s", "workers", "w3", 0s)
+			assert auto.entries.len() == 1 && auto.next == "0-0"
+			assert (try r.xack("s", "workers", first)) == 1
+			assert (try r.xpending("s", "workers")).len() == 0
+			assert (try r.xgroupDelConsumer("s", "workers", "w1")) == 0
+			assert try r.xgroupDestroy("s", "workers")
+			assert (try r.xdel("s", first)) == 1
+			for let i = 0; i < 20; i++ {
+				try r.xadd("capped", {"i": i}, maxLen = 5, exact = true)
+			}
+			assert (try r.xlen("capped")) == 5
+			assert (try r.xtrim("capped", 2, exact = true)) == 3
+
+			let waiting = async r.xread({"later": "$"}, wait = 5s)
+			time.sleep(100ms)
+			try r.xadd("later", {"a": "b"})
+			let arrived = try await waiting
+			assert arrived["later"].len() == 1
+			try r.close()
+		}
+
+		@test()
+		def TestScriptsAndServer() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			assert (try r.eval("return ARGV[1] .. KEYS[1]", ["k"], "v")).text() == "vk"
+			assert (try r.eval("return \{1, 'two', \{3\}\}")).len() == 3
+			let take = new Script("return redis.call('INCRBY', KEYS[1], ARGV[1])")
+			assert take.sha.len() == 40
+			try r.scriptFlush()
+			assert !(try r.scriptExists(take.sha))[0]
+			assert (try r.run(take, ["counter"], 5)).toInt() == 5
+			assert (try r.scriptExists(take.sha))[0]
+			assert (try r.run(take, ["counter"], 5)).toInt() == 10
+			assert (try r.scriptLoad(take.source)) == take.sha
+			assert (try r.evalSha(take.sha, ["counter"], 1)).toInt() == 11
+			let kind = ErrorKind.Server
+			r.evalSha("0000000000000000000000000000000000000000") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Value()
+			}
+			assert kind == ErrorKind.NoScript
+
+			let functions = "#!lua name=admtest\nredis.register_function('adm_double', function(keys, args) return args[1] * 2 end)"
+			assert (try r.functionLoad(functions, replace = true)) == "admtest"
+			assert (try r.fcall("adm_double", [], 21)).toInt() == 42
+			try r.command("FUNCTION", "DELETE", "admtest")
+
+			assert (try r.ping()) < 5s
+			assert (try r.dbSize()) == 1
+			assert (try r.info("server")).hasKey("redis_version")
+			assert (try r.info()).hasKey("used_memory")
+			let clock = try r.serverTime()
+			let drift = clock - time.now()
+			assert drift < 1min && drift > -1min
+			assert (try r.configGet("maxmemory-policy")).hasKey("maxmemory-policy")
+			try r.configSet("slowlog-max-len", 128)
+			assert (try r.waitReplicas(0, 100ms)) == 0
+			try r.flushDb()
+			assert (try r.dbSize()) == 0
+			try r.close()
+		}
+	}
+
+	check "Batches" {
+		@test()
+		def TestPipeline() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			let p = r.pipeline()
+			assert (try p.run()).len() == 0
+			for let i = 0; i < 1000; i++ {
+				try p.add("RPUSH", "numbers", i)
+			}
+			try p.add("LLEN", "numbers")
+			try p.add("GET", "numbers")
+			try p.add("LINDEX", "numbers", 999)
+			assert p.len() == 1003
+			let replies = try p.run()
+			assert replies.len() == 1003
+			assert replies[999].toInt() == 1000 && replies[1000].toInt() == 1000
+			assert replies[1001].isError() && replies[1001].text().startsWith("WRONGTYPE")
+			assert replies[1002].text() == "999"
+			assert p.len() == 0
+			try p.add("PING")
+			p.clear()
+			assert (try p.run()).len() == 0
+			try r.close()
+		}
+
+		@test()
+		def TestTransaction() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			try r.set("stock", 10)
+			let tx = try r.multi("stock")
+			let stock = (try tx.command("GET", "stock")).toInt()
+			try tx.queue("SET", "stock", stock - 1)
+			try tx.queue("RPUSH", "orders", "first")
+			try tx.queue("INCR", "orders")
+			assert tx.len() == 3
+			let replies = try tx.exec()
+			assert replies.len() == 3 && replies[0].text() == "OK" && replies[1].toInt() == 1
+			assert replies[2].isError()
+			assert text(try r.get("stock")) == "9"
+
+			let ended = ErrorKind.Server
+			tx.queue("PING") onerror (err error) {
+				ended = kindOfFailure(err)
+				recover none
+			}
+			assert ended == ErrorKind.Closed
+			try tx.discard()
+
+			// Another client changes the watched key: nothing runs.
+			let raced = try r.multi("stock")
+			try r.set("stock", 100)
+			try raced.queue("SET", "stock", 0)
+			let outcome = ErrorKind.Server
+			raced.exec() onerror (err error) {
+				outcome = kindOfFailure(err)
+				recover Value[]
+			}
+			assert outcome == ErrorKind.Aborted
+			assert text(try r.get("stock")) == "100"
+
+			// A command the server refuses when queued aborts the unit.
+			let refused = try r.multi()
+			try refused.queue("SET", "stock", 1)
+			try refused.queue("NOSUCHCOMMAND")
+			let message = ""
+			outcome = ErrorKind.Server
+			refused.exec() onerror (err error) {
+				outcome = kindOfFailure(err)
+				message = err.message
+				recover Value[]
+			}
+			assert outcome == ErrorKind.Aborted
+			assert message.contains("NOSUCHCOMMAND") || message.contains("unknown command")
+			assert text(try r.get("stock")) == "100"
+
+			// Discarded transactions give their connection back.
+			for let i = 0; i < 20; i++ {
+				let dropped = try r.multi("stock")
+				try dropped.queue("SET", "stock", 0)
+				try dropped.discard()
+			}
+			assert text(try r.get("stock")) == "100"
+			try r.close()
+		}
+
+		@test()
+		def TestPubSub() !none {
+			return none when testServer == ""
+			for let options in ["", "?protocol=2"] {
+				let r = try fresh(options)
+				let sub = try r.subscribe("news", "alerts")
+				try sub.psubscribe("user:*")
+				assert sub.channels().join(",") == "news,alerts"
+				assert sub.patterns().join(",") == "user:*"
+				assert (try sub.receive(50ms)) is none
+
+				assert (try r.publish("news", "hello")) == 1
+				assert (try r.publish("user:7", [byte(0), byte(200)])) == 1
+				assert (try r.publish("nobody", "x")) == 0
+				let first = try sub.receive(2s)
+				fail "first is none" when first is none
+				assert first.channel == "news" && first.pattern == "" && first.text() == "hello"
+				let second = try sub.receive(2s)
+				fail "second is none" when second is none
+				assert second.channel == "user:7" && second.pattern == "user:*" && second.payload.len() == 2
+
+				// Messages that arrive while a subscription changes are kept.
+				try r.publish("alerts", "kept")
+				time.sleep(50ms)
+				try sub.unsubscribe("news")
+				assert sub.channels().join(",") == "alerts"
+				let kept = try sub.receive(2s)
+				fail "kept is none" when kept is none
+				assert kept.text() == "kept"
+				try sub.unsubscribe()
+				try sub.punsubscribe()
+				assert sub.channels().len() == 0 && sub.patterns().len() == 0
+				try sub.unsubscribe()
+
+				try sub.ssubscribe("shard")
+				assert (try r.spublish("shard", "s")) == 1
+				let shard = try sub.receive(2s)
+				fail "shard is none" when shard is none
+				assert shard.channel == "shard" && shard.text() == "s"
+
+				try sub.close()
+				let after = ErrorKind.Server
+				sub.receive(1s) onerror (err error) {
+					after = kindOfFailure(err)
+					recover none
+				}
+				assert after == ErrorKind.Closed
+				try r.close()
+			}
+		}
+	}
+}
