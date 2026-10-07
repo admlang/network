@@ -11,4 +11,4 @@ repo_salt = "base64:++oAD/FLJkfqhM2pR0CxkyQffUg3t65wATNn6MMNcKQ="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.network.redis"]
-description = "Redis and Valkey client: RESP2 and RESP3, typed commands, pipelines, transactions, pub/sub, Cluster and Sentinel"
+description = "Redis and Valkey client"

@@ -11,4 +11,4 @@ repo_salt = "base64:+qiru+fTrB/2QpEsOaJUtd95mVswNUWKRP4T9pE/cxk="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.network.s3"]
-description = "Client for Amazon S3 and compatible stores (MinIO, Ceph, R2): objects, buckets, multipart uploads, presigned URLs"
+description = "Amazon S3 and compatible stores (MinIO, Ceph, R2) client"

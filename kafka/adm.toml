@@ -11,4 +11,4 @@ repo_salt = "base64:4wc85zlHmsMEXMtwdG8Fzy08dg6AGi0HKBtD/YXq1kw="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.network.kafka"]
-description = "Apache Kafka client: producer with batching and compression, consumer groups, transactions, topic administration"
+description = "Apache Kafka client"

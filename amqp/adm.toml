@@ -11,4 +11,4 @@ repo_salt = "base64:dZ9qFGzD7wYqxN62XqQHLrkihV4zUEZ9JWpwcdvPYrs="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.network.amqp"]
-description = "AMQP 0-9-1 client for RabbitMQ: exchanges, queues, publishing with confirms, consumers, transactions"
+description = "AMQP 0-9-1 client for RabbitMQ"
