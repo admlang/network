@@ -1,5 +1,5 @@
 // An S3 client as an ADM library: Signature Version 4 over std.net.http.
-@manifest(version = "0.1.0")
+@manifest(version = "0.1.1")
 library adm.network.s3 {
 	use (
 		adm.network.s3
