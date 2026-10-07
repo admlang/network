@@ -32,6 +32,15 @@ internal partial module adm.network.redis.resp {
 		// The pools of every server that holds keys.
 		def pools() !Pool[]
 
+		// shards splits keys into the groups one command can name
+		// together, in the order the keys came: all of them for one
+		// server, one group per hash slot for a cluster.
+		def shards(keys string[]) string[][]
+
+		// A number that changes whenever the servers `pools` names do: a
+		// master was replaced, a cluster got or lost one.
+		def epoch() int
+
 		def isOpen() bool
 
 		def isClosed() bool

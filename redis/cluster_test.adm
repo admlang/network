@@ -167,10 +167,24 @@ partial module adm.network.redis {
 			let both = try r.mget("\{u7\}:name", "\{u7\}:city")
 			assert both["\{u7\}:name"] == "Ana" && both["\{u7\}:city"] == "Cluj"
 			assert (try r.del("\{u7\}:name", "\{u7\}:city")) == 2
+			// Keys of many slots: one command per slot, sent together.
+			let many map<string, any> = {}
+			let names string[] = []
+			for let i = 0; i < 40; i++ {
+				many["spread:{i}"] = "v{i}"
+				names.push("spread:{i}")
+			}
+			try r.mset(many)
+			let back = try r.mget(...names, "spread:none")
+			assert back.len() == 40 && back["spread:17"] == "v17" && back["spread:39"] == "v39"
+			assert (try r.exists(...names)) == 40 && (try r.touch(...names)) == 40
+			assert (try r.unlink(...names[0:10])) == 10
+			assert (try r.del(...names)) == 30 && (try r.exists(...names)) == 0
 			let kind = ErrorKind.Server
-			r.del("key:1", "key:2", "key:3") onerror (err error) {
+			// What must happen in one step cannot be split.
+			r.msetNx({"fresh:1": "a", "fresh:2": "b", "fresh:3": "c"}) onerror (err error) {
 				kind = kindOfFailure(err)
-				recover 0
+				recover false
 			}
 			assert kind == ErrorKind.Cluster
 			// Scripts and commands that count their keys.
@@ -365,6 +379,108 @@ partial module adm.network.redis {
 		}
 	}
 
+	check "Tracking across servers" {
+		@test()
+		def TestClusterTracking() !none {
+			return none when testCluster == ""
+			let r = try cluster()
+			let other = try connectCluster(testCluster)
+			let names string[] = []
+			for let i = 0; i < 12; i++ {
+				names.push("track:{i}")
+				try r.set("track:{i}", "v")
+			}
+			// What this client read, on whichever node it lives.
+			let changes = try r.track()
+			for let name in names {
+				try r.get(name)
+			}
+			for let name in names {
+				try other.set(name, "changed")
+			}
+			let seen string[] = []
+			for let i = 0; i < 40 && seen.len() < 12; i++ {
+				let keys = try changes.receive(2s)
+				break when keys is none
+				seen.push(...keys)
+			}
+			assert seen.sort((a, b) => a < b).join(",") == names.sort((a, b) => a < b).join(",")
+			try changes.close()
+
+			// Every change under a prefix, from every master.
+			let wide = try r.track("wide:")
+			for let i = 0; i < 12; i++ {
+				try other.set("wide:{i}", "x")
+				try other.set("narrow:{i}", "x")
+			}
+			let got string[] = []
+			for let i = 0; i < 40 && got.len() < 12; i++ {
+				let keys = try wide.receive(2s)
+				break when keys is none
+				got.push(...keys)
+			}
+			assert got.len() == 12
+			for let key in got {
+				assert key.startsWith("wide:")
+			}
+			try wide.close()
+			try other.close()
+			try r.close()
+		}
+
+		@test()
+		def TestSentinelTracking() !none {
+			return none when testSentinel == ""
+			let parts = testSentinel.split("@")
+			let sentinels = parts[1].split(",")
+			let r = try connectSentinel(parts[0], ...sentinels)
+			let other = try connectSentinel(parts[0], ...sentinels)
+			let changes = try r.track()
+			try r.set("st:key", "one")
+			try r.get("st:key")
+			try other.set("st:key", "two")
+			let keys = try changes.receive(5s)
+			fail "no invalidation from the master" when keys is none
+			assert keys.len() == 1 && keys[0] == "st:key"
+
+			// A new master: everything may have changed, and the tracker
+			// goes on with it.
+			let guard = try connect("redis://{sentinels[0]}")
+			try guard.command("SENTINEL", "FAILOVER", parts[0])
+			try guard.close()
+			let all ?string[] = none
+			for let i = 0; i < 60; i++ {
+				let part = try changes.receive(500ms)
+				continue when part is none
+				if part.len() == 0 {
+					all = part
+					break
+				}
+			}
+			fail "the tracker did not notice the new master" when all is none
+			// The group may settle on its master in more than one step; each
+			// one empties the copies again, and what is read after it is
+			// tracked.
+			let after ?string[] = none
+			for let round = 0; round < 30 && after is none; round++ {
+				try r.get("st:key")
+				try other.set("st:key", "round {round}")
+				for let i = 0; i < 4 && after is none; i++ {
+					let part = try changes.receive(500ms)
+					break when !(part is none) && part.len() == 0
+					after = part unless part is none
+				}
+			}
+			fail "no invalidation from the new master" when after is none
+			assert after[0] == "st:key"
+			try changes.close()
+			try other.close()
+			try r.close()
+			time.sleep(2s)
+			return none
+		}
+	}
+
 	check "Sentinel" {
 		@test()
 		def TestSentinel() !none {
@@ -378,6 +494,19 @@ partial module adm.network.redis {
 			}
 			assert kind == ErrorKind.Connection
 			let r = try connectSentinel(parts[0], "127.0.0.1:1", ...sentinels)
+			// The client hears of a new master from the sentinels, before
+			// the old one stops answering: reads alone move it.
+			let first = try r.info("server")
+			let early = try connect("redis://{sentinels[0]}")
+			try early.command("SENTINEL", "FAILOVER", parts[0])
+			try early.close()
+			let heard = false
+			for let i = 0; i < 300 && !heard; i++ {
+				time.sleep(50ms)
+				heard = (try r.info("server"))["tcp_port"] != first["tcp_port"]
+			}
+			assert heard
+			time.sleep(3s)
 			try r.set("s:key", "one")
 			assert text(try r.get("s:key")) == "one"
 			assert (try r.command("ROLE")).items[0].text() == "master"

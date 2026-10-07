@@ -2,6 +2,7 @@
 // reading replies and error replies.
 internal partial module adm.network.s3.wire {
 	use (
+		std.crypto
 		std.crypto.hash
 		std.data.encoding
 		std.data.encoding::(XMLNode)
@@ -9,8 +10,10 @@ internal partial module adm.network.s3.wire {
 		std.net
 		std.net.http
 		std.net.url
+		std.sync
 		std.time
 		adm.network.s3::*
+		adm.network.s3.sigv4
 		adm.network.s3.sigv4::*
 	)
 
@@ -27,6 +30,8 @@ internal partial module adm.network.s3.wire {
 		// A body to stream instead, `size` bytes long.
 		stream  ?io.Reader = none
 		size    int
+		// A checksum of the body to send with it.
+		sum     Checksum   = Checksum.None
 
 		def new(method string, bucket string = "", key string = "") {
 			self.method = method
@@ -66,26 +71,72 @@ internal partial module adm.network.s3.wire {
 
 	// Engine sends calls to one endpoint. Any number of tasks share it.
 	type Engine {
-		scheme         string              = "https"
+		scheme         string                  = "https"
 		// The endpoint's `host[:port]`.
 		host           string
 		// True for AWS's own endpoint, whose host names the region.
 		aws            bool
-		region         string              = "us-east-1"
-		addressing     Addressing          = Addressing.Auto
+		region         string                  = "us-east-1"
+		addressing     Addressing              = Addressing.Auto
 		accessKey      string
 		secretKey      string
 		token          string
 		web            http.Client
-		partSize       int                 = 16 * 1024 * 1024
-		uploadTasks    int                 = 4
+		partSize       int                     = 16 * 1024 * 1024
+		uploadTasks    int                     = 4
 		// The region of each bucket found to live outside `region`.
 		atomic regions map<string, string>
+		// For temporary credentials: when they end, how to get the next
+		// ones, and the lock one task renews them under.
+		atomic expires ?time.Time              = none
+		renew          ?def () !Keys           = none
+		renewing       sync.Mutex
+		// Signature Version 4A: the regions requests are signed for ("":
+		// Signature Version 4 for one region) and the key in use.
+		regionSet      string                  = ""
+		atomic keyA    ?crypto.ECDSAPrivateKey = none
+		atomic keyAFor string                  = ""
 
 		def new() {
 			web = new http.Client()
 			web.decompress = false
 			web.redirects = new NoRedirects()
+			renewing = new sync.Mutex()
+		}
+
+		// adopt makes a set of credentials the ones requests are signed
+		// with.
+		atomic def adopt(keys Keys) {
+			accessKey = keys.accessKey
+			secretKey = keys.secretKey
+			token = keys.token
+			expires = keys.expires
+		}
+
+		// current is the credentials in use.
+		atomic def current() Keys {
+			return Keys{accessKey: accessKey, secretKey: secretKey, token: token, expires: expires}
+		}
+
+		// fresh replaces temporary credentials that end within five
+		// minutes.
+		// Fails with an S3Error as the renewal does, once the old ones have
+		// ended; before that they are used on.
+		def fresh() !none {
+			let until = expires
+			let again = renew
+			return none when until is none || again is none
+			return none when until - time.now() > 5min
+			renewing.lock()
+			defer renewing.unlock()
+			let now = expires
+			return none when !(now is none) && now - time.now() > 5min
+			let next = again() onerror (err error) {
+				fail err when now is none || now - time.now() <= 0s
+				recover current()
+			}
+			adopt(next)
+			return none
 		}
 
 		atomic def regionOf(bucket string) string {
@@ -129,35 +180,65 @@ internal partial module adm.network.s3.wire {
 		}
 
 		def signer(bucket string) Signer {
-			return Signer{accessKey: accessKey, secretKey: secretKey, token: token, region: regionOf(bucket)}
+			let keys = current()
+			let made = Signer{accessKey: keys.accessKey, secretKey: keys.secretKey, token: keys.token, region: regionOf(bucket)}
+			if regionSet != "" {
+				made.regionSet = regionSet
+				made.keyA = wideKey(keys)
+			}
+			return made
+		}
+
+		// The Signature Version 4A key of the credentials in use, made
+		// once for each access key.
+		atomic def wideKey(keys Keys) crypto.ECDSAPrivateKey {
+			let have = keyA
+			return have when !(have is none) && keyAFor == keys.accessKey
+			let made = sigv4.keyA(keys.accessKey, keys.secretKey)
+			keyA = made
+			keyAFor = keys.accessKey
+			return made
 		}
 
 		// Builds the signed request of a call.
 		def request(call Call) !http.Request {
+			try fresh()
+			let token = current().token
 			let endpoint = authority(call.bucket)
 			let sent = path(call.bucket, call.key)
 			let amzDate = amzDateOf(time.now())
 			let source = call.stream
 			let digest = emptyHash
 			let headers Field[] = [Field{name:"Host", value:endpoint}, Field{name:"x-amz-date", value:amzDate}]
+			let wide = regionSet != ""
+			headers.push(Field{name: "x-amz-region-set", value: regionSet}) when wide
+			// A stream under Signature Version 4A goes as it is, unsigned:
+			// its chunks would each need a signature of their own kind.
+			let plain = wide && !(source is none)
+			fail errorOf(ErrorKind.Argument, "s3: {call.subject()}: a stream signed with Signature Version 4A needs https") when plain && scheme != "https"
+			fail errorOf(ErrorKind.Argument, "s3: {call.subject()}: a stream signed with Signature Version 4A cannot carry a checksum; send the content from memory") when plain && call.sum != Checksum.None
 			headers.push(Field{name: "x-amz-security-token", value: token}) when token != ""
 			if source is none {
 				digest = sha256Hex(call.body) when call.body.len() > 0
+				headers.push(Field{name: checksumHeader(call.sum), value: checksumOf(call.sum, call.body)}) unless call.sum == Checksum.None
+			} else if plain {
+				digest = unsignedPayload
 			} else {
-				digest = streamingPayload
+				digest = call.sum == Checksum.None ?? (streamingPayload, streamingTrailerPayload)
 				headers.push(Field{name: "x-amz-decoded-content-length", value: call.size.str()})
+				headers.push(Field{name: "x-amz-trailer", value: checksumHeader(call.sum)}) unless call.sum == Checksum.None
 			}
 			headers.push(Field{name: "x-amz-content-sha256", value: digest})
 			for let h in call.headers {
-				if h.name.lower() == "content-encoding" && !(source is none) {
+				if h.name.lower() == "content-encoding" && !(source is none) && !plain {
 					headers.push(Field{name: "Content-Encoding", value: "aws-chunked,{h.value}"})
 					continue
 				}
 				headers.push(h)
 			}
-			headers.push(Field{name: "Content-Encoding", value: "aws-chunked"}) unless source is none || hasHeader(call.headers, "content-encoding")
+			headers.push(Field{name: "Content-Encoding", value: "aws-chunked"}) unless source is none || plain || hasHeader(call.headers, "content-encoding")
 			let query = canonicalQuery(call.query)
-			let stamp = sign(signer(call.bucket), call.method, sent, query, headers, digest, amzDate)
+			let stamp = try sign(signer(call.bucket), call.method, sent, query, headers, digest, amzDate)
 
 			let target = new url.URL()
 			target.scheme = scheme
@@ -174,9 +255,12 @@ internal partial module adm.network.s3.wire {
 			req.headers.set("Authorization", stamp.authorization)
 			if source is none {
 				req.replaceBody(call.body) when call.body.len() > 0 || (call.method := "PUT" || "POST")
+			} else if plain {
+				req.body = source
+				req.contentLength = call.size
 			} else {
-				req.body = new SignedChunks(source, call.size, stamp)
-				req.contentLength = chunkedLength(call.size)
+				req.body = new SignedChunks(source, call.size, stamp, chunkSize, call.sum)
+				req.contentLength = chunkedLength(call.size, chunkSize, call.sum)
 			}
 			return req
 		}
@@ -453,6 +537,17 @@ internal partial module adm.network.s3.wire {
 		applyCustomerKey(call, options.customerKey, "x-amz-server-side-encryption-customer-")
 		call.header("If-Match", quotedTag(options.ifMatch))
 		call.header("If-None-Match", quotedTag(options.ifNoneMatch))
+		call.sum = options.checksum
+	}
+
+	// For a write that sends no content of its own (starting an upload in
+	// parts, a copy): names the checksum S3 is to keep instead of sending
+	// one.
+	def nameChecksum(call Call) Checksum {
+		let sum = call.sum
+		call.sum = Checksum.None
+		call.header("x-amz-checksum-algorithm", checksumName(sum)) unless sum == Checksum.None
+		return sum
 	}
 
 	// Sets the query and the headers of an object being read.
@@ -474,6 +569,7 @@ internal partial module adm.network.s3.wire {
 		let until = options.ifUnmodifiedSince
 		call.header("If-Unmodified-Since", time.formatHTTPDate(until)) unless until is none
 		applyCustomerKey(call, options.customerKey, "x-amz-server-side-encryption-customer-")
+		call.header("x-amz-checksum-mode", "ENABLED") when options.checksum
 	}
 
 	// The three headers that hand S3 a key of the caller's own.
@@ -531,6 +627,9 @@ internal partial module adm.network.s3.wire {
 		for let name in res.headers.keys() {
 			let lower = name.lower()
 			info.metadata.set(lower.slice(11), res.headers.get(name)) when lower.startsWith("x-amz-meta-")
+			if lower.startsWith("x-amz-checksum-") && checksumNamed(lower.slice(15)) != Checksum.None {
+				info.checksums.set(lower.slice(15), res.headers.get(name))
+			}
 		}
 		return info
 	}
@@ -577,14 +676,17 @@ internal partial module adm.network.s3.wire {
 	}
 
 	// Uploads one part of a multipart upload.
-	def sendPart(engine Engine, bucket string, key string, id string, number int, data byte[]) !Part {
+	def sendPart(engine Engine, bucket string, key string, id string, number int, data byte[], sum Checksum = Checksum.None) !Part {
 		fail errorOf(ErrorKind.Argument, "s3: part number {number} is not 1 to {maxParts}") when number < 1 || number > maxParts
 		let call = new Call("PUT", bucket, key)
 		call.param("partNumber", number.str())
 		call.param("uploadId", id)
 		call.body = data
+		call.sum = sum
 		let res = try engine.done(call)
-		return Part{number: number, etag: bareTag(res.headers.get("ETag")), size: data.len()}
+		let part = Part{number: number, etag: bareTag(res.headers.get("ETag")), size: data.len()}
+		part.checksum = res.headers.get(checksumHeader(sum)) unless sum == Checksum.None
+		return part
 	}
 
 	// How a part sent on a task of its own ended.
@@ -593,9 +695,9 @@ internal partial module adm.network.s3.wire {
 		failure ?error
 	}
 
-	async def sendPartTask(engine Engine, bucket string, key string, id string, number int, data byte[]) async PartOutcome {
+	async def sendPartTask(engine Engine, bucket string, key string, id string, number int, data byte[], sum Checksum) async PartOutcome {
 		let failure ?error = none
-		let part = sendPart(engine, bucket, key, id, number, data) onerror (err error) {
+		let part = sendPart(engine, bucket, key, id, number, data, sum) onerror (err error) {
 			failure = err
 			recover Part{}
 		}
@@ -618,7 +720,7 @@ internal partial module adm.network.s3.wire {
 
 	// Sends a stream as the parts of a multipart upload, `uploadTasks` at
 	// a time; `first` is its first part, already read.
-	def sendPieces(engine Engine, bucket string, key string, id string, first byte[], body io.Reader) !Part[] {
+	def sendPieces(engine Engine, bucket string, key string, id string, first byte[], body io.Reader, sum Checksum = Checksum.None) !Part[] {
 		let parts Part[] = []
 		let flying array<async PartOutcome> = []
 		let failure ?error = none
@@ -636,7 +738,7 @@ internal partial module adm.network.s3.wire {
 				break unless failure is none
 				parts.push(outcome.part)
 			}
-			flying.push(sendPartTask(engine, bucket, key, id, number, piece))
+			flying.push(sendPartTask(engine, bucket, key, id, number, piece, sum))
 			number++
 			break when piece.len() < engine.partSize
 			let none_ byte[] = []

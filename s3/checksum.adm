@@ -1,0 +1,98 @@
+// The additional checksums of S3: CRC-32, CRC-32C, SHA-1 and SHA-256 of
+// the content, in base64.
+internal partial module adm.network.s3.sigv4 {
+	use (
+		std.crypto.hash
+		adm.network.s3::*
+	)
+
+	// Digest computes a checksum over content that comes in pieces.
+	type Digest {
+		kind   Checksum
+		hasher ?hash.Hasher = none
+		crc    uint32       = 0
+
+		def new(kind Checksum) {
+			self.kind = kind
+			match kind {
+				case Checksum.Crc32:
+					hasher = new hash.CRC32()
+				case Checksum.Sha1:
+					hasher = new hash.SHA1()
+				case Checksum.Sha256:
+					hasher = new hash.SHA256()
+				default:
+			}
+		}
+
+		def write(data byte[]) {
+			if kind == Checksum.Crc32c {
+				crc = hash.crc32c(data, crc)
+				return
+			}
+			let h = hasher
+			h.write(data) unless h is none
+		}
+
+		// The checksum in base64, as S3 takes it.
+		def value() string {
+			if kind == Checksum.Crc32c {
+				return byte[byte((crc >> 24) & 0xFF), byte((crc >> 16) & 0xFF), byte((crc >> 8) & 0xFF), byte(crc & 0xFF)].base64()
+			}
+			let h = hasher
+			return "" when h is none
+			return h.hash().base64()
+		}
+	}
+
+	// The checksum of content held in memory, in base64.
+	def checksumOf(kind Checksum, data byte[]) string {
+		let digest = new Digest(kind)
+		digest.write(data)
+		return digest.value()
+	}
+
+	// The header a checksum travels in.
+	def checksumHeader(kind Checksum) string {
+		return "x-amz-checksum-{kind.value}"
+	}
+
+	// The name S3 gives the algorithm, and the element a checksum has in
+	// its XML.
+	def checksumName(kind Checksum) string {
+		return kind.value.upper()
+	}
+
+	def checksumElement(kind Checksum) string {
+		return "Checksum{kind.value.upper()}"
+	}
+
+	def checksumNamed(name string) Checksum {
+		match name {
+			case "crc32":
+				return Checksum.Crc32
+			case "crc32c":
+				return Checksum.Crc32c
+			case "sha1":
+				return Checksum.Sha1
+			case "sha256":
+				return Checksum.Sha256
+			default:
+				return Checksum.None
+		}
+	}
+
+	// How long a checksum is in base64.
+	def checksumLength(kind Checksum) int {
+		match kind {
+			case Checksum.Crc32, Checksum.Crc32c:
+				return 8
+			case Checksum.Sha1:
+				return 28
+			case Checksum.Sha256:
+				return 44
+			default:
+				return 0
+		}
+	}
+}

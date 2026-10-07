@@ -67,9 +67,11 @@ reads the slot map and where each of the server's commands has its keys (`COMMAN
   was sent yet. A command that was already on its way when the connection broke fails, since it
   may have run;
 - needs the keys of one command in one slot. Keys with a common `{tag}` are: `{user:7}:name` and
-  `{user:7}:mail` hash by `user:7`. Other keys fail with `ErrorKind.Cluster` (`CROSSSLOT`);
-- sends the commands of a pipeline to their nodes, one batch per node, and puts the replies back
-  in order. A command the client could not place has an error reply in its place;
+  `{user:7}:mail` hash by `user:7`. Other keys fail with `ErrorKind.Cluster` (`CROSSSLOT`),
+  except in `del`, `unlink`, `exists`, `touch`, `mget` and `mset`: those send one command per
+  slot, all at once, so they are not one step;
+- sends the commands of a pipeline to their nodes, one batch per node and all batches at the
+  same time, and puts the replies back in order. A command the client could not place has an error reply in its place;
 - runs a transaction on the node of its first key (`multi("{acct}:a")`, or the first command
   queued); all its keys must be in that slot;
 - sends `keys`, `scan`, `dbSize`, `flushDb`, `flushAll`, `randomKey`, `scriptLoad`,
@@ -97,8 +99,8 @@ reached, has become a replica (`READONLY`), or dropped the connection as it was 
 client asks the sentinels again and goes on with the master they promoted, waiting up to
 `connectTimeout` for it. It learns of the other sentinels from the one that answered.
 
-Until the sentinels demote an old master it still answers, and the client stays with it: that
-takes as long as the group's failover does.
+The client also listens to a sentinel for `+switch-master` and moves to a new master as soon as
+the sentinels announce it, before the old one is demoted.
 
 ## Commands
 
@@ -106,7 +108,7 @@ Every command family has methods named after the Redis commands: keys (`del`, `e
 `expire`, `ttl`, `rename`, `scan`, ...), strings (`get`, `set`, `incr`, `mget`, `mset`,
 `append`, bits, HyperLogLog), hashes (`hset`, `hget`, `hgetAll`, `hincr`, field expiry),
 lists (`lpush`, `rpop`, `lrange`, `blpop`, `lmove`), sets (`sadd`, `sinter`, `sunionStore`),
-sorted sets (`zadd`, `zrange`, `zrangeByScore`, `zpopMin`, `bzpopMin`) and geo, streams
+sorted sets (`zadd`, `zrange`, `zrangeByScore` and `zcount` with `Bounds` for ends left out, `zpopMin`, `bzpopMin`) and geo, streams
 (`xadd`, `xrange`, `xread`, consumer groups), scripts (`eval`, `run`, `fcall`), and the server
 (`ping`, `info`, `dbSize`, `configGet`).
 
@@ -205,14 +207,32 @@ r.get("list") onerror (err error) {
 }
 ```
 
+## Keeping copies of values
+
+`r.track()` opens a `Tracker`: the server remembers the keys this client reads and says so when
+one of them changes, once per read. With prefixes (`r.track("user:", "cart:")`) it reports every
+change of a key that starts with one of them. Use it to keep values in memory and drop the ones
+that went stale.
+
+```adm
+let changes = try r.track()
+let name = try r.get("user:7:name")           // the server now watches this key for the client
+let keys = try changes.receive(1s)            // ?string[]: the keys that changed; [] = all of them
+try changes.close()
+```
+
+It needs RESP3. With a cluster it tracks on every master, and with a sentinel group on the
+master of the moment. An empty list from `receive` means every key: the server was flushed, a
+tracking connection broke, or the servers changed (a failover, a cluster that got another
+master) and the tracker started over, so changes may have been missed. Drop every copy then;
+what is read afterwards is tracked again. A cluster client that reads from replicas can track
+prefixes only.
+
 ## Not built yet
 
-- Splitting a command over slots (`del`, `mget`, `mset` with keys of several slots).
-- Sentinel: reading from replicas, and listening for `+switch-master` to leave an old master
-  before it is demoted.
-- Pipelines send their per-node batches one after another, not at the same time.
-- Client-side caching (`CLIENT TRACKING`): invalidation pushes are read and dropped.
-- Exclusive score bounds in `zrangeByScore`/`zcount`; use `command`.
+- Sentinel: reading from replicas.
+- `msetNx` and other commands that must run in one step are not split over the slots of a
+  cluster.
 
 ## Tests
 
@@ -240,4 +260,10 @@ They move a slot between nodes under a client, make a replica take over in the c
 have the sentinels fail the master over (about ten seconds). `ADM_TEST_REDIS_HARD=1` also stops
 a cluster master for good; start the cluster again afterwards (`docker restart redis-cluster`).
 
-Not covered by the suite: TLS (`rediss:`) and Unix sockets, which need a server set up for them.
+TLS and Unix sockets have a server of their own too: `testservers/tls.sh <folder>` starts it and
+writes its certificates and its socket to the folder.
+
+```bash
+ADM_TEST_REDIS_TLS=127.0.0.1:56380 ADM_TEST_REDIS_CERTS=<folder> \
+ADM_TEST_REDIS_SOCKET=<folder>/redis.sock adm test network/redis
+```

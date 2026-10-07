@@ -1,0 +1,13 @@
+// An AMQP 0-9-1 client as an ADM library: RabbitMQ and the brokers that
+// speak its protocol, over std.net.
+@manifest(version = "0.1.0")
+library adm.network.amqp {
+	use (
+		adm.network.amqp
+		adm.network.amqp.wire
+	)
+
+	export (
+		adm.network.amqp
+	)
+}

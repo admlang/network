@@ -51,7 +51,7 @@ partial module adm.network.s3 {
 					signed.push(Field{name: header, value: value})
 				}
 			}
-			let text = presignedQuery(engine.signer(name), method.value, path, query, signed, amzDateOf(time.now()), seconds)
+			let text = try presignedQuery(engine.signer(name), method.value, path, query, signed, amzDateOf(time.now()), seconds)
 			return "{engine.scheme}://{host}{path}?{text}"
 		}
 

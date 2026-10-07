@@ -1,0 +1,219 @@
+partial module adm.network.kafka {
+	use (
+		std.time
+		adm.network.kafka.wire::*
+	)
+
+	// Acks is how many brokers must have a record before `send` counts it
+	// as sent.
+	enum Acks {
+		// None: the producer does not wait, and learns of no failure.
+		None,
+		// The partition's leader wrote it.
+		Leader,
+		// Every in-sync replica has it.
+		All,
+	}
+
+	// Sent says where a record landed.
+	struct Sent {
+		topic     string
+		partition int
+		// The record's offset; -1 when the broker did not say (`Acks.None`,
+		// or a batch it already had from an earlier try).
+		offset    int
+	}
+
+	// Producer writes records to topics. Records of one partition go out
+	// in batches, in the order they were given; any number of tasks may
+	// send through one producer, and what they send meanwhile shares a
+	// batch.
+	//
+	// ```
+	// let out = try k.producer()
+	// out.compression = kafka.Compression.Zstd
+	// let sent = try out.send("orders", "paid", key = "order-7")
+	// for let line in lines {
+	//     try out.sendLater("log", line)       // does not wait
+	// }
+	// try out.flush()
+	// try out.close()
+	// ```
+	//
+	// Set the fields before the first send. A batch that fails for a
+	// reason that passes (a partition changing its leader, a broker
+	// restarting) is sent again for up to `deliveryTimeout`; with
+	// `idempotent` the brokers drop what such a retry would duplicate.
+	type Producer {
+		acks               Acks        = Acks.All
+		compression        Compression = Compression.None
+		// The brokers tell this producer's batches apart, so a batch sent
+		// twice is written once. Needs `Acks.All`.
+		idempotent         bool        = true
+		// How long a batch waits for more records before it is sent. 0s
+		// sends at once; records still share a batch while the one before
+		// is on its way.
+		linger             duration    = 0s
+		// A batch is closed once it holds this many bytes.
+		batchBytes         int         = 16384
+		// How long a broker may wait for its replicas.
+		timeout            duration    = 30s
+		// How long a batch is tried before `send` fails.
+		deliveryTimeout    duration    = 2min
+		// Names the producer for transactions; see `beginTx`. A new
+		// producer with the same id takes over from an older one, whose
+		// sends then fail with ErrorKind.Fenced.
+		transactionalId    string      = ""
+		// How long the cluster lets a transaction stay open before it
+		// rolls it back.
+		transactionTimeout duration    = 1min
+		internal engine    Sender
+		internal started   bool        = false
+
+		def new(engine Sender) {
+			self.engine = engine
+		}
+
+		internal def ready() !Sender {
+			return engine when started
+			fail errorOf(ErrorKind.Argument, "kafka: an idempotent or transactional producer needs Acks.All") when (idempotent || transactionalId != "") && acks != Acks.All
+			fail errorOf(ErrorKind.Argument, "kafka: batchBytes {batchBytes} is under 1024") when batchBytes < 1024
+			engine.acks = acks == Acks.All ?? (-1, acks == Acks.Leader ?? (1, 0))
+			engine.compression = compression
+			engine.idempotent = idempotent || transactionalId != ""
+			engine.linger = linger
+			engine.batchBytes = batchBytes
+			engine.timeout = timeout
+			engine.deliveryTimeout = deliveryTimeout
+			engine.transactionalId = transactionalId
+			engine.transactionTimeout = transactionTimeout
+			started = true
+			return engine
+		}
+
+		// send writes a record and returns where it landed, once the
+		// brokers `acks` asks for have it. Without `partition`, records
+		// with the same key go to the same partition (as every Kafka
+		// client places them) and records without a key are spread over
+		// the partitions a batch at a time. `timestamp` is the record's
+		// time; now when left out.
+		// Fails with a KafkaError: ErrorKind.NotFound for a topic that does
+		// not exist (and that the brokers do not make) or a partition it
+		// does not have, ErrorKind.TooLarge for a record over the broker's
+		// limit, ErrorKind.TimedOut when it is not sent within
+		// `deliveryTimeout`, ErrorKind.Denied without the permission,
+		// ErrorKind.Fenced when a newer producer took over,
+		// ErrorKind.State for a transactional producer outside a
+		// transaction, ErrorKind.Closed after `close`.
+		def send(topic string, value string, key string = "", partition int = -1, headers Header[] = [], timestamp ?time.Time = none) !Sent {
+			return try deliver(topic, outgoing(key.bytes(), value.bytes(), headers, timestamp), partition)
+		}
+
+		// send of bytes, with a key of bytes.
+		// Fails as `send(topic, text)` does.
+		def send(topic string, value byte[], key byte[] = [], partition int = -1, headers Header[] = [], timestamp ?time.Time = none) !Sent {
+			return try deliver(topic, outgoing(key, value, headers, timestamp), partition)
+		}
+
+		// sendLater hands a record to the producer and returns at once.
+		// `flush` waits for all such records and reports the first one
+		// that failed.
+		// Fails with a KafkaError for what shows before sending:
+		// ErrorKind.NotFound, ErrorKind.State, ErrorKind.Closed.
+		def sendLater(topic string, value string, key string = "", partition int = -1, headers Header[] = [], timestamp ?time.Time = none) !none {
+			try (try ready()).enqueue(topic, partition, outgoing(key.bytes(), value.bytes(), headers, timestamp), none)
+			return none
+		}
+
+		// sendLater of bytes, with a key of bytes.
+		// Fails as `sendLater(topic, text)` does.
+		def sendLater(topic string, value byte[], key byte[] = [], partition int = -1, headers Header[] = [], timestamp ?time.Time = none) !none {
+			try (try ready()).enqueue(topic, partition, outgoing(key, value, headers, timestamp), none)
+			return none
+		}
+
+		// tombstone writes a record without a value: in a compacted topic
+		// it deletes the key.
+		// Fails as `send` does.
+		def tombstone(topic string, key string, partition int = -1) !Sent {
+			let record = Outgoing{key: key.bytes(), value: none, timestamp: int(time.now().unixNs() / 1000000)}
+			return try deliver(topic, record, partition)
+		}
+
+		internal def deliver(topic string, record Outgoing, partition int) !Sent {
+			let signal = new channel<none>(1)
+			let (lot, index) = try (try ready()).enqueue(topic, partition, record, signal)
+			for !lot.done {
+				select {
+					case signal:
+						signal.flush()
+				}
+			}
+			let failed = lot.failure
+			fail failed unless failed is none
+			return Sent{topic: topic, partition: lot.partition, offset: lot.base < 0 ?? (-1, lot.base + index)}
+		}
+
+		// flush returns when every record given to the producer was sent
+		// or given up.
+		// Fails with the failure of the first `sendLater` record that was
+		// not sent since the last flush.
+		def flush() !none {
+			return try (try ready()).flush()
+		}
+
+		// beginTx opens a transaction: the records sent from now on, in
+		// any topics, become visible to consumers that read committed
+		// records together at `commitTx`, or never after `abortTx`. The
+		// producer needs a `transactionalId`.
+		// Fails with a KafkaError: ErrorKind.State without a transactional
+		// id or with a transaction open, ErrorKind.Fenced when a newer
+		// producer with the id took over.
+		def beginTx() !none {
+			return try (try ready()).start()
+		}
+
+		// commitTx makes the transaction's records visible.
+		// Fails with a KafkaError: ErrorKind.State when no transaction is
+		// open; the failure of a record sent in it (the transaction stays
+		// open: `abortTx` it); ErrorKind.Fenced when a newer producer took
+		// over.
+		def commitTx() !none {
+			return try (try ready()).end(true)
+		}
+
+		// abortTx drops the transaction's records: consumers that read
+		// committed records never see them.
+		// Fails with a KafkaError: ErrorKind.State when no transaction is
+		// open, ErrorKind.Fenced when a newer producer took over.
+		def abortTx() !none {
+			return try (try ready()).end(false)
+		}
+
+		// sendOffsets makes the positions of a consumer part of the open
+		// transaction: its group's offsets are committed with the
+		// transaction and not otherwise. This is how records are read,
+		// transformed and written exactly once; turn the consumer's
+		// `autoCommit` off.
+		// Fails with a KafkaError: ErrorKind.State when no transaction is
+		// open or the consumer has no group, and as a commit does.
+		def sendOffsets(from Consumer) !none {
+			fail errorOf(ErrorKind.State, "kafka: the consumer has no group to commit offsets for") when from.group == ""
+			return try (try ready()).commitOffsets(from.group, from.positions())
+		}
+
+		// close sends what the producer still holds and closes its
+		// connections. Never fails.
+		def close() !none {
+			engine.close()
+			return none
+		}
+	}
+
+	internal def outgoing(key byte[], value byte[], headers Header[], timestamp ?time.Time) Outgoing {
+		let stamp = timestamp is none ?? (time.now(), timestamp)
+		let record = Outgoing{value: value, headers: headers, timestamp: int(stamp.unixNs() / 1000000)}
+		record.key = key when key.len() > 0
+		return record
+	}
+}

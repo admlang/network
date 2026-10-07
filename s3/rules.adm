@@ -1,0 +1,274 @@
+// The lifecycle and CORS settings of a bucket as values: what
+// `Bucket.configuration` carries as XML documents.
+partial module adm.network.s3 {
+	use (
+		std.data.encoding
+		std.data.encoding::(XMLNode)
+		std.time
+		adm.network.s3.wire::*
+	)
+
+	// Transition moves objects to another storage class when they reach
+	// an age.
+	struct Transition {
+		// Days after the object was written (for a noncurrent version:
+		// after it stopped being the current one).
+		days         int
+		// A day to move on instead of an age; current versions only.
+		on           ?time.Time = none
+		storageClass string
+		// For noncurrent versions: how many of the newest stay where they
+		// are; 0 for none.
+		keep         int        = 0
+	}
+
+	// LifecycleRule is one rule of a bucket's lifecycle: which objects it
+	// covers and what happens to them with time. A field left as it is
+	// sets nothing.
+	struct LifecycleRule {
+		id                    string
+		enabled               bool                = true
+		// The objects the rule covers: those whose key starts with
+		// `prefix`, that carry every one of `labels`, and whose size is
+		// over `largerThan` and under `smallerThan` bytes (0: no bound).
+		prefix                string
+		labels                map<string, string>
+		largerThan            int                 = 0
+		smallerThan           int                 = 0
+		// Delete objects this many days after they were written, or on a
+		// day.
+		expireAfterDays       int                 = 0
+		expireOn              ?time.Time          = none
+		// Remove delete markers that have no versions left behind them.
+		expireDeleteMarkers   bool                = false
+		// Delete versions this many days after they stopped being the
+		// current one, keeping the `keepNoncurrent` newest of them.
+		noncurrentAfterDays   int                 = 0
+		keepNoncurrent        int                 = 0
+		// Drop uploads in parts that were not completed in this many days.
+		abortUploadsAfterDays int                 = 0
+		transitions           Transition[]
+		noncurrentTransitions Transition[]
+	}
+
+	// CorsRule lets pages of some origins call the bucket from a browser.
+	struct CorsRule {
+		id      string
+		// `https://app.example.com`, or `*` for any.
+		origins string[]
+		// `GET`, `PUT`, `POST`, `DELETE`, `HEAD`.
+		methods string[]
+		// The request headers a page may send (`*` for any), and the
+		// response headers its script may read.
+		headers string[]
+		exposed string[]
+		// How long a browser may remember the answer.
+		maxAge  duration = 0s
+	}
+
+	partial type Bucket {
+		// lifecycle returns the bucket's lifecycle rules; none are set
+		// when the list is empty.
+		// Fails with an S3Error as the type says.
+		def lifecycle() !LifecycleRule[] {
+			let document = try configuration("lifecycle")
+			return [] when document is none
+			let root = try parseXML(document.bytes(), new Call("GET", name))
+			let out LifecycleRule[] = []
+			for let node in root.elements("Rule") {
+				out.push(lifecycleRuleIn(node))
+			}
+			return out
+		}
+
+		// lifecycle replaces the bucket's lifecycle rules; an empty list
+		// removes them.
+		// Fails with an S3Error as the type says, and with
+		// ErrorKind.Argument for rules the server refuses (a rule that does
+		// nothing, two rules with one id).
+		def lifecycle(rules LifecycleRule[]) !none {
+			return try configuration("lifecycle", none) when rules.len() == 0
+			return try configuration("lifecycle", string(lifecycleDocument(rules)))
+		}
+
+		// cors returns the bucket's CORS rules; none are set when the list
+		// is empty.
+		// Fails with an S3Error as the type says.
+		def cors() !CorsRule[] {
+			let document = try configuration("cors")
+			return [] when document is none
+			let root = try parseXML(document.bytes(), new Call("GET", name))
+			let out CorsRule[] = []
+			for let node in root.elements("CORSRule") {
+				let rule = CorsRule{id: textOf(node, "ID")}
+				rule.origins = textsOf(node, "AllowedOrigin")
+				rule.methods = textsOf(node, "AllowedMethod")
+				rule.headers = textsOf(node, "AllowedHeader")
+				rule.exposed = textsOf(node, "ExposeHeader")
+				rule.maxAge = duration(numberOf(node, "MaxAgeSeconds") * 1000000000)
+				out.push(rule)
+			}
+			return out
+		}
+
+		// cors replaces the bucket's CORS rules; an empty list removes
+		// them.
+		// Fails with an S3Error as the type says.
+		def cors(rules CorsRule[]) !none {
+			return try configuration("cors", none) when rules.len() == 0
+			return try configuration("cors", string(corsDocument(rules)))
+		}
+	}
+
+	internal def textsOf(node XMLNode, name string) string[] {
+		let out string[] = []
+		for let child in node.elements(name) {
+			out.push(child.text())
+		}
+		return out
+	}
+
+	// The day of a moment as S3 takes it in a rule: midnight UTC.
+	internal def dayOf(at time.Time) string {
+		let day = int64(86400) * 1000000000
+		return time.fromUnixNs(at.unixNs() / day * day).str(time.TimeFormat.RFC3339)
+	}
+
+	internal def lifecycleRuleIn(node XMLNode) LifecycleRule {
+		let rule = LifecycleRule{id: textOf(node, "ID"), enabled: textOf(node, "Status") == "Enabled"}
+		// Before filters there was a prefix on the rule itself.
+		rule.prefix = textOf(node, "Prefix")
+		let filter = node.child("Filter")
+		if !(filter is none) {
+			let scope = filter
+			let both = filter.child("And")
+			scope = both unless both is none
+			rule.prefix = textOf(scope, "Prefix")
+			rule.largerThan = numberOf(scope, "ObjectSizeGreaterThan")
+			rule.smallerThan = numberOf(scope, "ObjectSizeLessThan")
+			for let tag in scope.elements("Tag") {
+				rule.labels.set(textOf(tag, "Key"), textOf(tag, "Value"))
+			}
+		}
+		let expiry = node.child("Expiration")
+		if !(expiry is none) {
+			rule.expireAfterDays = numberOf(expiry, "Days")
+			let date = textOf(expiry, "Date")
+			rule.expireOn = readTime(date) when date != ""
+			rule.expireDeleteMarkers = textOf(expiry, "ExpiredObjectDeleteMarker") == "true"
+		}
+		let old = node.child("NoncurrentVersionExpiration")
+		if !(old is none) {
+			rule.noncurrentAfterDays = numberOf(old, "NoncurrentDays")
+			rule.keepNoncurrent = numberOf(old, "NewerNoncurrentVersions")
+		}
+		let stale = node.child("AbortIncompleteMultipartUpload")
+		rule.abortUploadsAfterDays = numberOf(stale, "DaysAfterInitiation") unless stale is none
+		for let move in node.elements("Transition") {
+			let step = Transition{days: numberOf(move, "Days"), storageClass: textOf(move, "StorageClass")}
+			let date = textOf(move, "Date")
+			step.on = readTime(date) when date != ""
+			rule.transitions.push(step)
+		}
+		for let move in node.elements("NoncurrentVersionTransition") {
+			rule.noncurrentTransitions.push(Transition{days: numberOf(move, "NoncurrentDays"), storageClass: textOf(move, "StorageClass"), keep: numberOf(move, "NewerNoncurrentVersions")})
+		}
+		return rule
+	}
+
+	internal def lifecycleDocument(rules LifecycleRule[]) byte[] {
+		let doc = new encoding.XMLWriter()
+		doc.start("LifecycleConfiguration")
+		doc.attribute("xmlns", xmlns)
+		for let rule in rules {
+			doc.start("Rule")
+			doc.element("ID", rule.id) when rule.id != ""
+			doc.element("Status", rule.enabled ?? ("Enabled", "Disabled"))
+			let conditions = rule.labels.len()
+			conditions++ when rule.prefix != ""
+			conditions++ when rule.largerThan > 0
+			conditions++ when rule.smallerThan > 0
+			doc.start("Filter")
+			// Several conditions go inside an `And`; one stands alone, and
+			// none is an empty prefix: every object.
+			doc.start("And") when conditions > 1
+			doc.element("Prefix", rule.prefix) when rule.prefix != "" || conditions == 0
+			for let (key, value) in rule.labels {
+				doc.start("Tag")
+				doc.element("Key", key)
+				doc.element("Value", value)
+				doc.end()
+			}
+			doc.element("ObjectSizeGreaterThan", rule.largerThan.str()) when rule.largerThan > 0
+			doc.element("ObjectSizeLessThan", rule.smallerThan.str()) when rule.smallerThan > 0
+			doc.end() when conditions > 1
+			doc.end()
+			let until = rule.expireOn
+			if rule.expireAfterDays > 0 || !(until is none) || rule.expireDeleteMarkers {
+				doc.start("Expiration")
+				doc.element("Days", rule.expireAfterDays.str()) when rule.expireAfterDays > 0
+				doc.element("Date", dayOf(until)) unless until is none
+				doc.element("ExpiredObjectDeleteMarker", "true") when rule.expireDeleteMarkers
+				doc.end()
+			}
+			for let step in rule.transitions {
+				doc.start("Transition")
+				let date = step.on
+				if date is none {
+					doc.element("Days", step.days.str())
+				} else {
+					doc.element("Date", dayOf(date))
+				}
+				doc.element("StorageClass", step.storageClass)
+				doc.end()
+			}
+			if rule.noncurrentAfterDays > 0 {
+				doc.start("NoncurrentVersionExpiration")
+				doc.element("NoncurrentDays", rule.noncurrentAfterDays.str())
+				doc.element("NewerNoncurrentVersions", rule.keepNoncurrent.str()) when rule.keepNoncurrent > 0
+				doc.end()
+			}
+			for let step in rule.noncurrentTransitions {
+				doc.start("NoncurrentVersionTransition")
+				doc.element("NoncurrentDays", step.days.str())
+				doc.element("StorageClass", step.storageClass)
+				doc.element("NewerNoncurrentVersions", step.keep.str()) when step.keep > 0
+				doc.end()
+			}
+			if rule.abortUploadsAfterDays > 0 {
+				doc.start("AbortIncompleteMultipartUpload")
+				doc.element("DaysAfterInitiation", rule.abortUploadsAfterDays.str())
+				doc.end()
+			}
+			doc.end()
+		}
+		doc.end()
+		return doc.bytes()
+	}
+
+	internal def corsDocument(rules CorsRule[]) byte[] {
+		let doc = new encoding.XMLWriter()
+		doc.start("CORSConfiguration")
+		doc.attribute("xmlns", xmlns)
+		for let rule in rules {
+			doc.start("CORSRule")
+			doc.element("ID", rule.id) when rule.id != ""
+			for let origin in rule.origins {
+				doc.element("AllowedOrigin", origin)
+			}
+			for let method in rule.methods {
+				doc.element("AllowedMethod", method.upper())
+			}
+			for let header in rule.headers {
+				doc.element("AllowedHeader", header)
+			}
+			for let header in rule.exposed {
+				doc.element("ExposeHeader", header)
+			}
+			doc.element("MaxAgeSeconds", (int64(rule.maxAge) / 1000000000).str()) when rule.maxAge > 0s
+			doc.end()
+		}
+		doc.end()
+		return doc.bytes()
+	}
+}

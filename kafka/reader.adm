@@ -1,0 +1,1104 @@
+// What a consumer does behind `poll`: it keeps its place in each
+// partition, fetches from their leaders, and as a member of a group joins
+// it, answers its rebalances, sends heartbeats and commits offsets.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.time
+		adm.network.kafka::*
+	)
+
+	// Reader is the working half of a consumer.
+	type Reader {
+		cluster            Cluster
+		// Names the consumer's connections among the client's: one set
+		// for fetching, one for the group's coordinator.
+		purpose            string
+		group              string
+		// The topics a group member asks for; empty for a consumer that
+		// names its partitions itself.
+		topics             string[]                  = []
+		// Where to start in a partition the group has no offset for.
+		fromEarliest       bool                      = true
+		sessionTimeout     duration                  = 45s
+		rebalanceTimeout   duration                  = 5min
+		heartbeatEvery     duration                  = 3s
+		maxWait            duration                  = 500ms
+		minBytes           int                       = 1
+		maxBytes           int                       = 52428800
+		partitionBytes     int                       = 1048576
+		committedOnly      bool                      = false
+		// `range`, `roundrobin`, `sticky` or `cooperative-sticky`.
+		strategy           string                    = "range"
+		// The member lost its place in the group: what it held is gone.
+		atomic lostAll     bool                      = false
+		// True speaks the group protocol of Kafka 4, where the coordinator
+		// deals the partitions and a heartbeat carries everything.
+		modern             bool                      = false
+		// What the coordinator wants the member to hold, until `poll` has
+		// made it so.
+		atomic target      map<string, int[]>
+		atomic targeted    bool                      = false
+		instanceId         string                    = ""
+		onAssigned         ?def (map<string, int[]>) = none
+		onRevoked          ?def (map<string, int[]>) = none
+		// The partitions the consumer reads, and the next offset of each
+		// by `topic/partition`.
+		atomic owned       map<string, int[]>
+		atomic places      map<string, int>
+		atomic paused      map<string, bool>
+		atomic memberId    string                    = ""
+		atomic generation  int                       = -1
+		// The group changed (or was never joined): the next poll joins.
+		atomic rejoin      bool                      = true
+		atomic joining     bool                      = false
+		atomic beating     bool                      = false
+		atomic coordinator int                       = -1
+		atomic closed      bool                      = false
+		// What ends the consumer for good: another member took its place.
+		atomic fatal       ?error                    = none
+		atomic gathered    Record[]                  = []
+		atomic stale       bool                      = false
+
+		def new(cluster Cluster, purpose string, group string) {
+			self.cluster = cluster
+			self.purpose = purpose
+			self.group = group
+		}
+
+		// ---- places ----
+
+		atomic def placeOf(name string, partition int) ?int {
+			return places.get("{name}/{partition}")
+		}
+
+		atomic def setPlace(name string, partition int, offset int) {
+			places["{name}/{partition}"] = offset
+		}
+
+		atomic def advance(name string, partition int, from int, next int) {
+			let slot = "{name}/{partition}"
+			let now = places.get(slot)
+			// A seek meanwhile wins over what was fetched before it.
+			places[slot] = next when !(now is none) && now == from
+		}
+
+		atomic def ownedCopy() map<string, int[]> {
+			let out map<string, int[]> = {}
+			for let (name, parts) in owned {
+				out[name] = parts.clone()
+			}
+			return out
+		}
+
+		atomic def owns(name string, partition int) bool {
+			let parts = owned.get(name)
+			return !(parts is none) && parts.includes(partition)
+		}
+
+		atomic def take(parts map<string, int[]>) {
+			owned = parts
+			places = {}
+			paused = {}
+		}
+
+		// Adds partitions the consumer names itself.
+		atomic def addOwned(name string, parts int[]) {
+			let all int[] = []
+			let have = owned.get(name)
+			all = have unless have is none
+			for let partition in parts {
+				all.push(partition) unless all.includes(partition)
+			}
+			owned[name] = all
+		}
+
+		atomic def setPaused(name string, partition int, on bool) {
+			if on {
+				paused["{name}/{partition}"] = true
+			} else {
+				paused.delete("{name}/{partition}")
+			}
+		}
+
+		atomic def isPaused(name string, partition int) bool {
+			return paused.hasKey("{name}/{partition}")
+		}
+
+		// The next offset of every partition the consumer reads, by topic.
+		atomic def positions() map<string, map<int, int>> {
+			let out map<string, map<int, int>> = {}
+			for let (name, parts) in owned {
+				let offsets map<int, int> = {}
+				for let partition in parts {
+					let place = places.get("{name}/{partition}")
+					offsets[partition] = place unless place is none
+				}
+				out[name] = offsets
+			}
+			return out
+		}
+
+		// Whether some owned partition has no starting offset yet.
+		atomic def unplaced() bool {
+			for let (name, parts) in owned {
+				for let partition in parts {
+					return true unless places.hasKey("{name}/{partition}")
+				}
+			}
+			return false
+		}
+
+		// locate gives every owned partition its starting offset: the one
+		// the group committed, else the partition's first or next offset.
+		// Fails with a KafkaError as `committedOffsets` and `offsetFor` do.
+		def locate() !none {
+			for let (name, parts) in ownedCopy() {
+				let known map<int, int> = {}
+				known = try committedOffsets(cluster, "{purpose}g", group, name, parts) when group != ""
+				for let partition in parts {
+					continue unless placeOf(name, partition) is none
+					let offset = known.get(partition)
+					if offset is none {
+						setPlace(name, partition, try startOf(name, partition))
+					} else {
+						setPlace(name, partition, offset)
+					}
+				}
+			}
+			return none
+		}
+
+		def startOf(name string, partition int) !int {
+			return try offsetFor(cluster, "{purpose}g", name, partition, fromEarliest ?? (offsetEarliest, offsetLatest))
+		}
+
+		// ---- fetching ----
+
+		// poll returns the records that arrive within `wait`, as soon as
+		// some do; none when the time passes first. A member of a group
+		// first joins it, or joins again when the group changed.
+		// Fails with a KafkaError: ErrorKind.Closed after `close`,
+		// ErrorKind.Fenced when another member with the same instance id
+		// took over, ErrorKind.NotFound for a topic that does not exist,
+		// ErrorKind.Corrupt for records that fail their checksum, and as
+		// `join` and `Broker.call` do.
+		def poll(wait duration) !Record[] {
+			let deadline = time.now() + wait
+			for {
+				fail errorOf(ErrorKind.Closed, "kafka: the consumer is closed") when closed
+				let ended = fatal
+				fail ended unless ended is none
+				try join() when group != "" && topics.len() > 0 && rejoin
+				try reconcile() when modern && targeted
+				try locate() when unplaced()
+				let left = deadline - time.now()
+				left = 0s when left < 0s
+				let records = try fetch(left < maxWait ?? (left, maxWait))
+				return records when records.len() > 0 || time.now() >= deadline
+			}
+			return []
+		}
+
+		// One round: a fetch request to every broker that leads a partition
+		// the consumer reads, all at once.
+		def fetch(wait duration) !Record[] {
+			let byLeader map<int, string[]> = {}
+			for let (name, parts) in ownedCopy() {
+				for let partition in parts {
+					continue when isPaused(name, partition) || placeOf(name, partition) is none
+					let leader = try cluster.leader(name, partition, takeStale())
+					let slots string[] = []
+					let have = byLeader.get(leader)
+					slots = have unless have is none
+					slots.push("{name}/{partition}")
+					byLeader[leader] = slots
+				}
+			}
+			if byLeader.len() == 0 {
+				// Nothing to read: every partition is paused or none is
+				// assigned.
+				time.sleep(wait < 100ms ?? (wait, 100ms))
+				return []
+			}
+			let round = new AsyncScope()
+			for let (leader, slots) in byLeader {
+				async<round> fetchFrom(leader, slots, wait)
+			}
+			try await round
+			return takeGathered()
+		}
+
+		atomic def takeStale() bool {
+			let was = stale
+			stale = false
+			return was
+		}
+
+		atomic def gather(records Record[]) {
+			gathered.push(...records)
+		}
+
+		atomic def takeGathered() Record[] {
+			let out = gathered
+			gathered = []
+			return out
+		}
+
+		def fetchFrom(leader int, slots string[], wait duration) !none {
+			let ask = new Encoder()
+			ask.i32(-1)
+			ask.i32(int(int64(wait) / 1000000))
+			ask.i32(minBytes)
+			ask.i32(maxBytes)
+			ask.i8(committedOnly ?? (1, 0))
+			ask.i32(0)
+			ask.i32(-1)
+			let byTopic map<string, int[]> = {}
+			for let slot in slots {
+				let cut = slot.indexOf("/")
+				let name = slot.slice(0, cut)
+				let parts int[] = []
+				let have = byTopic.get(name)
+				parts = have unless have is none
+				parts.push(slot.slice(cut + 1, slot.len()).toInt<int>())
+				byTopic[name] = parts
+			}
+			let asked map<string, int> = {}
+			ask.count(byTopic.len())
+			for let (name, parts) in byTopic {
+				ask.text(name)
+				ask.count(parts.len())
+				for let partition in parts {
+					let place = placeOf(name, partition)
+					let from = place is none ?? (0, place)
+					asked["{name}/{partition}"] = from
+					ask.i32(partition)
+					ask.i32(-1)
+					ask.i64(from)
+					ask.i64(-1)
+					ask.i32(partitionBytes)
+				}
+			}
+			ask.count(0)
+			ask.text("")
+			let broker = cluster.conn(leader, "{purpose}f") onerror (err error) {
+				// The broker may be gone: look the leaders up again.
+				stale = true
+				time.sleep(100ms)
+				return none
+			}
+			let answer = broker.call(apiFetch, ask, wait) onerror (err error) {
+				stale = true
+				return none
+			}
+			try answer.i32()
+			let whole = try answer.i16()
+			try answer.i32()
+			fail brokerError(whole, "fetching") when whole != 0 && !retriable(whole)
+			for let t = try answer.count(); t > 0; t-- {
+				let name = try answer.text()
+				for let p = try answer.count(); p > 0; p-- {
+					let partition = try answer.i32()
+					let code = try answer.i16()
+					try answer.i64()
+					try answer.i64()
+					try answer.i64()
+					let aborted Aborted[] = []
+					for let a = try answer.count(); a > 0; a-- {
+						let producer = try answer.i64()
+						aborted.push(Aborted{producerId: producer, first: try answer.i64()})
+					}
+					try answer.i32()
+					let data = try answer.bytes()
+					let from = asked.get("{name}/{partition}")
+					continue when from is none
+					if code == 1 {
+						// The place is before what the partition still holds,
+						// or past its end: start where a new consumer would.
+						let start = try startOf(name, partition)
+						advance(name, partition, from, start)
+						continue
+					}
+					if code != 0 {
+						fail brokerError(code, "fetching '{name}' partition {partition}") unless retriable(code)
+						stale = true
+						continue
+					}
+					let (records, next) = try decodeBatches(data, name, partition, from, aborted)
+					if records.len() == 0 && next == from && data.len() > 0 {
+						// One batch larger than the fetch could carry.
+						fail errorOf(ErrorKind.TooLarge, "kafka: a batch of '{name}' partition {partition} at offset {from} is larger than partitionBytes ({partitionBytes})") when data.len() >= partitionBytes
+					}
+					// Records fetched for a place the consumer left by a
+					// seek, or for a partition it lost, are dropped.
+					let now = placeOf(name, partition)
+					continue when now is none || now != from
+					advance(name, partition, from, next)
+					gather(records)
+				}
+			}
+			return none
+		}
+
+		// ---- the group ----
+
+		def coordinatorConn() !Broker {
+			let node = coordinator
+			if node < 0 {
+				node = try cluster.coordinator(group, 0)
+				coordinator = node
+			}
+			return cluster.conn(node, "{purpose}g") onerror (err error) {
+				coordinator = -1
+				fail err
+			}
+		}
+
+		// join makes the consumer a member of its group and takes the
+		// partitions the group gives it. While members come and go this
+		// may take up to the group's rebalance timeout.
+		// Fails with a KafkaError: ErrorKind.Fenced when another member
+		// with the same instance id took over, ErrorKind.Denied without
+		// the permission, ErrorKind.Argument for timeouts the broker
+		// refuses, ErrorKind.TimedOut when the coordinator stays away, and
+		// as `Broker.call` does.
+		def join() !none {
+			joining = true
+			let failed ?error = none
+			if modern {
+				arrive() onerror (err error) {
+					failed = err
+					recover none
+				}
+			} else {
+				enter() onerror (err error) {
+					failed = err
+					recover none
+				}
+			}
+			joining = false
+			fail failed unless failed is none
+			if !beating {
+				beating = true
+				if modern {
+					let task = async tick()
+					task.keepAlive()
+				} else {
+					let task = async beat()
+					task.keepAlive()
+				}
+			}
+			return none
+		}
+
+		def enter() !none {
+			let had = ownedCopy()
+			let gentle = strategy == "cooperative-sticky"
+			// The cooperative way keeps its partitions through a rebalance
+			// and gives up only those the group moves; every other way, and
+			// a member the group forgot, gives up all of them first.
+			if had.len() > 0 && (!gentle || lostAll) {
+				let revoked = onRevoked
+				revoked(had) unless revoked is none
+				if gentle {
+					let nothing map<string, int[]> = {}
+					take(nothing)
+				}
+			}
+			lostAll = false
+			let deadline = time.now() + rebalanceTimeout + cluster.login.timeout
+			for {
+				fail errorOf(ErrorKind.TimedOut, "kafka: joining group '{group}' took longer than {rebalanceTimeout}") when time.now() > deadline
+				let ask = new Encoder()
+				ask.text(group)
+				ask.i32(int(int64(sessionTimeout) / 1000000))
+				ask.i32(int(int64(rebalanceTimeout) / 1000000))
+				ask.text(memberId)
+				ask.maybe(instanceId == "" ?? (none, instanceId))
+				ask.text("consumer")
+				let keeps = strategy := "sticky" || "cooperative-sticky"
+				let holding map<string, int[]> = {}
+				holding = ownedCopy() when keeps
+				let wish = subscriptionOf(topics, holding, generation, strategy == "sticky")
+				let offers = ["range", "roundrobin"]
+				offers = ["roundrobin", "range"] when strategy == "roundrobin"
+				offers = [strategy] when keeps
+				ask.count(offers.len())
+				for let offer in offers {
+					ask.text(offer)
+					ask.bytes(wish)
+				}
+				let broker = try coordinatorConn()
+				let answer = try broker.call(apiJoinGroup, ask, rebalanceTimeout)
+				try answer.i32()
+				let code = try answer.i16()
+				let round = try answer.i32()
+				let chosen = try answer.text()
+				let leader = try answer.text()
+				let me = try answer.text()
+				if code == 79 {
+					// The coordinator wants the id it just gave back.
+					memberId = me
+					continue
+				}
+				if code != 0 {
+					let passes = retriable(code) || code == 25 || code == 27 || code == 22
+					fail brokerError(code, "joining group '{group}'") unless passes
+					if code == 25 {
+						memberId = ""
+						lostAll = true
+					}
+					coordinator = -1 when code == 15 || code == 16
+					time.sleep(100ms)
+					continue
+				}
+				memberId = me
+				generation = round
+				let plan = new Encoder()
+				plan.text(group)
+				plan.i32(round)
+				plan.text(me)
+				plan.maybe(instanceId == "" ?? (none, instanceId))
+				if leader == me {
+					let wishes map<string, Wish> = {}
+					for let n = try answer.count(); n > 0; n-- {
+						let id = try answer.text()
+						try answer.maybe()
+						wishes[id] = try subscriptionIn(try answer.bytes())
+					}
+					let shares = try share(chosen, wishes)
+					plan.count(shares.len())
+					for let (id, parts) in shares {
+						plan.text(id)
+						plan.bytes(assignmentOf(parts))
+					}
+				} else {
+					plan.count(0)
+				}
+				let synced = try broker.call(apiSyncGroup, plan, rebalanceTimeout)
+				try synced.i32()
+				code = try synced.i16()
+				if code != 0 {
+					let passes = retriable(code) || code == 25 || code == 27 || code == 22
+					fail brokerError(code, "taking partitions in group '{group}'") unless passes
+					memberId = "" when code == 25
+					coordinator = -1 when code == 15 || code == 16
+					time.sleep(100ms)
+					continue
+				}
+				let given = try assignmentIn(try synced.bytes())
+				if chosen == "cooperative-sticky" {
+					let (gone, fresh) = changes(given)
+					if gone.len() > 0 {
+						// Told while the places are still known, so they can
+						// be committed.
+						let revoked = onRevoked
+						revoked(gone) unless revoked is none
+					}
+					settle(given)
+					// What was given up goes to its new owner in a round of
+					// its own, which this member starts by joining again.
+					rejoin = gone.len() > 0
+					try locate()
+					let assigned = onAssigned
+					assigned(fresh) unless assigned is none || (fresh.len() == 0 && had.len() > 0)
+					return none
+				}
+				take(given)
+				rejoin = false
+				try locate()
+				let assigned = onAssigned
+				assigned(ownedCopy()) unless assigned is none
+				return none
+			}
+			return none
+		}
+
+		// share deals the partitions of every topic the members ask for,
+		// as the group's leader: `range` gives each member a run of every
+		// topic's partitions, `roundrobin` deals all partitions one by one.
+		// Fails with a KafkaError as `Cluster.topic` does.
+		def share(how string, wishes map<string, Wish>) !map<string, map<string, int[]>> {
+			return try stickyShare(wishes, how == "cooperative-sticky") when how := "sticky" || "cooperative-sticky"
+			let members string[] = []
+			let names string[] = []
+			for let (id, wish) in wishes {
+				members.push(id)
+				for let name in wish.topics {
+					names.push(name) unless names.includes(name)
+				}
+			}
+			members = members.sort((a, b) => a < b)
+			names = names.sort((a, b) => a < b)
+			let out map<string, map<string, int[]>> = {}
+			for let id in members {
+				let nothing map<string, int[]> = {}
+				out[id] = nothing
+			}
+			let turn = 0
+			for let name in names {
+				let known = cluster.topic(name, false, true) onerror (err error) {
+					// A topic that does not exist yet gives nothing.
+					let missing = false
+					missing = err.kind == ErrorKind.NotFound when err is KafkaError
+					fail err unless missing
+					recover Topic{name: name}
+				}
+				let count = known.parts.len()
+				let takers string[] = []
+				for let id in members {
+					takers.push(id) when wishes[id].topics.includes(name)
+				}
+				continue when takers.len() == 0 || count == 0
+				if how == "roundrobin" {
+					for let partition = 0; partition < count; partition++ {
+						// The next member in turn that asks for this topic.
+						for !wishes[members[turn % members.len()]].topics.includes(name) {
+							turn++
+						}
+						give(out, members[turn % members.len()], name, partition)
+						turn++
+					}
+				} else {
+					let each = count / takers.len()
+					let extra = count % takers.len()
+					let next = 0
+					for let (i, id) in takers {
+						let size = each + (i < extra ?? (1, 0))
+						for let k = 0; k < size; k++ {
+							give(out, id, name, next)
+							next++
+						}
+					}
+				}
+			}
+			return out
+		}
+
+		// stickyShare deals partitions so that each stays with the member
+		// that holds it, as far as an even deal allows: what nobody holds
+		// goes to whoever has least, and a member with two more than another
+		// that wants the topic passes one on. With `cooperative` a
+		// partition that changes hands is given to nobody in this round: its
+		// holder lets go of it first, and the next round deals it.
+		// Fails with a KafkaError as `Cluster.topic` does.
+		def stickyShare(wishes map<string, Wish>, cooperative bool) !map<string, map<string, int[]>> {
+			let members string[] = []
+			let names string[] = []
+			for let (id, wish) in wishes {
+				members.push(id)
+				for let name in wish.topics {
+					names.push(name) unless names.includes(name)
+				}
+			}
+			members = members.sort((a, b) => a < b)
+			names = names.sort((a, b) => a < b)
+			// Every partition of every topic, in order, and who gets it.
+			let spotTopic string[] = []
+			let spotPart int[] = []
+			let index map<string, int> = {}
+			for let name in names {
+				let known = cluster.topic(name, false, true) onerror (err error) {
+					let missing = false
+					missing = err.kind == ErrorKind.NotFound when err is KafkaError
+					fail err unless missing
+					recover Topic{name: name}
+				}
+				for let part in known.parts {
+					index["{name}/{part.index}"] = spotTopic.len()
+					spotTopic.push(name)
+					spotPart.push(part.index)
+				}
+			}
+			let holder string[] = []
+			let claimed int[] = []
+			let before string[][] = []
+			for let i = 0; i < spotTopic.len(); i++ {
+				holder.push("")
+				claimed.push(-2)
+				let nobody string[] = []
+				before.push(nobody)
+			}
+			// A partition stays with the member that says it holds it; of
+			// two that say so, the one from the later round, and neither
+			// when they are of the same round.
+			for let id in members {
+				let wish = wishes[id]
+				for let (name, parts) in wish.owned {
+					continue unless wish.topics.includes(name)
+					for let partition in parts {
+						let at = index.get("{name}/{partition}")
+						continue when at is none
+						before[at].push(id)
+						if wish.generation > claimed[at] {
+							holder[at] = id
+							claimed[at] = wish.generation
+						} else if wish.generation == claimed[at] {
+							holder[at] = ""
+						}
+					}
+				}
+			}
+			let load map<string, int> = {}
+			for let id in members {
+				load[id] = 0
+			}
+			for let id in holder {
+				load[id] = load[id] + 1 when id != ""
+			}
+			for let i = 0; i < spotTopic.len(); i++ {
+				continue when holder[i] != ""
+				let best = ""
+				for let id in members {
+					continue unless wishes[id].topics.includes(spotTopic[i])
+					best = id when best == "" || load[id] < load[best]
+				}
+				continue when best == ""
+				holder[i] = best
+				load[best] = load[best] + 1
+			}
+			let moved = true
+			for moved {
+				moved = false
+				for let i = 0; i < spotTopic.len(); i++ {
+					let from = holder[i]
+					continue when from == ""
+					for let id in members {
+						continue unless wishes[id].topics.includes(spotTopic[i]) && load[id] + 1 < load[from]
+						holder[i] = id
+						load[id] = load[id] + 1
+						load[from] = load[from] - 1
+						moved = true
+						break
+					}
+				}
+			}
+			let out map<string, map<string, int[]>> = {}
+			for let id in members {
+				let nothing map<string, int[]> = {}
+				out[id] = nothing
+			}
+			for let i = 0; i < spotTopic.len(); i++ {
+				let to = holder[i]
+				continue when to == ""
+				if cooperative {
+					let held = false
+					for let id in before[i] {
+						held = true when id != to
+					}
+					continue when held
+				}
+				give(out, to, spotTopic[i], spotPart[i])
+			}
+			return out
+		}
+
+		// What a new assignment takes away from the partitions the
+		// consumer holds, and what it adds.
+		atomic def changes(given map<string, int[]>) (map<string, int[]>, map<string, int[]>) {
+			let gone map<string, int[]> = {}
+			let fresh map<string, int[]> = {}
+			for let (name, parts) in owned {
+				let now = given.get(name)
+				let lost int[] = []
+				for let partition in parts {
+					lost.push(partition) when now is none || !now.includes(partition)
+				}
+				gone[name] = lost when lost.len() > 0
+			}
+			for let (name, parts) in given {
+				let was = owned.get(name)
+				let added int[] = []
+				for let partition in parts {
+					added.push(partition) when was is none || !was.includes(partition)
+				}
+				fresh[name] = added when added.len() > 0
+			}
+			return (gone, fresh)
+		}
+
+		// Makes an assignment the consumer's, keeping its place in every
+		// partition it held already.
+		atomic def settle(given map<string, int[]>) {
+			let kept map<string, int> = {}
+			for let (name, parts) in given {
+				for let partition in parts {
+					let slot = "{name}/{partition}"
+					let place = places.get(slot)
+					kept[slot] = place unless place is none
+				}
+			}
+			owned = given
+			places = kept
+			paused = {}
+		}
+
+		def give(out map<string, map<string, int[]>>, id string, name string, partition int) {
+			let mine = out[id]
+			let parts int[] = []
+			let have = mine.get(name)
+			parts = have unless have is none
+			parts.push(partition)
+			mine[name] = parts
+			out[id] = mine
+		}
+
+		// The heartbeat task: tells the coordinator the member is alive,
+		// and learns from its answers that the group changes.
+		def beat() {
+			for !closed {
+				time.sleep(heartbeatEvery)
+				break when closed
+				continue when joining || rejoin || generation < 0
+				let ask = new Encoder()
+				ask.text(group)
+				ask.i32(generation)
+				ask.text(memberId)
+				ask.maybe(instanceId == "" ?? (none, instanceId))
+				let code = pulse(ask) onerror (err error) {
+					coordinator = -1
+					recover 0
+				}
+				continue when joining
+				switch {
+					case code == 0:
+					case code == 27:
+						rejoin = true
+					case code == 22:
+						lostAll = true
+						rejoin = true
+					case code == 25:
+						memberId = ""
+						lostAll = true
+						rejoin = true
+					case code == 82:
+						fatal = brokerError(code, "group '{group}'")
+					case code == 15 || code == 16:
+						coordinator = -1
+				}
+			}
+			beating = false
+		}
+
+		def pulse(ask Encoder) !int {
+			let broker = try coordinatorConn()
+			let answer = try broker.call(apiHeartbeat, ask)
+			try answer.i32()
+			return try answer.i16()
+		}
+
+		// ---- the group protocol of Kafka 4 ----
+
+		// heartbeat tells the coordinator the member is there and returns
+		// its error code. `full` says everything about the member (to join,
+		// or again after a break); `report` says what it holds, which is
+		// how it answers a new assignment. What comes back (the member's
+		// id and epoch, how often to beat, a new assignment) is kept.
+		// Fails with a KafkaError as `coordinatorConn` and `Broker.callAt`
+		// do.
+		def heartbeat(full bool, report bool) !int {
+			let ask = new Encoder()
+			ask.ctext(group)
+			ask.ctext(memberId)
+			ask.i32(generation < -2 ?? (0, generation))
+			ask.cmaybe(instanceId == "" ?? (none, instanceId))
+			ask.cmaybe(none)
+			ask.i32(full ?? (int(int64(rebalanceTimeout) / 1000000), -1))
+			if full {
+				ask.ccount(topics.len())
+				for let name in topics {
+					ask.ctext(name)
+				}
+				ask.cmaybe(strategy == "range" ?? ("range", "uniform"))
+			} else {
+				ask.uvarint(0)
+				ask.cmaybe(none)
+			}
+			if full || report {
+				let held = ownedCopy()
+				let ids = try cluster.learnIds(topics)
+				let known = 0
+				for let (name, _) in held {
+					known++ when ids.hasKey(name)
+				}
+				ask.ccount(known)
+				for let (name, parts) in held {
+					continue unless ids.hasKey(name)
+					ask.uuid(ids[name])
+					ask.ccount(parts.len())
+					for let partition in parts {
+						ask.i32(partition)
+					}
+					ask.tagged()
+				}
+			} else {
+				ask.uvarint(0)
+			}
+			ask.tagged()
+			let broker = try coordinatorConn()
+			let answer = try broker.callAt(apiGroupHeartbeat, 0, true, ask)
+			try answer.i32()
+			let code = try answer.i16()
+			try answer.cmaybe()
+			let me = try answer.cmaybe()
+			let epoch = try answer.i32()
+			let beatMillis = try answer.i32()
+			return code when code != 0
+			memberId = me unless me is none
+			generation = epoch
+			heartbeatEvery = duration(int64(beatMillis) * 1000000) when beatMillis > 0
+			// A byte says whether an assignment follows.
+			if (try answer.i8()) >= 0 {
+				let wanted map<string, int[]> = {}
+				let unknown = false
+				for let n = try answer.ccount(); n > 0; n-- {
+					let id = try answer.uuid()
+					let parts int[] = []
+					for let p = try answer.ccount(); p > 0; p-- {
+						parts.push(try answer.i32())
+					}
+					try answer.tagged()
+					let name = cluster.nameOf(id)
+					if name is none {
+						unknown = true
+					} else {
+						wanted[name] = parts
+					}
+				}
+				if unknown {
+					// A topic made since the ids were asked for: the next
+					// heartbeat that reports brings the assignment again.
+					try cluster.learnIds(topics)
+				} else {
+					aim(wanted)
+				}
+			}
+			return 0
+		}
+
+		atomic def aim(wanted map<string, int[]>) {
+			target = wanted
+			targeted = true
+		}
+
+		atomic def takeTarget() map<string, int[]> {
+			targeted = false
+			return target
+		}
+
+		// arrive joins the group, or joins it again after the coordinator
+		// forgot the member.
+		// Fails with a KafkaError: ErrorKind.Unsupported when the broker
+		// does not speak this protocol (before Kafka 4, or turned off),
+		// ErrorKind.Fenced, ErrorKind.Denied, ErrorKind.TimedOut when the
+		// coordinator stays away, and as `heartbeat` does.
+		def arrive() !none {
+			let had = ownedCopy()
+			if had.len() > 0 {
+				let revoked = onRevoked
+				revoked(had) unless revoked is none
+				let nothing map<string, int[]> = {}
+				take(nothing)
+			}
+			lostAll = false
+			generation = 0
+			try cluster.learnIds(topics)
+			let deadline = time.now() + cluster.login.timeout
+			for {
+				let code = try heartbeat(true, false)
+				break when code == 0
+				if code == 25 {
+					memberId = ""
+					continue
+				}
+				fail brokerError(code, "joining group '{group}'") unless retriable(code)
+				coordinator = -1 when code == 15 || code == 16
+				fail errorOf(ErrorKind.TimedOut, "kafka: the coordinator of group '{group}' was not ready within {cluster.login.timeout}", code) when time.now() > deadline
+				time.sleep(100ms)
+			}
+			rejoin = false
+			return none
+		}
+
+		// reconcile makes the consumer hold what the coordinator wants: it
+		// gives up what is no longer its own, takes what is new, and says
+		// so. The coordinator hands a partition out only once its last
+		// holder let go of it.
+		// Fails with a KafkaError as `locate` and `heartbeat` do.
+		def reconcile() !none {
+			let wanted = takeTarget()
+			let (gone, fresh) = changes(wanted)
+			if gone.len() > 0 {
+				let revoked = onRevoked
+				revoked(gone) unless revoked is none
+			}
+			settle(wanted)
+			try locate()
+			if fresh.len() > 0 {
+				let assigned = onAssigned
+				assigned(fresh) unless assigned is none
+			}
+			let code = try heartbeat(false, true)
+			lose(code) when code != 0
+			return none
+		}
+
+		// What an error code of a heartbeat means for the member.
+		def lose(code int) {
+			switch {
+				case code == 25:
+					memberId = ""
+					lostAll = true
+					rejoin = true
+				case code == 110:
+					lostAll = true
+					rejoin = true
+				case code == 82 || code == 111:
+					fatal = brokerError(code, "group '{group}'")
+				case code == 15 || code == 16:
+					coordinator = -1
+			}
+		}
+
+		// The heartbeat task of this protocol.
+		def tick() {
+			for !closed {
+				time.sleep(heartbeatEvery)
+				break when closed
+				continue when joining || rejoin
+				let code = heartbeat(false, false) onerror (err error) {
+					coordinator = -1
+					recover 0
+				}
+				lose(code) when code != 0 && !joining
+			}
+			beating = false
+		}
+
+		// commit stores offsets for the group: the next offset to read of
+		// each partition given.
+		// Fails with a KafkaError: ErrorKind.Rebalanced when the group
+		// changed and the commit did not happen, ErrorKind.State for a
+		// consumer without a group, ErrorKind.Fenced, and as `Broker.call`
+		// does.
+		def commit(offsets map<string, map<int, int>>) !none {
+			fail errorOf(ErrorKind.State, "kafka: a consumer without a group has nowhere to commit offsets") when group == ""
+			let deadline = time.now() + cluster.login.timeout
+			for {
+				let count = 0
+				for let (_, parts) in offsets {
+					count++ when parts.len() > 0
+				}
+				return none when count == 0
+				let ask = new Encoder()
+				let worst = 0
+				let broker = try coordinatorConn()
+				if modern {
+					// A group of the new protocol takes commits in the
+					// flexible form only, with the member's epoch.
+					ask.ctext(group)
+					ask.i32(generation)
+					ask.ctext(memberId)
+					ask.cmaybe(instanceId == "" ?? (none, instanceId))
+					ask.ccount(count)
+					for let (name, parts) in offsets {
+						continue when parts.len() == 0
+						ask.ctext(name)
+						ask.ccount(parts.len())
+						for let (partition, offset) in parts {
+							ask.i32(partition)
+							ask.i64(offset)
+							ask.i32(-1)
+							ask.cmaybe(none)
+							ask.tagged()
+						}
+						ask.tagged()
+					}
+					ask.tagged()
+					let answer = try broker.callAt(apiOffsetCommit, 9, true, ask)
+					try answer.i32()
+					for let t = try answer.ccount(); t > 0; t-- {
+						try answer.ctext()
+						for let p = try answer.ccount(); p > 0; p-- {
+							try answer.i32()
+							let code = try answer.i16()
+							worst = code when code != 0
+							try answer.tagged()
+						}
+						try answer.tagged()
+					}
+				} else {
+					ask.text(group)
+					ask.i32(generation)
+					ask.text(memberId)
+					ask.maybe(instanceId == "" ?? (none, instanceId))
+					ask.count(count)
+					for let (name, parts) in offsets {
+						continue when parts.len() == 0
+						ask.text(name)
+						ask.count(parts.len())
+						for let (partition, offset) in parts {
+							ask.i32(partition)
+							ask.i64(offset)
+							ask.i32(-1)
+							ask.maybe(none)
+						}
+					}
+					let answer = try broker.call(apiOffsetCommit, ask)
+					try answer.i32()
+					for let t = try answer.count(); t > 0; t-- {
+						try answer.text()
+						for let p = try answer.count(); p > 0; p-- {
+							try answer.i32()
+							let code = try answer.i16()
+							worst = code when code != 0
+						}
+					}
+				}
+				return none when worst == 0
+				if worst == 22 || worst == 25 || worst == 27 || worst == 110 || worst == 113 {
+					memberId = "" when worst == 25
+					lostAll = true when worst == 25 || worst == 22 || worst == 110
+					// A stale epoch of the new protocol is cured by the next
+					// heartbeat, without joining again.
+					rejoin = true unless modern && (worst == 27 || worst == 113)
+					fail brokerError(worst, "committing offsets of group '{group}'")
+				}
+				fail brokerError(worst, "committing offsets of group '{group}'") unless retriable(worst)
+				coordinator = -1 when worst == 15 || worst == 16
+				fail errorOf(ErrorKind.TimedOut, "kafka: the coordinator of group '{group}' took no commit within {cluster.login.timeout}", worst) when time.now() > deadline
+				time.sleep(100ms)
+			}
+			return none
+		}
+
+		// close leaves the group, so that its partitions go to the other
+		// members at once, and closes the consumer's connections. A member
+		// with an instance id stays: it is expected back.
+		def close() {
+			return when closed
+			closed = true
+			if modern && group != "" && memberId != "" {
+				// An epoch of -1 leaves; -2 says a member with an instance
+				// id will be back.
+				generation = instanceId == "" ?? (-1, -2)
+				heartbeat(false, false) onerror recover 0
+			} else if group != "" && memberId != "" && instanceId == "" {
+				let ask = new Encoder()
+				ask.text(group)
+				ask.count(1)
+				ask.text(memberId)
+				ask.maybe(none)
+				leave(ask) onerror recover none
+			}
+			cluster.drop("{purpose}f")
+			cluster.drop("{purpose}g")
+		}
+
+		def leave(ask Encoder) !none {
+			let broker = try coordinatorConn()
+			try broker.call(apiLeaveGroup, ask)
+			return none
+		}
+	}
+}

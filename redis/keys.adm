@@ -7,29 +7,53 @@ partial module adm.network.redis {
 	// Commands on keys of any type. Each fails with a RedisError as
 	// `command` does.
 	partial type Client {
-		// Deletes keys. Returns how many existed.
+		// Deletes keys. Returns how many existed. With a cluster the keys
+		// may live in any slots: each slot's keys go in a command of their
+		// own, so the deletion is not one step.
 		// Fails as `command` does.
 		def del(keys ...string) !int {
-			return (try call(timeout, ...joined(["DEL"], keys))).toInt()
+			return try counted("DEL", keys)
+		}
+
+		// Sends a command that takes keys and answers with a count, once
+		// for each group of keys the server can take together, and adds the
+		// counts up.
+		internal def counted(name string, keys string[]) !int {
+			let groups = link.shards(keys)
+			if groups.len() <= 1 {
+				let whole any[] = [name]
+				return (try link.call(timeout, joined(whole, keys))).toInt()
+			}
+			let commands any[][] = []
+			for let group in groups {
+				let part any[] = [name]
+				commands.push(joined(part, group))
+			}
+			let total = 0
+			for let reply in try link.run(commands, timeout) {
+				fail serverError(reply.text()) when reply.isError()
+				total += reply.toInt()
+			}
+			return total
 		}
 
 		// Deletes keys, freeing their memory in the background. Returns how
-		// many existed.
+		// many existed. With a cluster, as `del`.
 		// Fails as `command` does.
 		def unlink(keys ...string) !int {
-			return (try call(timeout, ...joined(["UNLINK"], keys))).toInt()
+			return try counted("UNLINK", keys)
 		}
 
 		// How many of the keys exist; a key named twice counts twice.
 		// Fails as `command` does.
 		def exists(keys ...string) !int {
-			return (try call(timeout, ...joined(["EXISTS"], keys))).toInt()
+			return try counted("EXISTS", keys)
 		}
 
 		// Sets the last access time of keys. Returns how many exist.
 		// Fails as `command` does.
 		def touch(keys ...string) !int {
-			return (try call(timeout, ...joined(["TOUCH"], keys))).toInt()
+			return try counted("TOUCH", keys)
 		}
 
 		// Makes a key expire after `ttl`. False when the key does not exist.

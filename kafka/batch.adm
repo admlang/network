@@ -1,0 +1,319 @@
+// Record batches (the format Kafka has used since 0.11): how records are
+// packed for a produce request and unpacked from a fetch response.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.bytes
+		std.crypto.hash
+		std.data.compress.gzip
+		std.data.compress.lz4
+		std.data.compress.snappy
+		std.data.compress.zstd
+		std.io
+		std.time
+		adm.network.kafka::*
+	)
+
+	const (
+		// Where the fields of a batch start, and where its records do.
+		batchLengthAt   = 8
+		batchMagicAt    = 16
+		batchCrcAt      = 17
+		batchAttributes = 21
+		batchRecordsAt  = 61
+		// The bits of a batch's attributes.
+		attrCompression = 0x07
+		attrLogTime     = 0x08
+		attrTransaction = 0x10
+		attrControl     = 0x20
+	)
+
+	// Outgoing is a record a producer holds until its batch is sent.
+	struct Outgoing {
+		key       ?byte[]
+		value     ?byte[]
+		headers   Header[]
+		// Milliseconds since 1970.
+		timestamp int
+	}
+
+	// Identity is who a batch says it comes from, for a broker that
+	// refuses what it already has: none of it (-1) for a producer that is
+	// not idempotent.
+	struct Identity {
+		producerId    int
+		producerEpoch int
+		sequence      int
+		transactional bool
+	}
+
+	// encodeBatch packs records into one batch.
+	// Fails with ErrorKind.Argument when the compression cannot be
+	// written.
+	def encodeBatch(records Outgoing[], compression Compression, who Identity) !byte[] {
+		let first = records.len() > 0 ?? (records[0].timestamp, 0)
+		let last = first
+		let body = new Encoder()
+		for let (i, record) in records {
+			last = record.timestamp when record.timestamp > last
+			let one = new Encoder()
+			one.i8(0)
+			one.varint(record.timestamp - first)
+			one.varint(i)
+			one.varbytes(record.key)
+			one.varbytes(record.value)
+			one.varint(record.headers.len())
+			for let h in record.headers {
+				let name = h.name.bytes()
+				one.varint(name.len())
+				one.raw(name)
+				one.varint(h.value.len())
+				one.raw(h.value)
+			}
+			body.varint(one.data.len())
+			body.raw(one.data)
+		}
+		let packed = try pack(body.data, compression)
+		let out = new Encoder()
+		out.i64(0)
+		out.i32(batchRecordsAt - 12 + packed.len())
+		out.i32(-1)
+		out.i8(2)
+		out.i32(0)
+		out.i16(codeOf(compression) | (who.transactional ?? (attrTransaction, 0)))
+		out.i32(records.len() - 1)
+		out.i64(first)
+		out.i64(last)
+		out.i64(who.producerId)
+		out.i16(who.producerEpoch)
+		out.i32(who.sequence)
+		out.i32(records.len())
+		out.raw(packed)
+		let crc = int(hash.crc32c(out.data[batchAttributes:]))
+		out.data[batchCrcAt] = byte((crc >> 24) & 0xFF)
+		out.data[batchCrcAt + 1] = byte((crc >> 16) & 0xFF)
+		out.data[batchCrcAt + 2] = byte((crc >> 8) & 0xFF)
+		out.data[batchCrcAt + 3] = byte(crc & 0xFF)
+		return out.data
+	}
+
+	def codeOf(compression Compression) int {
+		match compression {
+			case Compression.None:
+				return 0
+			case Compression.Gzip:
+				return 1
+			case Compression.Snappy:
+				return 2
+			case Compression.Lz4:
+				return 3
+			case Compression.Zstd:
+				return 4
+		}
+	}
+
+	// The eight bytes that open the Snappy framing Kafka's Java clients
+	// write: blocks of raw Snappy, each with its length in front.
+	const snappyFraming = byte[0x82, 0x53, 0x4E, 0x41, 0x50, 0x50, 0x59, 0x00]
+
+	def pack(plain byte[], compression Compression) !byte[] {
+		match compression {
+			case Compression.None:
+				return plain
+			case Compression.Gzip:
+				let sink = new bytes.Buffer()
+				let writer = new gzip.Writer(sink)
+				writer.write(plain) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "kafka: gzip: {err.message}")
+				}
+				writer.close() onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "kafka: gzip: {err.message}")
+				}
+				return sink.bytes()
+			case Compression.Snappy:
+				let out = new Encoder()
+				out.raw(snappyFraming)
+				out.i32(1)
+				out.i32(1)
+				// Blocks of 32 KiB, as the Java writer makes them.
+				for let at = 0; at < plain.len(); at += 32768 {
+					let end = at + 32768 < plain.len() ?? (at + 32768, plain.len())
+					out.bytes(snappy.compress(plain[at:end]))
+				}
+				return out.data
+			case Compression.Lz4:
+				let sink = new bytes.Buffer()
+				let writer = new lz4.Writer(sink)
+				writer.write(plain) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "kafka: lz4: {err.message}")
+				}
+				writer.close() onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "kafka: lz4: {err.message}")
+				}
+				return sink.bytes()
+			case Compression.Zstd:
+				return zstd.compress(plain)
+		}
+	}
+
+	// Fails with ErrorKind.Corrupt when the data does not unpack, and
+	// with ErrorKind.Unsupported for a compression the client does not
+	// know.
+	def unpack(packed byte[], code int) !byte[] {
+		match code {
+			case 0:
+				return packed
+			case 1:
+				let reader = new gzip.Reader(new bytes.Reader(packed))
+				return io.readAll(reader) onerror (err error) {
+					fail errorOf(ErrorKind.Corrupt, "kafka: a gzip batch does not unpack: {err.message}")
+				}
+			case 2:
+				if packed.len() >= 16 && packed[0:8].equals(snappyFraming) {
+					let out byte[] = []
+					let blocks = new Decoder(packed)
+					try blocks.take(16)
+					for blocks.left() > 0 {
+						let block = try blocks.bytes()
+						let plain = snappy.decompress(block) onerror (err error) {
+							fail errorOf(ErrorKind.Corrupt, "kafka: a snappy batch does not unpack: {err.message}")
+						}
+						out.push(...plain)
+					}
+					return out
+				}
+				return snappy.decompress(packed) onerror (err error) {
+					fail errorOf(ErrorKind.Corrupt, "kafka: a snappy batch does not unpack: {err.message}")
+				}
+			case 3:
+				return lz4.decompress(packed) onerror (err error) {
+					fail errorOf(ErrorKind.Corrupt, "kafka: an lz4 batch does not unpack: {err.message}")
+				}
+			case 4:
+				return zstd.decompress(packed) onerror (err error) {
+					fail errorOf(ErrorKind.Corrupt, "kafka: a zstd batch does not unpack: {err.message}")
+				}
+			default:
+				fail errorOf(ErrorKind.Unsupported, "kafka: a batch with compression {code}, which the client does not know")
+		}
+	}
+
+	// Aborted names a transaction that was rolled back: its producer and
+	// the offset of its first record.
+	struct Aborted {
+		producerId int
+		first      int
+	}
+
+	// decodeBatches unpacks the batches a fetch returned for a partition
+	// into the records at or after offset `from`, and returns them with
+	// the offset to fetch next. A batch cut off at the end of the data is
+	// left for the next fetch. With `aborted` (a fetch of committed
+	// records only) the records of rolled-back transactions are left
+	// out; the markers that end transactions always are.
+	// Fails with a KafkaError: ErrorKind.Corrupt for a batch that fails
+	// its checksum or does not unpack, ErrorKind.Unsupported for the
+	// message formats before Kafka 0.11.
+	def decodeBatches(data byte[], name string, partition int, from int, aborted Aborted[]) !(Record[], int) {
+		let out Record[] = []
+		let next = from
+		let at = 0
+		let pending = aborted.sort((a, b) => a.first < b.first)
+		let open map<int, bool> = {}
+		for at + batchRecordsAt <= data.len() {
+			let head = new Decoder(data[at:at + batchRecordsAt])
+			let base = try head.i64()
+			let length = try head.i32()
+			let end = at + 12 + length
+			break when length < batchRecordsAt - 12 || end > data.len()
+			try head.i32()
+			let magic = try head.i8()
+			fail errorOf(ErrorKind.Unsupported, "kafka: '{name}' partition {partition} holds records in the format of Kafka before 0.11 (magic {magic})") when magic != 2
+			let crc = try head.u32()
+			fail errorOf(ErrorKind.Corrupt, "kafka: a batch of '{name}' partition {partition} at offset {base} fails its checksum") when crc != int(hash.crc32c(data[at + batchAttributes:end]))
+			let attributes = try head.i16()
+			let lastDelta = try head.i32()
+			let firstTime = try head.i64()
+			let maxTime = try head.i64()
+			let producer = try head.i64()
+			try head.i16()
+			try head.i32()
+			let count = try head.i32()
+			let packed = data[at + batchRecordsAt:end]
+			at = end
+			// A compacted batch may have lost its last records: the next
+			// offset still follows the one it ended with.
+			let after = base + lastDelta + 1
+			for pending.len() > 0 && pending[0].first <= base {
+				open[pending[0].producerId] = true
+				pending.shift()
+			}
+			if attributes & attrControl != 0 {
+				// The marker that ends a transaction: its producer's
+				// records count again from here.
+				open.delete(producer)
+				next = after when after > next
+				continue
+			}
+			let skipped = attributes & attrTransaction != 0 && open.hasKey(producer)
+			if skipped || after <= from {
+				next = after when after > next
+				continue
+			}
+			let records = new Decoder(try unpack(packed, attributes & attrCompression))
+			for let i = 0; i < count; i++ {
+				let size = try records.varint()
+				let one = new Decoder(try records.take(size))
+				try one.i8()
+				let stamp = try one.varint()
+				let delta = try one.varint()
+				let key = try one.varbytes()
+				let value = try one.varbytes()
+				let record = Record{topic: name, partition: partition, offset: base + delta}
+				record.key = key unless key is none
+				record.value = value unless value is none
+				record.deleted = value is none
+				let millis = attributes & attrLogTime != 0 ?? (maxTime, firstTime + stamp)
+				record.timestamp = time.fromUnixNs(int64(millis) * 1000000)
+				for let h = try one.varint(); h > 0; h-- {
+					let header = Header{name: string(try one.take(try one.varint()))}
+					let held = try one.varbytes()
+					header.value = held unless held is none
+					record.headers.push(header)
+				}
+				out.push(record) when record.offset >= from
+			}
+			next = after when after > next
+		}
+		return (out, next)
+	}
+
+	// The hash Kafka's Java producer picks a partition with (murmur2), so
+	// that a key lands where every other client puts it.
+	def murmur2(data byte[]) uint32 {
+		let m = uint32(0x5bd1e995)
+		let size = data.len()
+		let h = uint32(0x9747b28c) ^ uint32(size)
+		let blocks = size / 4
+		for let i = 0; i < blocks; i++ {
+			let at = i * 4
+			let k = uint32(data[at]) | (uint32(data[at + 1]) << 8) | (uint32(data[at + 2]) << 16) | (uint32(data[at + 3]) << 24)
+			k = k * m
+			k = k ^ (k >> 24)
+			k = k * m
+			h = h * m
+			h = h ^ k
+		}
+		let tail = blocks * 4
+		let rest = size - tail
+		h = h ^ (uint32(data[tail + 2]) << 16) when rest == 3
+		h = h ^ (uint32(data[tail + 1]) << 8) when rest >= 2
+		if rest >= 1 {
+			h = h ^ uint32(data[tail])
+			h = h * m
+		}
+		h = h ^ (h >> 13)
+		h = h * m
+		h = h ^ (h >> 15)
+		return h
+	}
+}

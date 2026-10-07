@@ -1,0 +1,256 @@
+// What survives a broken connection: each channel's record of what it set
+// up, and the connection's way back to the broker.
+internal partial module adm.network.amqp.wire {
+	use (
+		std.time
+		adm.network.amqp::*
+	)
+
+	// Step is one thing a channel set up (an exchange, a queue, a binding,
+	// a consumer, a mode), with how to set it up again on a new channel.
+	struct Step {
+		key  string
+		redo def (Session, Lane) !none
+	}
+
+	// Session is a channel across connections: the lane it runs on now and
+	// the steps that bring a new lane to the same state.
+	type Session {
+		hub           Hub
+		atomic lane   Lane
+		atomic steps  Step[]              = []
+		// The current name of each queue the broker named, by the name it
+		// had when it was declared.
+		atomic names  map<string, string>
+		atomic feeds  Feed[]              = []
+		atomic closed bool                = false
+
+		def new(hub Hub, lane Lane) {
+			self.hub = hub
+			self.lane = lane
+		}
+
+		// keep records a step, in the place of the one with the same key
+		// when there is one: steps are done again in the order they were
+		// first done.
+		atomic def keep(key string, redo def (Session, Lane) !none) {
+			for let (i, step) in steps {
+				if step.key == key {
+					steps[i] = Step{key: key, redo: redo}
+					return
+				}
+			}
+			steps.push(Step{key: key, redo: redo})
+		}
+
+		// forget drops the steps whose key starts with one of the
+		// prefixes, or holds one of them between bars: the bindings of an
+		// exchange or a queue that is gone.
+		atomic def forget(marks ...string) {
+			let kept Step[] = []
+			for let step in steps {
+				let gone = false
+				for let mark in marks {
+					gone = true when step.key == mark || step.key.startsWith("{mark}|") || step.key.contains("|{mark}|") || step.key.endsWith("|{mark}")
+				}
+				kept.push(step) unless gone
+			}
+			steps = kept
+		}
+
+		atomic def rename(first string, now string) {
+			names[first] = now
+		}
+
+		// The name a queue has now: its own, unless the broker named it
+		// and has named it anew since.
+		atomic def current(queue string) string {
+			let now = names.get(queue)
+			return queue when now is none
+			return now
+		}
+
+		atomic def watch(feed Feed) {
+			feeds.push(feed)
+		}
+
+		atomic def unwatch(tag string) {
+			feeds = feeds.filter(f => f.tag != tag)
+		}
+
+		atomic def copySteps() Step[] {
+			return steps.clone()
+		}
+
+		atomic def takeFeeds() Feed[] {
+			let all = feeds
+			feeds = []
+			return all
+		}
+
+		// restore brings a new lane to the state the steps describe and
+		// makes it the session's.
+		// Fails with an AmqpError as the calls of the steps do.
+		def restore(next Lane) !none {
+			next.keep = true
+			next.onReturn = lane.onReturn
+			lane = next
+			for let step in copySteps() {
+				let redo = step.redo
+				try redo(self, next)
+			}
+			return none
+		}
+
+		// end closes the session for good: its consumers learn why.
+		def end(err error) {
+			closed = true
+			for let feed in takeFeeds() {
+				feed.stop(err)
+			}
+			hub.drop(self)
+		}
+	}
+
+	// Hub is a connection across its links: where it goes, the link it
+	// has now, and its sessions.
+	type Hub {
+		target            Target
+		// Come back after a broken connection.
+		reconnect         bool
+		// The first pause before a try; it doubles up to 30 seconds.
+		pause             duration
+		onReconnect       ?def ()   = none
+		atomic link       Link
+		atomic sessions   Session[] = []
+		atomic closed     bool      = false
+		atomic recovering bool      = false
+
+		def new(target Target, link Link, reconnect bool, pause duration) {
+			self.target = target
+			self.link = link
+			self.reconnect = reconnect
+			self.pause = pause
+			listen(link)
+		}
+
+		def listen(to Link) {
+			to.onLost = def (err error) {
+				lost(err)
+			}
+		}
+
+		// open opens a channel on the current link.
+		// Fails with an AmqpError as `Link.openLane` does.
+		def open() !Session {
+			let lane = try link.openLane()
+			lane.keep = reconnect
+			let session = new Session(self, lane)
+			add(session)
+			return session
+		}
+
+		atomic def add(session Session) {
+			sessions.push(session)
+		}
+
+		atomic def drop(session Session) {
+			sessions = sessions.filter(s => s != session)
+		}
+
+		atomic def copySessions() Session[] {
+			return sessions.clone()
+		}
+
+		atomic def claim() bool {
+			return false when recovering || closed || !reconnect
+			recovering = true
+			return true
+		}
+
+		// The link broke: without `reconnect` every session ends; with it a
+		// task goes looking for the broker.
+		def lost(err error) {
+			if !reconnect || closed {
+				for let session in copySessions() {
+					session.end(err)
+				}
+				return
+			}
+			if claim() {
+				let task = async comeBack()
+				task.keepAlive()
+			}
+		}
+
+		// The task that dials until the broker answers, then restores
+		// every session. A broker that refuses the login ends them all.
+		def comeBack() {
+			let wait = pause
+			for !closed {
+				time.sleep(wait)
+				wait = wait + wait < 30s ?? (wait + wait, 30s)
+				break when closed
+				let refused ?error = none
+				let next = redial() onerror (err error) {
+					let final = false
+					final = err.kind == ErrorKind.Denied when err is AmqpError
+					refused = err when final
+					recover none
+				}
+				if !(refused is none) {
+					for let session in copySessions() {
+						session.end(refused)
+					}
+					break
+				}
+				continue when next is none
+				link = next
+				for let session in copySessions() {
+					continue when session.closed
+					let failed ?error = none
+					renew(session, next) onerror (err error) {
+						failed = err
+						recover none
+					}
+					continue when failed is none
+					// A channel the broker will not restore (a queue that
+					// is gone, a permission) ends; a link that broke again
+					// is tried again from the start.
+					break unless next.isOpen()
+					session.end(failed)
+				}
+				continue unless next.isOpen()
+				recovering = false
+				listen(next)
+				// Lost again while the handler was not yet set.
+				if !next.isOpen() {
+					recovering = true
+					continue
+				}
+				let tell = onReconnect
+				tell() unless tell is none
+				return
+			}
+			recovering = false
+		}
+
+		def redial() !?Link {
+			return try dial(target)
+		}
+
+		def renew(session Session, next Link) !none {
+			return try session.restore(try next.openLane())
+		}
+
+		// close ends every session and the link. Never fails.
+		def close() {
+			closed = true
+			let ended = errorOf(ErrorKind.Closed, "amqp: the connection is closed")
+			for let session in copySessions() {
+				session.end(ended)
+			}
+			link.close()
+		}
+	}
+}

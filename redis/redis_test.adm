@@ -2,6 +2,9 @@
 // without running. See README.md for the server they expect.
 partial module adm.network.redis {
 	use (
+		std.crypto.x509::(CertPool)
+		std.net.tls
+		std.os
 		std.testing
 		std.time
 	)
@@ -9,6 +12,18 @@ partial module adm.network.redis {
 	// The server's address as `host:port`. The tests empty its database 9.
 	@env("ADM_TEST_REDIS")
 	internal const testServer string
+
+	// A server that takes TLS, as `host:port`, the folder with its
+	// `ca.pem`, and the path of its Unix socket; `testservers/tls.sh`
+	// starts one.
+	@env("ADM_TEST_REDIS_TLS")
+	internal const testSecure string
+
+	@env("ADM_TEST_REDIS_CERTS")
+	internal const testCerts string
+
+	@env("ADM_TEST_REDIS_SOCKET")
+	internal const testSocket string
 
 	// A client on an emptied database 9.
 	def fresh(options string = "") !Client {
@@ -637,6 +652,132 @@ partial module adm.network.redis {
 				assert after == ErrorKind.Closed
 				try r.close()
 			}
+		}
+	}
+
+	check "Leftovers" {
+		@test()
+		def TestScoreBounds() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			try r.zadd("z", {"a": 1.0, "b": 2.0, "c": 3.0, "d": 4.0})
+			assert (try r.zcount("z", 1.0, 4.0)) == 4
+			assert (try r.zcount("z", 1.0, 4.0, Bounds.OpenMin)) == 3
+			assert (try r.zcount("z", 1.0, 4.0, Bounds.OpenMax)) == 3
+			assert (try r.zcount("z", 1.0, 4.0, Bounds.Open)) == 2
+			let inner = try r.zrangeByScore("z", 1.0, 4.0, bounds = Bounds.Open)
+			assert inner.len() == 2 && inner[0].member == "b" && inner[1].member == "c"
+			let down = try r.zrangeByScore("z", 1.0, 4.0, reverse = true, bounds = Bounds.OpenMax)
+			assert down.len() == 3 && down[0].member == "c"
+			assert (try r.zremRangeByScore("z", 2.0, 4.0, Bounds.OpenMin)) == 2
+			assert (try r.zcard("z")) == 2
+			try r.close()
+		}
+
+		@test()
+		def TestSecureAndSocket() !none {
+			if testSecure != "" && testCerts != "" {
+				let pool = new CertPool()
+				pool.appendCertsFromPEM(string(try os.readFile("{testCerts}/ca.pem")))
+				let r = new Client()
+				r.tls = tls.Config{serverName: "localhost", rootCAs: pool}
+				try r.connect("rediss://{testSecure}/3")
+				try r.set("tls:key", "under TLS")
+				assert text(try r.get("tls:key")) == "under TLS"
+				let p = r.pipeline()
+				for let i = 0; i < 200; i++ {
+					try p.add("INCR", "tls:n")
+				}
+				assert (try p.run())[199].toInt() >= 200
+				let sub = try r.subscribe("tls:news")
+				try r.publish("tls:news", "sealed")
+				let m = try sub.receive(5s)
+				fail "no message under TLS" when m is none
+				assert m.text() == "sealed"
+				try sub.close()
+				try r.del("tls:key", "tls:n")
+				try r.close()
+				// An authority the client does not trust.
+				let kind = ErrorKind.Server
+				connect("rediss://{testSecure}") onerror (err error) {
+					kind = kindOfFailure(err)
+					recover new Client()
+				}
+				assert kind == ErrorKind.Connection
+			}
+			if testSocket != "" {
+				let r = try connect("unix://{testSocket}?db=2")
+				try r.set("sock:key", "by socket")
+				assert text(try r.get("sock:key")) == "by socket"
+				assert (try r.command("CLIENT", "INFO")).text().contains("db=2")
+				let tx = try r.multi()
+				try tx.queue("INCR", "sock:n")
+				assert (try tx.exec()).len() == 1
+				try r.del("sock:key", "sock:n")
+				try r.close()
+			}
+			return none
+		}
+
+		@test()
+		def TestTracking() !none {
+			return none when testServer == ""
+			let r = try fresh()
+			let other = try fresh()
+			// The server remembers what this client read.
+			let changes = try r.track()
+			try r.set("t:name", "Ana")
+			assert text(try r.get("t:name")) == "Ana"
+			assert (try changes.receive(200ms)) is none
+			try other.set("t:name", "Bea")
+			let keys = try changes.receive(5s)
+			fail "no invalidation" when keys is none
+			assert keys.len() == 1 && keys[0] == "t:name"
+			// Told once per read: nothing more until it is read again.
+			try other.set("t:name", "Cora")
+			assert (try changes.receive(200ms)) is none
+			assert text(try r.get("t:name")) == "Cora"
+			try other.del("t:name")
+			let again = try changes.receive(5s)
+			fail "no second invalidation" when again is none
+			assert again[0] == "t:name"
+			try changes.close()
+			let kind = ErrorKind.Server
+			changes.receive(100ms) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			assert text(try r.get("t:name")) == "(none)"
+
+			// Every change under a prefix, read or not.
+			let wide = try r.track("user:", "cart:")
+			try other.set("user:7", "x")
+			try other.set("order:7", "x")
+			try other.set("cart:7", "x")
+			let seen string[] = []
+			for let i = 0; i < 2; i++ {
+				let part = try wide.receive(5s)
+				fail "no broadcast invalidation" when part is none
+				seen.push(...part)
+			}
+			assert seen.sort((a, b) => a < b).join(",") == "cart:7,user:7"
+			try other.command("FLUSHDB")
+			let all = try wide.receive(5s)
+			fail "no flush invalidation" when all is none
+			assert all.len() == 0
+			try wide.close()
+
+			let old = try fresh("?protocol=2")
+			kind = ErrorKind.Server
+			old.track() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover changes
+			}
+			assert kind == ErrorKind.Argument
+			try old.close()
+			try other.close()
+			try r.close()
 		}
 	}
 }

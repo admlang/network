@@ -1,0 +1,99 @@
+partial module adm.network.amqp {
+	use std.time
+
+	// Message is what a publisher sends and a consumer gets: a body and
+	// the properties that travel with it.
+	//
+	// `headers`, like every table of this library, holds booleans,
+	// integers, floats, text, bytes, `time.Time`, `Decimal`, none, arrays
+	// (`any[]`) and tables (`map<string, any>`) of those.
+	struct Message {
+		body            byte[]           = []
+		// The MIME type of the body ("application/json").
+		contentType     string           = ""
+		// How the body is encoded on top of its type ("gzip").
+		contentEncoding string           = ""
+		headers         map<string, any> = {}
+		// A persistent message of a durable queue survives a restart of
+		// the broker.
+		persistent      bool             = false
+		// 0 to 9, or up to the queue's `x-max-priority`; -1 leaves it out.
+		priority        int              = -1
+		// What a reply repeats so the requester can tell which request
+		// it answers.
+		correlationId   string           = ""
+		// The queue a reply goes to.
+		replyTo         string           = ""
+		// How long the message may wait in a queue before the broker
+		// drops it; 0s keeps it until consumed.
+		expires         duration         = 0s
+		messageId       string           = ""
+		// When the message was made, to the second.
+		timestamp       ?time.Time       = none
+		// A name for what the message is, chosen by the application (the
+		// protocol's `type` property).
+		kind            string           = ""
+		// The user who published; the broker refuses a name that is not
+		// the connection's.
+		userId          string           = ""
+		appId           string           = ""
+	}
+
+	// Decimal is the protocol's decimal value in a table: `value` with its
+	// last `scale` digits after the point.
+	struct Decimal {
+		scale int
+		value int
+	}
+
+	// Returned is a message the broker sent back: published as mandatory
+	// and routed to no queue, or as immediate with no consumer ready.
+	struct Returned {
+		message    Message
+		// 312 (NO_ROUTE) or 313 (NO_CONSUMERS).
+		replyCode  int
+		replyText  string
+		exchange   string
+		routingKey string
+	}
+
+	// QueueInfo is what the broker says about a queue it declared.
+	struct QueueInfo {
+		// The queue's name: the one asked for, or the one the broker made
+		// up for an empty name.
+		name      string
+		// Messages ready to be delivered.
+		messages  int
+		consumers int
+	}
+
+	// ExchangeKind is how an exchange routes a message to its queues.
+	enum ExchangeKind {
+		// To the queues bound with the message's routing key.
+		Direct  = "direct",
+		// To every bound queue.
+		Fanout  = "fanout",
+		// To the queues whose binding pattern matches the routing key
+		// (`orders.*.paid`, `logs.#`).
+		Topic   = "topic",
+		// To the queues whose binding arguments match the message's
+		// headers.
+		Headers = "headers",
+	}
+
+	// Auth is how a connection proves who it is.
+	enum Auth {
+		// User and password (SASL PLAIN).
+		Plain,
+		// User and password in the protocol's own table form.
+		AMQPlain,
+		// The TLS client certificate names the user; needs the broker's
+		// certificate authentication.
+		External,
+	}
+
+	// text returns a message body as text.
+	def text(m Message) string {
+		return string(m.body)
+	}
+}

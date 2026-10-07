@@ -1,0 +1,206 @@
+// Requests about topics, offsets and groups that the client, the
+// producer and the consumer share.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.time
+		adm.network.kafka::*
+	)
+
+	// The offset ListOffsets is asked for by these timestamps.
+	const (
+		offsetLatest   = -1
+		offsetEarliest = -2
+	)
+
+	// offsetFor asks the leader of a partition for the offset of the first
+	// record at or after a timestamp in milliseconds, or for its first
+	// (`offsetEarliest`) or next (`offsetLatest`) offset; -1 when no record
+	// is that late.
+	// Fails with a KafkaError: ErrorKind.NotFound for a topic or partition
+	// that does not exist, ErrorKind.TimedOut when the partition stays
+	// without a leader, and as `Cluster.conn` and `Broker.call` do.
+	def offsetFor(cluster Cluster, purpose string, name string, partition int, timestamp int, committedOnly bool = false) !int {
+		let deadline = time.now() + cluster.login.timeout
+		let fresh = false
+		for {
+			let ask = new Encoder()
+			ask.i32(-1)
+			ask.i8(committedOnly ?? (1, 0))
+			ask.count(1)
+			ask.text(name)
+			ask.count(1)
+			ask.i32(partition)
+			ask.i32(-1)
+			ask.i64(timestamp)
+			let broker = try cluster.conn(try cluster.leader(name, partition, fresh), purpose)
+			let answer = try broker.call(apiListOffsets, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			try answer.count()
+			try answer.i32()
+			let code = try answer.i16()
+			try answer.i64()
+			let offset = try answer.i64()
+			return offset when code == 0
+			fail brokerError(code, "the offsets of '{name}' partition {partition}") unless retriable(code)
+			fail errorOf(ErrorKind.TimedOut, "kafka: '{name}' partition {partition} has no leader that answers after {cluster.login.timeout}", code) when time.now() > deadline
+			fresh = true
+			time.sleep(100ms)
+		}
+		fail errorOf(ErrorKind.Protocol, "kafka: no offset")
+	}
+
+	// committedOffsets asks a group's coordinator for the offsets the
+	// group committed for partitions of a topic; a partition without one
+	// is left out.
+	// Fails with a KafkaError as `Cluster.coordinator`, `Cluster.conn` and
+	// `Broker.call` do, and with the coordinator's error.
+	def committedOffsets(cluster Cluster, purpose string, group string, name string, partitions int[]) !map<int, int> {
+		let deadline = time.now() + cluster.login.timeout
+		for {
+			let ask = new Encoder()
+			ask.text(group)
+			ask.count(1)
+			ask.text(name)
+			ask.ints(partitions)
+			let broker = try cluster.conn(try cluster.coordinator(group, 0), purpose)
+			let answer = try broker.call(apiOffsetFetch, ask)
+			try answer.i32()
+			let out map<int, int> = {}
+			let worst = 0
+			for let t = try answer.count(); t > 0; t-- {
+				try answer.text()
+				for let p = try answer.count(); p > 0; p-- {
+					let index = try answer.i32()
+					let offset = try answer.i64()
+					try answer.i32()
+					try answer.maybe()
+					let code = try answer.i16()
+					worst = code when code != 0
+					out[index] = offset when code == 0 && offset >= 0
+				}
+			}
+			let code = try answer.i16()
+			worst = code when code != 0
+			return out when worst == 0
+			fail brokerError(worst, "the committed offsets of group '{group}'") unless retriable(worst)
+			fail errorOf(ErrorKind.TimedOut, "kafka: the coordinator of group '{group}' did not answer within {cluster.login.timeout}", worst) when time.now() > deadline
+			time.sleep(100ms)
+		}
+		fail errorOf(ErrorKind.Protocol, "kafka: no offsets")
+	}
+
+	// What a member of a consumer group says or is told about its
+	// partitions: topics and, in an assignment, the partitions of each.
+	struct Share {
+		topics     string[]
+		partitions map<string, int[]>
+	}
+
+	// Wish is what a member tells its group when it joins: the topics it
+	// wants, and the partitions it holds from the round before with the
+	// number of that round (-1 when it does not say).
+	struct Wish {
+		topics     string[]
+		owned      map<string, int[]>
+		generation int                = -1
+	}
+
+	// The bytes of a consumer's subscription. `sticky` repeats what it
+	// holds in the form the `sticky` strategy of Kafka's Java client reads.
+	def subscriptionOf(topics string[], owned map<string, int[]>, generation int, sticky bool) byte[] {
+		let e = new Encoder()
+		e.i16(2)
+		e.texts(topics)
+		if sticky {
+			let held = new Encoder()
+			held.count(owned.len())
+			for let (name, parts) in owned {
+				held.text(name)
+				held.ints(parts)
+			}
+			held.i32(generation)
+			e.bytes(held.data)
+		} else {
+			e.i32(-1)
+		}
+		e.count(owned.len())
+		for let (name, parts) in owned {
+			e.text(name)
+			e.ints(parts)
+		}
+		e.i32(generation)
+		return e.data
+	}
+
+	// A member's subscription, of any version: an older one says less.
+	def subscriptionIn(raw byte[]) !Wish {
+		let wish = Wish{}
+		return wish when raw.len() == 0
+		let d = new Decoder(raw)
+		let version = try d.i16()
+		wish.topics = try d.texts()
+		let extra = try d.bytes()
+		if version >= 1 && d.left() >= 4 {
+			for let n = try d.count(); n > 0; n-- {
+				let name = try d.text()
+				wish.owned[name] = try d.ints()
+			}
+		}
+		wish.generation = try d.i32() when version >= 2 && d.left() >= 4
+		if wish.owned.len() == 0 && extra.len() >= 4 {
+			// What the `sticky` strategy keeps in its own corner.
+			let held = new Decoder(extra)
+			let failed = false
+			let count = held.count() onerror (err error) {
+				failed = true
+				recover 0
+			}
+			for let n = count; n > 0 && !failed; n-- {
+				let name = held.text() onerror (err error) {
+					failed = true
+					recover ""
+				}
+				let parts = held.ints() onerror (err error) {
+					failed = true
+					recover int[]
+				}
+				wish.owned[name] = parts unless failed
+			}
+			if !failed && held.left() >= 4 && wish.generation < 0 {
+				wish.generation = held.i32() onerror recover -1
+			}
+			if failed {
+				let nothing map<string, int[]> = {}
+				wish.owned = nothing
+			}
+		}
+		return wish
+	}
+
+	// The bytes of a consumer's assignment (the partitions it gets).
+	def assignmentOf(parts map<string, int[]>) byte[] {
+		let e = new Encoder()
+		e.i16(0)
+		e.count(parts.len())
+		for let (name, indexes) in parts {
+			e.text(name)
+			e.ints(indexes)
+		}
+		e.i32(-1)
+		return e.data
+	}
+
+	def assignmentIn(raw byte[]) !map<string, int[]> {
+		let out map<string, int[]> = {}
+		return out when raw.len() == 0
+		let d = new Decoder(raw)
+		try d.i16()
+		for let n = try d.count(); n > 0; n-- {
+			let name = try d.text()
+			out[name] = try d.ints()
+		}
+		return out
+	}
+}

@@ -1,0 +1,454 @@
+partial module adm.network.amqp {
+	use adm.network.amqp.wire::*
+
+	// Channel is one conversation with the broker on a connection: it
+	// declares exchanges and queues, publishes and consumes. A connection
+	// carries many; open one per task that waits for answers, since a
+	// channel runs one call at a time.
+	//
+	// The broker closes a channel on an error (a queue that does not exist,
+	// a second acknowledgement): the call that caused it fails with the
+	// broker's reason, every later one with the same, and the connection
+	// stays good for a new channel.
+	//
+	// A channel stays open until `close` or until its connection closes;
+	// letting go of the Channel value does not close it.
+	//
+	// Tables (`arguments`, message headers) hold booleans, integers,
+	// floats, text, bytes, `time.Time`, `Decimal`, none, arrays and tables.
+	type Channel {
+		// Called with every message the broker sends back (published as
+		// mandatory and routed nowhere), on a task of its own.
+		onReturn         ?def (Returned) = none
+		// With `confirms`: whether `publish` waits for the broker's word
+		// on each message. False publishes without waiting; `waitConfirms`
+		// then collects the answers.
+		confirmWait      bool            = true
+		internal session Session
+		// Keeps the connection open for as long as the channel is held.
+		internal owner   Connection
+
+		def new(session Session, owner Connection) {
+			self.session = session
+			self.owner = owner
+		}
+
+		// The channel's number on its connection.
+		def number() int {
+			return session.lane.id
+		}
+
+		// Whether the channel can still be used.
+		def isOpen() bool {
+			return !session.closed && session.lane.isOpen()
+		}
+
+		// ---- exchanges ----
+
+		// declareExchange makes an exchange, or checks that the one that
+		// exists has these properties. `durable` survives a restart of the
+		// broker, `autoDelete` goes away with its last binding, `inner`
+		// takes messages from other exchanges only. `passive` makes
+		// nothing: it fails unless the exchange exists.
+		// Fails with an AmqpError: ErrorKind.Precondition when the exchange
+		// exists with other properties, ErrorKind.NotFound for a passive
+		// declare of a missing one, ErrorKind.Denied without the
+		// permission, and as every channel call does (ErrorKind.Closed,
+		// TimedOut, Connection).
+		def declareExchange(name string, kind ExchangeKind = ExchangeKind.Direct, durable bool = false, autoDelete bool = false, inner bool = false, passive bool = false, arguments map<string, any> = {}) !none {
+			return try declareExchange(name, kind.value, durable, autoDelete, inner, passive, arguments)
+		}
+
+		// declareExchange for a kind a broker plugin adds
+		// ("x-delayed-message", "x-consistent-hash").
+		// Fails as `declareExchange(name, ExchangeKind)` does.
+		def declareExchange(name string, kind string, durable bool = false, autoDelete bool = false, inner bool = false, passive bool = false, arguments map<string, any> = {}) !none {
+			let send = def (s Session, lane Lane) !none {
+				let m = method(exchangeDeclare)
+				m.u16(0)
+				try m.short(name)
+				try m.short(kind)
+				m.bits(passive, durable, autoDelete, inner, false)
+				try m.table(arguments)
+				try lane.call(m.data, exchangeDeclareOk)
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("x|{name}", send) unless passive
+			return none
+		}
+
+		// deleteExchange removes an exchange; with `ifUnused`, only when
+		// nothing is bound to it.
+		// Fails with an AmqpError: ErrorKind.Precondition when it is in use
+		// and `ifUnused` is set, and as every channel call does.
+		def deleteExchange(name string, ifUnused bool = false) !none {
+			let m = method(exchangeDelete)
+			m.u16(0)
+			try m.short(name)
+			m.bits(ifUnused, false)
+			try session.lane.call(m.data, exchangeDeleteOk)
+			session.forget("x|{name}", "x:{name}")
+			return none
+		}
+
+		// bindExchange makes `destination` receive what `source` routes
+		// with `key`.
+		// Fails with an AmqpError: ErrorKind.NotFound when either exchange
+		// is missing, and as every channel call does.
+		def bindExchange(destination string, source string, key string = "", arguments map<string, any> = {}) !none {
+			let send = def (s Session, lane Lane) !none {
+				let m = method(exchangeBind)
+				m.u16(0)
+				try m.short(destination)
+				try m.short(source)
+				try m.short(key)
+				m.bits(false)
+				try m.table(arguments)
+				try lane.call(m.data, exchangeBindOk)
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("b|x:{destination}|x:{source}|k:{key}|{arguments.len()}", send)
+			return none
+		}
+
+		// unbindExchange removes a binding `bindExchange` made, named by
+		// the same key and arguments.
+		// Fails with an AmqpError as every channel call does.
+		def unbindExchange(destination string, source string, key string = "", arguments map<string, any> = {}) !none {
+			let m = method(exchangeUnbind)
+			m.u16(0)
+			try m.short(destination)
+			try m.short(source)
+			try m.short(key)
+			m.bits(false)
+			try m.table(arguments)
+			try session.lane.call(m.data, exchangeUnbindOk)
+			session.forget("b|x:{destination}|x:{source}|k:{key}|{arguments.len()}")
+			return none
+		}
+
+		// ---- queues ----
+
+		// declareQueue makes a queue, or checks that the one that exists
+		// has these properties, and says how full it is. An empty name
+		// asks the broker for one. `durable` survives a restart of the
+		// broker, `exclusive` belongs to this connection and goes with it,
+		// `autoDelete` goes away with its last consumer. `passive` makes
+		// nothing: it fails unless the queue exists. `arguments` carries
+		// the broker's own settings (`x-queue-type`, `x-message-ttl`,
+		// `x-dead-letter-exchange`, `x-max-length`).
+		// Fails with an AmqpError: ErrorKind.Precondition when the queue
+		// exists with other properties, ErrorKind.NotFound for a passive
+		// declare of a missing one, ErrorKind.Locked when another
+		// connection has it exclusively, and as every channel call does.
+		def declareQueue(name string = "", durable bool = false, exclusive bool = false, autoDelete bool = false, passive bool = false, arguments map<string, any> = {}) !QueueInfo {
+			let info = QueueInfo{}
+			let send = def (s Session, lane Lane) !none {
+				let m = method(queueDeclare)
+				m.u16(0)
+				// A queue the broker named is named anew by each broker.
+				try m.short(name == "" ?? ("", s.current(name)))
+				m.bits(passive, durable, exclusive, autoDelete, false)
+				try m.table(arguments)
+				let reply = try lane.call(m.data, queueDeclareOk)
+				let given = try reply.args.short()
+				s.rename(info.name, given) when name == "" && info.name != ""
+				info.name = given when info.name == ""
+				info.messages = try reply.args.u32()
+				info.consumers = try reply.args.u32()
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("q|q:{info.name}", send) unless passive
+			return info
+		}
+
+		// bindQueue makes a queue receive what an exchange routes with
+		// `key`.
+		// Fails with an AmqpError: ErrorKind.NotFound when the queue or the
+		// exchange is missing, and as every channel call does.
+		def bindQueue(queue string, exchange string, key string = "", arguments map<string, any> = {}) !none {
+			let send = def (s Session, lane Lane) !none {
+				let m = method(queueBind)
+				m.u16(0)
+				try m.short(s.current(queue))
+				try m.short(exchange)
+				try m.short(key)
+				m.bits(false)
+				try m.table(arguments)
+				try lane.call(m.data, queueBindOk)
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("b|q:{queue}|x:{exchange}|k:{key}|{arguments.len()}", send)
+			return none
+		}
+
+		// unbindQueue removes a binding `bindQueue` made, named by the same
+		// key and arguments.
+		// Fails with an AmqpError as every channel call does.
+		def unbindQueue(queue string, exchange string, key string = "", arguments map<string, any> = {}) !none {
+			let m = method(queueUnbind)
+			m.u16(0)
+			try m.short(session.current(queue))
+			try m.short(exchange)
+			try m.short(key)
+			try m.table(arguments)
+			try session.lane.call(m.data, queueUnbindOk)
+			session.forget("b|q:{queue}|x:{exchange}|k:{key}|{arguments.len()}")
+			return none
+		}
+
+		// purgeQueue drops the messages of a queue that wait for delivery
+		// and returns how many they were.
+		// Fails with an AmqpError: ErrorKind.NotFound for a missing queue,
+		// and as every channel call does.
+		def purgeQueue(queue string) !int {
+			let m = method(queuePurge)
+			m.u16(0)
+			try m.short(session.current(queue))
+			m.bits(false)
+			let reply = try session.lane.call(m.data, queuePurgeOk)
+			return try reply.args.u32()
+		}
+
+		// deleteQueue removes a queue and returns how many messages it
+		// held; with `ifUnused` only when it has no consumers, with
+		// `ifEmpty` only when it holds no messages.
+		// Fails with an AmqpError: ErrorKind.Precondition when a condition
+		// does not hold, and as every channel call does.
+		def deleteQueue(queue string, ifUnused bool = false, ifEmpty bool = false) !int {
+			let m = method(queueDelete)
+			m.u16(0)
+			try m.short(session.current(queue))
+			m.bits(ifUnused, ifEmpty, false)
+			let reply = try session.lane.call(m.data, queueDeleteOk)
+			session.forget("q|q:{queue}", "q:{queue}")
+			return try reply.args.u32()
+		}
+
+		// ---- publishing ----
+
+		// publish sends a message to an exchange with a routing key; the
+		// exchange "" delivers straight to the queue the key names.
+		// `mandatory` asks for the message back when no queue takes it,
+		// `immediate` when no consumer is ready (RabbitMQ refuses it).
+		//
+		// After `confirms` it returns once the broker took the message
+		// (unless `confirmWait` is false). Without confirms it returns when
+		// the message is written, and what the broker does not take is
+		// lost or comes to `onReturn`.
+		// Fails with an AmqpError: with confirms, ErrorKind.Unroutable for
+		// a mandatory message that came back and ErrorKind.Refused when
+		// the broker refuses it; ErrorKind.Argument for a name or a header
+		// that cannot be sent; ErrorKind.TimedOut when the confirm does
+		// not come; and with what closed the channel.
+		def publish(exchange string, routingKey string, message Message, mandatory bool = false, immediate bool = false) !none {
+			session.lane.onReturn = onReturn
+			return try session.lane.publish(exchange, routingKey, message, mandatory, immediate, confirmWait)
+		}
+
+		// publish of bytes with no properties.
+		// Fails as `publish(exchange, routingKey, Message)` does.
+		def publish(exchange string, routingKey string, body byte[], mandatory bool = false, immediate bool = false) !none {
+			return try publish(exchange, routingKey, Message{body: body}, mandatory, immediate)
+		}
+
+		// publish of text, as `text/plain`.
+		// Fails as `publish(exchange, routingKey, Message)` does.
+		def publish(exchange string, routingKey string, text string, mandatory bool = false, immediate bool = false) !none {
+			return try publish(exchange, routingKey, Message{body: text.bytes(), contentType: "text/plain"}, mandatory, immediate)
+		}
+
+		// confirms turns publisher confirms on: from now on the broker
+		// answers for every message published on the channel. It cannot be
+		// combined with `selectTx`.
+		// Fails with an AmqpError as every channel call does.
+		def confirms() !none {
+			return none when session.lane.confirming
+			let send = def (s Session, lane Lane) !none {
+				let m = method(confirmSelect)
+				m.bits(false)
+				try lane.call(m.data, confirmSelectOk)
+				lane.confirming = true
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("mode", send)
+			return none
+		}
+
+		// waitConfirms returns when the broker has answered for every
+		// message published so far, waiting up to `timeout` (0s without
+		// end).
+		// Fails with an AmqpError: ErrorKind.Refused when it refused any
+		// since the last call, ErrorKind.TimedOut when the wait ends first,
+		// and with what closed the channel.
+		def waitConfirms(timeout duration = 0s) !none {
+			return try session.lane.waitConfirms(timeout)
+		}
+
+		// ---- consuming ----
+
+		// qos limits what the broker sends ahead of acknowledgements:
+		// `prefetch` deliveries, and `size` bytes of bodies (0: no limit;
+		// RabbitMQ takes only 0). The limit holds for each consumer opened
+		// afterwards, or with `global` for the channel as a whole.
+		// Fails with an AmqpError as every channel call does.
+		def qos(prefetch int, size int = 0, global bool = false) !none {
+			fail errorOf(ErrorKind.Argument, "amqp: a prefetch of {prefetch} is not between 0 and 65535") when prefetch < 0 || prefetch > 65535
+			let send = def (s Session, lane Lane) !none {
+				let m = method(basicQos)
+				m.u32(size)
+				m.u16(prefetch)
+				m.bits(global)
+				try lane.call(m.data, basicQosOk)
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("qos|{global}", send)
+			return none
+		}
+
+		// consume subscribes to a queue and returns the consumer its
+		// deliveries are read from with `next`. With `autoAck` the broker
+		// counts a message as done when it sends it; `exclusive` refuses
+		// other consumers on the queue; `tag` names the consumer (the
+		// client makes one up for ""); `arguments` carries the broker's
+		// own settings (`x-priority`, `x-stream-offset`).
+		// Fails with an AmqpError: ErrorKind.NotFound for a missing queue,
+		// ErrorKind.Denied when the queue is taken exclusively,
+		// ErrorKind.Argument for a tag in use on the channel, and as every
+		// channel call does.
+		def consume(queue string, autoAck bool = false, exclusive bool = false, noLocal bool = false, tag string = "", arguments map<string, any> = {}) !Consumer {
+			return try subscribe(queue, none, autoAck, exclusive, noLocal, tag, arguments)
+		}
+
+		// consume with a handler: each delivery is passed to it on a task
+		// of the consumer's own, one at a time, so the handler may call the
+		// channel and wait.
+		// Fails as `consume(queue)` does.
+		def consume(queue string, handler def (Delivery), autoAck bool = false, exclusive bool = false, noLocal bool = false, tag string = "", arguments map<string, any> = {}) !Consumer {
+			return try subscribe(queue, handler, autoAck, exclusive, noLocal, tag, arguments)
+		}
+
+		internal def subscribe(queue string, handler ?def (Delivery), autoAck bool, exclusive bool, noLocal bool, tag string, arguments map<string, any>) !Consumer {
+			let name = tag == "" ?? (session.lane.freshTag(), tag)
+			let feed = new Feed(name, handler)
+			let send = def (s Session, lane Lane) !none {
+				// A consumer the broker cancelled stays cancelled.
+				return none unless feed.ended is none
+				// The consumer is in place before the broker hears of it: the
+				// first delivery may come right behind the answer.
+				fail errorOf(ErrorKind.Argument, "amqp: the channel already has a consumer with the tag '{name}'") unless lane.addFeed(feed)
+				let m = method(basicConsume)
+				m.u16(0)
+				try m.short(s.current(queue))
+				try m.short(name)
+				m.bits(noLocal, autoAck, exclusive, false)
+				try m.table(arguments)
+				lane.call(m.data, basicConsumeOk) onerror (err error) {
+					lane.dropFeed(name)
+					fail err
+				}
+				return none
+			}
+			try send(session, session.lane)
+			// After the steps that made its queue: a consumer comes back
+			// last.
+			session.keep("c|{name}|q:{queue}", send)
+			session.watch(feed)
+			return new Consumer(session, feed, queue, self)
+		}
+
+		// get takes one message from a queue, or none when it is empty.
+		// With `autoAck` the broker counts it as done at once.
+		// Fails with an AmqpError: ErrorKind.NotFound for a missing queue,
+		// and as every channel call does.
+		def get(queue string, autoAck bool = false) !?Delivery {
+			let m = method(basicGet)
+			m.u16(0)
+			try m.short(session.current(queue))
+			m.bits(autoAck)
+			let reply = try session.lane.call(m.data, basicGetOk, basicGetEmpty)
+			return reply.delivery
+		}
+
+		// redeliver asks the broker to send again every delivery of the
+		// channel that was not acknowledged; with `requeue` they go back
+		// to their queues and may reach another consumer.
+		// Fails with an AmqpError as every channel call does.
+		def redeliver(requeue bool = true) !none {
+			let m = method(basicRecover)
+			m.bits(requeue)
+			try session.lane.call(m.data, basicRecoverOk)
+			return none
+		}
+
+		// ---- transactions ----
+
+		// selectTx makes the channel transactional: what it publishes and
+		// acknowledges from now on takes effect at `commitTx`. It cannot be
+		// combined with `confirms`.
+		// Fails with an AmqpError as every channel call does.
+		def selectTx() !none {
+			let send = def (s Session, lane Lane) !none {
+				try lane.call(method(txSelect).data, txSelectOk)
+				return none
+			}
+			try send(session, session.lane)
+			session.keep("mode", send)
+			return none
+		}
+
+		// commitTx makes the publishes and acknowledgements since the last
+		// commit or rollback take effect, and starts the next transaction.
+		// Fails with an AmqpError: ErrorKind.Precondition on a channel that
+		// is not transactional, and as every channel call does.
+		def commitTx() !none {
+			try session.lane.call(method(txCommit).data, txCommitOk)
+			return none
+		}
+
+		// rollbackTx drops the publishes and acknowledgements since the
+		// last commit or rollback. Deliveries whose acknowledgement was
+		// dropped are not sent again by it; `redeliver` asks for them.
+		// Fails with an AmqpError as `commitTx` does.
+		def rollbackTx() !none {
+			try session.lane.call(method(txRollback).data, txRollbackOk)
+			return none
+		}
+
+		// ---- flow and close ----
+
+		// flow asks the broker to stop (`false`) or resume sending
+		// deliveries on the channel. RabbitMQ does not stop a channel: it
+		// closes the connection (540, NOT_IMPLEMENTED); `qos` is its way to
+		// hold deliveries back.
+		// Fails with an AmqpError as every channel call does.
+		def flow(active bool) !none {
+			let m = method(channelFlow)
+			m.bits(active)
+			try session.lane.call(m.data, channelFlowOk)
+			return none
+		}
+
+		// close ends the channel: its consumers stop, and the broker hands
+		// its unacknowledged deliveries to others. Never fails.
+		def close() !none {
+			session.lane.close()
+			session.end(errorOf(ErrorKind.Closed, "amqp: the channel is closed"))
+			return none
+		}
+
+		// queueName is the name a queue has now. A queue the broker named
+		// gets a new name when the connection comes back; the channel's
+		// own calls take the first name on, but a message published to the
+		// default exchange is routed by the current one.
+		def queueName(queue string) string {
+			return session.current(queue)
+		}
+	}
+}

@@ -1,0 +1,229 @@
+partial module adm.network.redis {
+	use (
+		std.time
+		adm.network.redis.resp::*
+	)
+
+	// Tracker tells a program which keys changed on the server, so that
+	// it can keep copies of values and drop the ones that went stale
+	// (client-side caching). It holds a connection of its own to every
+	// server that holds keys.
+	//
+	// ```
+	// let changes = try r.track()
+	// let name = try r.get("user:7:name")          // the server remembers who read it
+	// cache["user:7:name"] = name
+	// ...
+	// let keys = try changes.receive(1s)           // ?string[]: none after a second
+	// ...                                          // drop the copies of those keys
+	// ```
+	type Tracker {
+		internal link           Link
+		internal prefixes       string[]
+		internal timeout        duration
+		internal atomic conns   Conn[]        = []
+		internal atomic watched Pool[]        = []
+		internal atomic events  string[][]    = []
+		// A connection broke: invalidations may have been missed.
+		internal atomic lost    bool          = false
+		internal atomic epoch   int           = 0
+		internal atomic closed  bool          = false
+		internal signal         channel<none>
+
+		def new(link Link, prefixes string[], timeout duration) {
+			self.link = link
+			self.prefixes = prefixes
+			self.timeout = timeout
+			signal = new channel<none>(1)
+		}
+
+		// receive returns the keys of the next invalidation, waiting up to
+		// `timeout` for it (0s without end); none when the wait ends first.
+		// An empty list means every key: the server was flushed, or the
+		// tracker lost a connection or the servers changed (a failover, a
+		// cluster that moved its slots to other masters) and started over,
+		// so changes may have been missed.
+		// Fails with a RedisError: ErrorKind.Closed after `close`, and as
+		// `connect` does when the servers cannot be reached again.
+		def receive(timeout duration = 0s) !?string[] {
+			let deadline = time.now() + timeout
+			for {
+				fail errorOf(ErrorKind.Closed, "redis: the tracker is closed") when closed
+				if lost || link.epoch() != epoch {
+					try restart()
+					return []
+				}
+				let keys = take()
+				return keys unless keys is none
+				// Short waits: a change of servers shows between them.
+				let wait = 500ms
+				if timeout > 0s {
+					let left = deadline - time.now()
+					return none when left <= 0s
+					wait = left when left < wait
+				}
+				let sleep = time.sleepChan(wait)
+				select {
+					case signal:
+						signal.flush()
+					case sleep:
+				}
+			}
+			return none
+		}
+
+		// close ends the tracking: the servers forget what the client read.
+		// Never fails.
+		def close() !none {
+			return none when closed
+			closed = true
+			disarm()
+			return none
+		}
+
+		internal atomic def take() ?string[] {
+			return none when events.len() == 0
+			return events.shift()
+		}
+
+		internal atomic def put(keys string[]) {
+			events.push(keys)
+		}
+
+		internal atomic def hold(conn Conn, pool ?Pool) {
+			conns.push(conn)
+			watched.push(pool) unless pool is none
+		}
+
+		internal atomic def release() (Conn[], Pool[]) {
+			let c = conns
+			let p = watched
+			conns = []
+			watched = []
+			events = []
+			return (c, p)
+		}
+
+		// restart opens the tracking connections anew, one to every server
+		// that holds keys. Invalidations between the old connections and
+		// the new ones are missed: drop every copy. `receive` does this by
+		// itself when a connection breaks or the servers change.
+		// Fails with a RedisError as `connect` does, and with the server's
+		// error when it does not track (Redis before 6).
+		def restart() !none {
+			disarm()
+			lost = false
+			epoch = link.epoch()
+			for let pool in try link.pools() {
+				let place = retarget(pool.target, pool.target.host, pool.target.port)
+				place.path = pool.target.path
+				place.database = pool.target.database
+				let conn = try dial(place)
+				let failed ?error = none
+				let id = clientId(conn) onerror (err error) {
+					failed = err
+					recover 0
+				}
+				if failed is none && prefixes.len() > 0 {
+					let args any[] = ["CLIENT", "TRACKING", "ON", "BCAST"]
+					for let prefix in prefixes {
+						args.push("PREFIX", prefix)
+					}
+					let answer = one(conn, timeout, ...args) onerror (err error) {
+						failed = err
+						recover new Value()
+					}
+					failed = serverError(answer.text()) when failed is none && answer.isError()
+				}
+				if !(failed is none) {
+					conn.close()
+					disarm()
+					fail failed
+				}
+				if prefixes.len() > 0 {
+					hold(conn, none)
+				} else {
+					// The server's own connections send what they read to
+					// this one.
+					pool.track(id)
+					hold(conn, pool)
+				}
+				let task = async pump(conn)
+				task.keepAlive()
+			}
+			return none
+		}
+
+		internal def disarm() {
+			let (open, pools) = release()
+			for let pool in pools {
+				pool.track(0)
+			}
+			for let conn in open {
+				conn.close()
+			}
+		}
+
+		// The task of one connection: every invalidation it gets goes to
+		// `receive`.
+		internal def pump(conn Conn) {
+			for !closed && !conn.broken {
+				let failed = false
+				let arrived = conn.ready(1s) onerror (err error) {
+					failed = true
+					recover false
+				}
+				let event = new Value()
+				if arrived && !failed {
+					event = conn.wire.read() onerror (err error) {
+						failed = true
+						recover new Value()
+					}
+				}
+				if failed {
+					// Unless the tracker itself closed the connection.
+					if !conn.broken || !closed {
+						lost = true unless closed
+					}
+					break
+				}
+				continue unless arrived
+				continue unless event.kind == ValueKind.Push && event.items.len() >= 2 && event.items[0].text() == "invalidate"
+				let keys string[] = []
+				for let item in event.items[1].items {
+					keys.push(item.text())
+				}
+				put(keys)
+				signal <- none when signal.len() == 0
+			}
+			signal <- none when signal.len() == 0
+		}
+	}
+
+	partial type Client {
+		// track opens a Tracker. Without prefixes the servers remember the
+		// keys this client reads and report when one of them changes,
+		// once per read. With prefixes they report every change of a key
+		// that starts with one of them, read or not ("" for all keys).
+		// It needs RESP3. With a cluster or a sentinel group the tracker
+		// follows the servers as they change.
+		// Fails with a RedisError: ErrorKind.Argument for RESP2, and for
+		// tracking what a cluster client reads while it reads from
+		// replicas; the server's error (Redis before 6); and as `connect`
+		// does.
+		def track(prefixes ...string) !Tracker {
+			fail errorOf(ErrorKind.Argument, "redis: tracking needs RESP3; the connection speaks RESP{protocol}") when protocol != 3
+			fail errorOf(ErrorKind.Argument, "redis: a client that reads from replicas can track prefixes, not the keys it reads") when readFromReplicas && prefixes.len() == 0
+			let tracker = new Tracker(link, prefixes, timeout)
+			try tracker.restart()
+			return tracker
+		}
+	}
+
+	// The id the server gave a connection.
+	internal def clientId(conn Conn) !int {
+		let answer = try one(conn, conn.wire.timeout, "CLIENT", "ID")
+		fail serverError(answer.text()) when answer.isError()
+		return answer.toInt()
+	}
+}

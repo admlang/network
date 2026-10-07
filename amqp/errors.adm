@@ -1,0 +1,52 @@
+partial module adm.network.amqp {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is AmqpError`.
+	enum ErrorKind {
+		// The broker cannot be reached, or the connection broke.
+		Connection   = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut     = "timeout",
+		// The connection, channel or consumer was closed.
+		Closed       = "closed",
+		// The broker sent something that is not AMQP 0-9-1, or the client
+		// was used in a way the protocol does not allow.
+		Protocol     = "protocol",
+		// An argument or an option the client does not take.
+		Argument     = "argument",
+		// The user or password is wrong, or the user may not do this
+		// (ACCESS_REFUSED, 403).
+		Denied       = "denied",
+		// The queue, exchange or virtual host does not exist
+		// (NOT_FOUND, 404).
+		NotFound     = "notfound",
+		// Another connection holds the queue exclusively
+		// (RESOURCE_LOCKED, 405).
+		Locked       = "locked",
+		// The request does not fit what exists: a queue declared again
+		// with other properties, an acknowledgement of an unknown delivery
+		// (PRECONDITION_FAILED, 406).
+		Precondition = "precondition",
+		// A mandatory message matched no queue (NO_ROUTE, 312), or an
+		// immediate one found no consumer (NO_CONSUMERS, 313).
+		Unroutable   = "unroutable",
+		// The broker refused a published message (basic.nack).
+		Refused      = "refused",
+		// Any other close the broker sent; `replyCode` holds its number.
+		Server       = "server",
+	}
+
+	// AmqpError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct AmqpError {
+		message   string
+		code      string
+		cause     ?error
+		stack     errors.StackTrace
+		kind      ErrorKind
+		// The reply code of the broker's close or return (404, 406, 312);
+		// 0 when the failure did not come from the broker.
+		replyCode int
+	}
+}

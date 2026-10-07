@@ -56,10 +56,11 @@ partial module adm.network.redis {
 			return (try call(timeout, "ZCARD", key)).toInt()
 		}
 
-		// How many members have a score from `min` to `max`, both included.
+		// How many members have a score from `min` to `max`, both included
+		// unless `bounds` leaves one out.
 		// Fails as `command` does.
-		def zcount(key string, min float, max float) !int {
-			return (try call(timeout, "ZCOUNT", key, min, max)).toInt()
+		def zcount(key string, min float, max float, bounds Bounds = Bounds.Closed) !int {
+			return (try call(timeout, "ZCOUNT", key, lowBound(min, bounds), highBound(max, bounds))).toInt()
 		}
 
 		// A member's position counting from the lowest score (from the
@@ -90,16 +91,17 @@ partial module adm.network.redis {
 			return scoredOf(try call(timeout, ...args))
 		}
 
-		// The members with a score from `min` to `max`, both included, with
-		// their scores, lowest first (highest first with `reverse`); `limit`
-		// > 0 returns that many from `offset`.
+		// The members with a score from `min` to `max`, both included
+		// unless `bounds` leaves one out, with their scores, lowest first
+		// (highest first with `reverse`); `limit` > 0 returns that many
+		// from `offset`.
 		// Fails as `command` does.
-		def zrangeByScore(key string, min float, max float, reverse bool = false, offset int = 0, limit int = 0) !Scored[] {
+		def zrangeByScore(key string, min float, max float, reverse bool = false, offset int = 0, limit int = 0, bounds Bounds = Bounds.Closed) !Scored[] {
 			let args any[] = ["ZRANGE", key]
 			if reverse {
-				args.push(max, min, "BYSCORE", "REV")
+				args.push(highBound(max, bounds), lowBound(min, bounds), "BYSCORE", "REV")
 			} else {
-				args.push(min, max, "BYSCORE")
+				args.push(lowBound(min, bounds), highBound(max, bounds), "BYSCORE")
 			}
 			args.push("LIMIT", offset, limit) when limit > 0
 			args.push("WITHSCORES")
@@ -155,11 +157,11 @@ partial module adm.network.redis {
 			return (try call(timeout, "ZREMRANGEBYRANK", key, start, stop)).toInt()
 		}
 
-		// Removes the members with a score from `min` to `max`. Returns how
-		// many.
+		// Removes the members with a score from `min` to `max`, both
+		// included unless `bounds` leaves one out. Returns how many.
 		// Fails as `command` does.
-		def zremRangeByScore(key string, min float, max float) !int {
-			return (try call(timeout, "ZREMRANGEBYSCORE", key, min, max)).toInt()
+		def zremRangeByScore(key string, min float, max float, bounds Bounds = Bounds.Closed) !int {
+			return (try call(timeout, "ZREMRANGEBYSCORE", key, lowBound(min, bounds), highBound(max, bounds))).toInt()
 		}
 
 		// The members of any of the sets, each with the sum of its scores.
@@ -246,6 +248,30 @@ partial module adm.network.redis {
 		distance  float
 		longitude float
 		latitude  float
+	}
+
+	// Bounds says which ends of a range of scores belong to it.
+	enum Bounds {
+		// Both `min` and `max`.
+		Closed,
+		// Scores above `min`, up to and with `max`.
+		OpenMin,
+		// Scores from `min`, below `max`.
+		OpenMax,
+		// Neither end.
+		Open,
+	}
+
+	// The low end of a score range as the server takes it: `(` in front
+	// leaves the score itself out.
+	internal def lowBound(score float, bounds Bounds) string {
+		let open = bounds := Bounds.OpenMin || Bounds.Open
+		return open ?? ("({doubleText(score)}", doubleText(score))
+	}
+
+	internal def highBound(score float, bounds Bounds) string {
+		let open = bounds := Bounds.OpenMax || Bounds.Open
+		return open ?? ("({doubleText(score)}", doubleText(score))
 	}
 
 	internal def poppedScored(reply Value) ?Popped {

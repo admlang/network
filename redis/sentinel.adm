@@ -17,21 +17,23 @@ internal partial module adm.network.redis.resp {
 
 	// SentinelLink sends commands to the master the sentinels name.
 	type SentinelLink {
-		base        Target
-		limit       int
+		base           Target
+		limit          int
 		// The name the sentinels watch the master under.
-		master      string
+		master         string
 		// Guards `sentinels`, `pool` and `generation`.
-		lock        sync.Mutex
+		lock           sync.Mutex
 		// One search for the master at a time.
-		resolving   sync.Mutex
+		resolving      sync.Mutex
 		// The sentinels to ask, the one that answered last first.
-		sentinels   Target[]
-		pool        ?Pool
+		sentinels      Target[]
+		pool           ?Pool
 		// Counts the masters found, so a task knows another one already
 		// looked.
-		generation  int
-		atomic shut bool       = false
+		generation     int
+		atomic shut    bool       = false
+		// Set once the task that listens for a change of master runs.
+		atomic watched bool       = false
 
 		def new(base Target, master string, sentinels Target[], limit int) {
 			self.base = base
@@ -125,6 +127,11 @@ internal partial module adm.network.redis.resp {
 			lock.unlock()
 			next.close() when shut
 			old.close() unless old is none
+			if !watched && !shut {
+				watched = true
+				let task = async watch()
+				task.keepAlive()
+			}
 		}
 
 		// A connection to the master, looking for the new one for as long
@@ -210,6 +217,62 @@ internal partial module adm.network.redis.resp {
 			let held = try lease()
 			held.pool.giveBack(held.conn)
 			return [held.pool]
+		}
+
+		def shards(keys string[]) string[][] {
+			return [keys]
+		}
+
+		def epoch() int {
+			let (_, seen) = current()
+			return seen
+		}
+
+		// The task that listens to a sentinel for the moment the master
+		// changes, and then finds the new one at once instead of on the
+		// next command that fails.
+		def watch() {
+			for !shut {
+				lock.lock()
+				let asked = sentinels.clone()
+				lock.unlock()
+				let conn ?Conn = none
+				for let sentinel in asked {
+					conn = dialed(sentinel) onerror recover none
+					break unless conn is none
+				}
+				if conn is none {
+					time.sleep(1s)
+					continue
+				}
+				let joined = one(conn, base.timeout, "SUBSCRIBE", "+switch-master") onerror recover errorValue("no answer")
+				if joined.isError() {
+					conn.close()
+					time.sleep(1s)
+					continue
+				}
+				for !shut {
+					let lost = false
+					let arrived = conn.ready(1s) onerror (err error) {
+						lost = true
+						recover false
+					}
+					break when lost
+					continue unless arrived
+					let event = conn.wire.read() onerror (err error) {
+						lost = true
+						recover new Value()
+					}
+					break when lost
+					// "message", the channel, then the master's name with
+					// its old and new address.
+					continue when event.items.len() < 3 || event.items[1].text() != "+switch-master"
+					continue unless event.items[2].text().split(" ")[0] == master
+					let (_, seen) = current()
+					found(seen) onerror recover none
+				}
+				conn.close()
+			}
 		}
 
 		def isOpen() bool {

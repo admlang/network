@@ -4,6 +4,7 @@ partial module adm.network.s3 {
 		std.net.http
 		std.os
 		std.time
+		adm.network.s3.sigv4::(checksumNamed, checksumOf)
 		adm.network.s3.wire::*
 	)
 
@@ -44,6 +45,21 @@ partial module adm.network.s3 {
 		// whether it marks a deletion instead of holding content.
 		latest             bool
 		deleteMarker       bool
+		// The checksums S3 keeps for the object, in base64, by `crc32`,
+		// `crc32c`, `sha1` or `sha256`; a read gets them when it asks with
+		// `ReadOptions.checksum`. One that ends in `-N` is of an object
+		// uploaded in N parts: the checksum of the parts' checksums.
+		checksums          map<string, string>
+	}
+
+	// Checksum is a checksum S3 stores with an object, beside its entity
+	// tag, and checks the content against when it is written.
+	enum Checksum {
+		None   = "",
+		Crc32  = "crc32",
+		Crc32c = "crc32c",
+		Sha1   = "sha1",
+		Sha256 = "sha256",
 	}
 
 	// WriteOptions are the settings of an object being written, for `put`,
@@ -76,6 +92,10 @@ partial module adm.network.s3 {
 		// loses fails with ErrorKind.Precondition.
 		ifMatch            string
 		ifNoneMatch        string
+		// A checksum of the content, sent with it: S3 refuses content that
+		// does not match and keeps the checksum with the object. A stream
+		// is checksummed as it is sent.
+		checksum           Checksum            = Checksum.None
 	}
 
 	// ReadOptions narrow a `get` or an `info`.
@@ -99,6 +119,10 @@ partial module adm.network.s3 {
 		part              int        = 0
 		// The key of an object written with `WriteOptions.customerKey`.
 		customerKey       byte[]
+		// Ask for the checksums S3 keeps for the object: they come in
+		// `ObjectInfo.checksums`, and `Object.bytes` checks the content
+		// against them.
+		checksum          bool       = false
 	}
 
 	// Object is an object being read: what S3 says about it, and its
@@ -133,10 +157,22 @@ partial module adm.network.s3 {
 			return n
 		}
 
-		// The whole content. Fails as `read` does.
+		// The whole content, checked against the checksums in `info`.
+		// Fails as `read` does, and with ErrorKind.Protocol when the
+		// content does not match a checksum.
 		def bytes() !byte[] {
 			let data = res.bytes() onerror (err error) {
 				fail errorOf(ErrorKind.Connection, "s3: reading {info.key}: {err.message}", err)
+			}
+			// The checksum of a whole object read whole; not of a range, nor
+			// the checksum of checksums an upload in parts has.
+			if data.len() == info.size {
+				for let (name, want) in info.checksums {
+					continue when want.contains("-")
+					let kind = checksumNamed(name)
+					continue when kind == Checksum.None
+					fail errorOf(ErrorKind.Protocol, "s3: the content of {info.key} does not match its {name} checksum") when checksumOf(kind, data) != want
+				}
 			}
 			return data
 		}

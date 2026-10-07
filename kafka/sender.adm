@@ -1,0 +1,593 @@
+// What a producer does behind `send`: records wait in batches per
+// partition, one task per partition sends them in order, and each batch
+// is tried again while its failure may pass.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.sync
+		std.time
+		adm.network.kafka::*
+	)
+
+	// Lot is one batch of a partition on its way to the broker.
+	type Lot {
+		topic          string
+		partition      int
+		records        Outgoing[]      = []
+		bytes          int             = 0
+		created        time.Time
+		// Taken for sending: it accepts no more records.
+		closed         bool            = false
+		who            Identity
+		atomic done    bool            = false
+		atomic failure ?error          = none
+		// The offset of its first record and the time the broker stamped
+		// it with; -1 when the broker did not say.
+		atomic base    int             = -1
+		atomic logTime int             = -1
+		atomic waiters channel<none>[] = []
+		// True when some sender waits for the outcome itself; a failure
+		// nobody waits for is kept for `flush`.
+		atomic watched bool            = false
+
+		def new(topic string, partition int) {
+			self.topic = topic
+			self.partition = partition
+			created = time.now()
+			who = Identity{producerId: -1, producerEpoch: -1, sequence: -1}
+		}
+
+		atomic def watch(signal channel<none>) {
+			watched = true
+			waiters.push(signal)
+		}
+
+		atomic def finishWith(base int, logTime int, failure ?error) channel<none>[] {
+			self.base = base
+			self.logTime = logTime
+			self.failure = failure
+			done = true
+			let all = waiters
+			waiters = []
+			return all
+		}
+
+		def settle(base int, logTime int, failure ?error) {
+			for let signal in finishWith(base, logTime, failure) {
+				signal <- none when signal.len() == 0
+			}
+		}
+	}
+
+	// Sender is the working half of a producer.
+	type Sender {
+		cluster              Cluster
+		// Names the producer's connections among the client's.
+		purpose              string
+		// -1 for all in-sync replicas, 1 for the leader, 0 for none.
+		acks                 int                = -1
+		compression          Compression        = Compression.None
+		idempotent           bool               = true
+		linger               duration           = 0s
+		batchBytes           int                = 16384
+		// How long a broker may wait for its replicas.
+		timeout              duration           = 30s
+		// How long a batch is tried before it is given up.
+		deliveryTimeout      duration           = 2min
+		transactionalId      string             = ""
+		transactionTimeout   duration           = 1min
+		atomic queues        map<string, Lot[]>
+		atomic draining      map<string, bool>
+		atomic sticky        map<string, int>
+		atomic sequences     map<string, int>
+		atomic producerId    int                = -1
+		atomic producerEpoch int                = -1
+		// Batches not yet settled.
+		atomic open          int                = 0
+		// The first failure of a batch nobody waited for.
+		atomic unseen        ?error             = none
+		atomic closed        bool               = false
+		atomic inTransaction bool               = false
+		atomic enlisted      map<string, bool>
+		idle                 channel<none>
+		starting             sync.Mutex
+		enlisting            sync.Mutex
+
+		def new(cluster Cluster, purpose string) {
+			self.cluster = cluster
+			self.purpose = purpose
+			idle = new channel<none>(1)
+			starting = new sync.Mutex()
+			enlisting = new sync.Mutex()
+		}
+
+		// ---- queueing ----
+
+		// enqueue puts a record into the open batch of its partition,
+		// choosing the partition when `partition` is negative: by the
+		// key's hash, or the same one for every keyless record of a topic
+		// until its batch is sent. `signal`, when given, is woken with
+		// the batch's outcome.
+		// Fails with a KafkaError: ErrorKind.Closed after `close`,
+		// ErrorKind.NotFound for a topic or a partition that does not
+		// exist, ErrorKind.TooLarge for a record no batch can hold,
+		// ErrorKind.State for a transactional producer outside a
+		// transaction, and as `Cluster.topic` and `enlist` do.
+		def enqueue(name string, partition int, record Outgoing, signal ?channel<none>) !(Lot, int) {
+			fail errorOf(ErrorKind.Closed, "kafka: the producer is closed") when closed
+			fail errorOf(ErrorKind.State, "kafka: a transactional producer sends inside a transaction; call beginTx first") when transactionalId != "" && !inTransaction
+			let topic = try cluster.topic(name, true)
+			let count = topic.parts.len()
+			let target = partition
+			if target < 0 {
+				let key = record.key
+				if key is none || key.len() == 0 {
+					target = stickyFor(name, count)
+				} else {
+					target = int(murmur2(key) & uint32(0x7FFFFFFF)) % count
+				}
+			}
+			fail errorOf(ErrorKind.NotFound, "kafka: topic '{name}' has no partition {target}; it has {count}") when target >= count
+			let size = 70
+			let key = record.key
+			size += key.len() unless key is none
+			let value = record.value
+			size += value.len() unless value is none
+			for let h in record.headers {
+				size += h.name.len() + h.value.len() + 10
+			}
+			try enlist(name, target) when transactionalId != ""
+			let slot = "{name}/{target}"
+			let (lot, index, starts) = place(slot, name, target, record, size, signal)
+			if starts {
+				let task = async drain(slot)
+				task.keepAlive()
+			}
+			return (lot, index)
+		}
+
+		atomic def stickyFor(name string, count int) int {
+			let current = sticky.get(name)
+			return current unless current is none || current >= count
+			let first = (int(time.now().unixNs() / 1000) & 0x7FFFFFFF) % count
+			sticky[name] = first
+			return first
+		}
+
+		// Appends to the partition's last batch, or opens a new one when
+		// that one is taken or full; true when no task drains the
+		// partition.
+		atomic def place(slot string, name string, partition int, record Outgoing, size int, signal ?channel<none>) (Lot, int, bool) {
+			let queue = queues.get(slot)
+			let lots Lot[] = []
+			lots = queue unless queue is none
+			let reuse = false
+			if lots.len() > 0 {
+				let last = lots[lots.len() - 1]
+				reuse = !last.closed && last.bytes + size <= batchBytes
+			}
+			let lot = new Lot(name, partition)
+			if reuse {
+				lot = lots[lots.len() - 1]
+			} else {
+				lots.push(lot)
+				queues[slot] = lots
+				open++
+				// The next keyless batch of the topic goes elsewhere.
+				let current = sticky.get(name)
+				if !(current is none) && current == partition && lots.len() > 1 {
+					sticky.delete(name)
+				}
+			}
+			lot.records.push(record)
+			lot.bytes += size
+			lot.watch(signal) unless signal is none
+			let running = draining.hasKey(slot)
+			draining[slot] = true
+			return (lot, lot.records.len() - 1, !running)
+		}
+
+		// The first batch of a partition, closed for sending and given its
+		// place in the producer's sequence; none when the partition has
+		// nothing left, which ends its task.
+		atomic def take(slot string) ?Lot {
+			let queue = queues.get(slot)
+			if queue is none || queue.len() == 0 {
+				draining.delete(slot)
+				queues.delete(slot)
+				return none
+			}
+			let lot = queue[0]
+			if !lot.closed {
+				lot.closed = true
+				if idempotent && producerId >= 0 {
+					let next = sequences.get(slot)
+					let sequence = next is none ?? (0, next)
+					lot.who = Identity{producerId: producerId, producerEpoch: producerEpoch, sequence: sequence, transactional: transactionalId != ""}
+					sequences[slot] = (sequence + lot.records.len()) & 0x7FFFFFFF
+				}
+			}
+			return lot
+		}
+
+		atomic def peek(slot string) ?Lot {
+			let queue = queues.get(slot)
+			return none when queue is none || queue.len() == 0
+			return queue[0]
+		}
+
+		atomic def pop(slot string, lot Lot) {
+			let queue = queues.get(slot)
+			if !(queue is none) && queue.len() > 0 {
+				queue.shift()
+				queues[slot] = queue
+			}
+			open--
+			let failed = lot.failure
+			unseen = failed when !(failed is none) && !lot.watched && unseen is none
+		}
+
+		// ---- sending ----
+
+		// The task of one partition: its batches, one after another.
+		def drain(slot string) {
+			for {
+				let waiting = peek(slot)
+				if !(waiting is none) && !waiting.closed && linger > 0s {
+					let age = time.now() - waiting.created
+					time.sleep(linger - age) when age < linger && waiting.bytes < batchBytes
+				}
+				let failed ?error = none
+				if idempotent {
+					identify() onerror (err error) {
+						failed = err
+						recover none
+					}
+				}
+				let lot = take(slot)
+				break when lot is none
+				if failed is none {
+					deliver(lot, slot) onerror (err error) {
+						failed = err
+						recover none
+					}
+				}
+				lot.settle(-1, -1, failed) unless failed is none
+				pop(slot, lot)
+				idle <- none when idle.len() == 0
+			}
+			idle <- none when idle.len() == 0
+		}
+
+		// deliver sends one batch to the leader of its partition until the
+		// broker takes it, its failure cannot pass, or the delivery timeout
+		// ends.
+		def deliver(lot Lot, slot string) !none {
+			let batch = try encodeBatch(lot.records, compression, lot.who)
+			let deadline = lot.created + deliveryTimeout
+			let fresh = false
+			for {
+				let ask = new Encoder()
+				ask.maybe(transactionalId == "" ?? (none, transactionalId))
+				ask.i16(acks)
+				ask.i32(int(int64(timeout) / 1000000))
+				ask.count(1)
+				ask.text(lot.topic)
+				ask.count(1)
+				ask.i32(lot.partition)
+				ask.bytes(batch)
+				let passing ?error = none
+				let code = 0
+				let base = -1
+				let logTime = -1
+				let broker = route(lot, fresh) onerror (err error) {
+					passing = err
+					recover none
+				}
+				if !(broker is none) {
+					if acks == 0 {
+						try broker.cast(apiProduce, ask)
+						lot.settle(-1, -1, none)
+						return none
+					}
+					let answer = exchange(broker, ask) onerror (err error) {
+						passing = err
+						recover none
+					}
+					if !(answer is none) {
+						try answer.count()
+						try answer.text()
+						try answer.count()
+						try answer.i32()
+						code = try answer.i16()
+						base = try answer.i64()
+						logTime = try answer.i64()
+					}
+				}
+				if passing is none {
+					// A batch the broker already has was taken by an
+					// earlier try whose answer got lost.
+					if code == 0 || code == 46 {
+						lot.settle(code == 0 ?? (base, -1), logTime, none)
+						return none
+					}
+					let failure = brokerError(code, "sending to '{lot.topic}' partition {lot.partition}")
+					if !retriable(code) {
+						// A sequence the broker refuses means it lost track
+						// of this producer: the next batch starts anew.
+						forgetIdentity() when code == 45 || code == 59
+						rewind(slot, lot) when code != 45 && code != 59
+						fail failure
+					}
+					passing = failure
+				}
+				if time.now() > deadline {
+					// Whether the broker has the batch is not known.
+					forgetIdentity()
+					fail passing unless passing is none
+					fail errorOf(ErrorKind.TimedOut, "kafka: the batch for '{lot.topic}' partition {lot.partition} was not sent within {deliveryTimeout}")
+				}
+				fresh = true
+				time.sleep(100ms)
+			}
+			return none
+		}
+
+		def route(lot Lot, fresh bool) !?Broker {
+			return try cluster.conn(try cluster.leader(lot.topic, lot.partition, fresh), purpose)
+		}
+
+		def exchange(broker Broker, ask Encoder) !?Decoder {
+			return try broker.call(apiProduce, ask, timeout)
+		}
+
+		// A batch the broker refused for good frees its place in the
+		// sequence for the next one.
+		atomic def rewind(slot string, lot Lot) {
+			sequences[slot] = lot.who.sequence when lot.who.sequence >= 0 && lot.who.producerId == producerId
+		}
+
+		atomic def forgetIdentity() {
+			return when transactionalId != ""
+			producerId = -1
+			producerEpoch = -1
+			sequences = {}
+		}
+
+		// identify gets the producer its id from the cluster, once: the
+		// number a broker tells its batches apart by.
+		// Fails with a KafkaError: ErrorKind.Fenced when a newer producer
+		// with the same transactional id took over, ErrorKind.TimedOut when
+		// the cluster names none in time, and as `Broker.call` does.
+		def identify() !none {
+			return none when producerId >= 0
+			starting.lock()
+			defer starting.unlock()
+			return none when producerId >= 0
+			let deadline = time.now() + cluster.login.timeout
+			for {
+				let ask = new Encoder()
+				ask.maybe(transactionalId == "" ?? (none, transactionalId))
+				ask.i32(transactionalId == "" ?? (-1, int(int64(transactionTimeout) / 1000000)))
+				let broker = transactionalId == "" ?? (try cluster.any(), try cluster.conn(try cluster.coordinator(transactionalId, 1), purpose))
+				let answer = try broker.call(apiInitProducerId, ask, transactionTimeout)
+				try answer.i32()
+				let code = try answer.i16()
+				let id = try answer.i64()
+				let epoch = try answer.i16()
+				if code == 0 {
+					adopt(id, epoch)
+					return none
+				}
+				fail brokerError(code, "getting a producer id") unless retriable(code)
+				fail errorOf(ErrorKind.TimedOut, "kafka: the cluster gave the producer no id within {cluster.login.timeout}", code) when time.now() > deadline
+				time.sleep(100ms)
+			}
+			return none
+		}
+
+		atomic def adopt(id int, epoch int) {
+			producerId = id
+			producerEpoch = epoch
+			sequences = {}
+		}
+
+		// ---- waiting ----
+
+		// flush returns when every record given to the producer was sent or
+		// given up.
+		// Fails with the first failure of a record nobody waited for since
+		// the last flush.
+		def flush() !none {
+			for open > 0 {
+				select {
+					case idle:
+						idle.flush()
+				}
+			}
+			let failed = takeUnseen()
+			fail failed unless failed is none
+			return none
+		}
+
+		atomic def takeUnseen() ?error {
+			let failed = unseen
+			unseen = none
+			return failed
+		}
+
+		// ---- transactions ----
+
+		// coordinated sends a request to the transaction coordinator and
+		// returns what follows the throttle time of its answer, trying
+		// again while the coordinator moves or still finishes the previous
+		// transaction.
+		def coordinated(api int, ask Encoder, about string, codeAt def (Decoder) !int) !none {
+			let deadline = time.now() + cluster.login.timeout
+			for {
+				let broker = try cluster.conn(try cluster.coordinator(transactionalId, 1), purpose)
+				let answer = try broker.call(api, ask, transactionTimeout)
+				try answer.i32()
+				let code = try codeAt(answer)
+				return none when code == 0
+				fail brokerError(code, about) unless retriable(code)
+				fail errorOf(ErrorKind.TimedOut, "kafka: {about}: the coordinator was not ready within {cluster.login.timeout}", code) when time.now() > deadline
+				time.sleep(50ms)
+			}
+			return none
+		}
+
+		// start opens a transaction: what is sent from now on becomes
+		// visible together, at `end`.
+		// Fails with a KafkaError: ErrorKind.State when the producer has no
+		// transactional id or a transaction is open, and as `identify`
+		// does.
+		def start() !none {
+			fail errorOf(ErrorKind.State, "kafka: a producer needs a transactional id for transactions") when transactionalId == ""
+			fail errorOf(ErrorKind.State, "kafka: a transaction is already open") when inTransaction
+			try identify()
+			startTransaction()
+			return none
+		}
+
+		atomic def startTransaction() {
+			inTransaction = true
+			enlisted = {}
+			unseen = none
+		}
+
+		// Tells the coordinator that a partition takes part in the open
+		// transaction, once per partition.
+		def enlist(name string, partition int) !none {
+			let slot = "{name}/{partition}"
+			return none when isEnlisted(slot)
+			enlisting.lock()
+			defer enlisting.unlock()
+			return none when isEnlisted(slot)
+			try identify()
+			let ask = new Encoder()
+			ask.text(transactionalId)
+			ask.i64(producerId)
+			ask.i16(producerEpoch)
+			ask.count(1)
+			ask.text(name)
+			ask.ints([partition])
+			try coordinated(apiAddPartitionsToTxn, ask, "adding '{name}' partition {partition} to the transaction", def (answer Decoder) !int {
+				try answer.count()
+				try answer.text()
+				try answer.count()
+				try answer.i32()
+				return try answer.i16()
+			})
+			markEnlisted(slot)
+			return none
+		}
+
+		atomic def isEnlisted(slot string) bool {
+			return enlisted.hasKey(slot)
+		}
+
+		atomic def markEnlisted(slot string) {
+			enlisted[slot] = true
+		}
+
+		atomic def anyEnlisted() bool {
+			return enlisted.len() > 0
+		}
+
+		// end commits or rolls back the open transaction, after everything
+		// sent in it has reached the brokers.
+		// Fails with a KafkaError: ErrorKind.State when no transaction is
+		// open, the failure of a record of the transaction for a commit
+		// (the transaction stays open: roll it back), ErrorKind.Fenced when
+		// a newer producer took over, and as `coordinated` does.
+		def end(commit bool) !none {
+			fail errorOf(ErrorKind.State, "kafka: no transaction is open") unless inTransaction
+			let failed ?error = none
+			flush() onerror (err error) {
+				failed = err
+				recover none
+			}
+			fail failed when commit && !(failed is none)
+			if anyEnlisted() {
+				let ask = new Encoder()
+				ask.text(transactionalId)
+				ask.i64(producerId)
+				ask.i16(producerEpoch)
+				ask.bool(commit)
+				try coordinated(apiEndTxn, ask, commit ?? ("committing the transaction", "rolling the transaction back"), def (answer Decoder) !int {
+					return try answer.i16()
+				})
+			}
+			stopTransaction()
+			return none
+		}
+
+		atomic def stopTransaction() {
+			inTransaction = false
+			enlisted = {}
+		}
+
+		// commitOffsets makes a group's offsets part of the open
+		// transaction: they are committed when it is, and not when it is
+		// rolled back.
+		// Fails with a KafkaError: ErrorKind.State when no transaction is
+		// open, and as `coordinated`, `Cluster.coordinator` and
+		// `Broker.call` do.
+		def commitOffsets(group string, offsets map<string, map<int, int>>) !none {
+			fail errorOf(ErrorKind.State, "kafka: no transaction is open") unless inTransaction
+			let add = new Encoder()
+			add.text(transactionalId)
+			add.i64(producerId)
+			add.i16(producerEpoch)
+			add.text(group)
+			try coordinated(apiAddOffsetsToTxn, add, "adding the offsets of group '{group}' to the transaction", def (answer Decoder) !int {
+				return try answer.i16()
+			})
+			markEnlisted("offsets of {group}")
+			let deadline = time.now() + cluster.login.timeout
+			for {
+				let ask = new Encoder()
+				ask.text(transactionalId)
+				ask.text(group)
+				ask.i64(producerId)
+				ask.i16(producerEpoch)
+				ask.count(offsets.len())
+				for let (name, parts) in offsets {
+					ask.text(name)
+					ask.count(parts.len())
+					for let (partition, offset) in parts {
+						ask.i32(partition)
+						ask.i64(offset)
+						ask.i32(-1)
+						ask.maybe(none)
+					}
+				}
+				let broker = try cluster.conn(try cluster.coordinator(group, 0), purpose)
+				let answer = try broker.call(apiTxnOffsetCommit, ask)
+				try answer.i32()
+				let worst = 0
+				for let t = try answer.count(); t > 0; t-- {
+					try answer.text()
+					for let p = try answer.count(); p > 0; p-- {
+						try answer.i32()
+						let code = try answer.i16()
+						worst = code when code != 0
+					}
+				}
+				return none when worst == 0
+				fail brokerError(worst, "committing the offsets of group '{group}' in the transaction") unless retriable(worst)
+				fail errorOf(ErrorKind.TimedOut, "kafka: the coordinator of group '{group}' was not ready within {cluster.login.timeout}", worst) when time.now() > deadline
+				time.sleep(50ms)
+			}
+			return none
+		}
+
+		// close sends what is held and closes the producer's connections.
+		def close() {
+			return when closed
+			flush() onerror recover none
+			closed = true
+			cluster.drop(purpose)
+		}
+	}
+}

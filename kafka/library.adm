@@ -1,0 +1,13 @@
+// An Apache Kafka client as an ADM library: the Kafka protocol over
+// std.net.
+@manifest(version = "0.1.0")
+library adm.network.kafka {
+	use (
+		adm.network.kafka
+		adm.network.kafka.wire
+	)
+
+	export (
+		adm.network.kafka
+	)
+}

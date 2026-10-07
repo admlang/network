@@ -168,6 +168,7 @@ partial module adm.network.s3 {
 			call.header("x-amz-copy-source", copySource(name, key, version))
 			if !(options is none) {
 				applyWrite(call, "", options)
+				nameChecksum(call)
 				call.header("x-amz-metadata-directive", "REPLACE")
 				call.header("x-amz-tagging-directive", "REPLACE") when options.labels.len() > 0
 				applyCustomerKey(call, options.customerKey, "x-amz-copy-source-server-side-encryption-customer-")

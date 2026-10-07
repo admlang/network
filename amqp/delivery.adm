@@ -1,0 +1,130 @@
+partial module adm.network.amqp {
+	use adm.network.amqp.wire::*
+
+	// Delivery is a message the broker handed to a consumer or to `get`,
+	// and the means to answer for it.
+	//
+	// Unless the consumer was opened with `autoAck`, every delivery must be
+	// answered with `ack`, `nack` or `reject`; the broker keeps what is
+	// unanswered and hands it out again when the channel closes.
+	type Delivery {
+		message       Message
+		// The number the broker gave the delivery on its channel.
+		tag           int     = 0
+		// The tag of the consumer it came to; "" for `get`.
+		consumer      string  = ""
+		// True when the broker handed the message out before.
+		redelivered   bool    = false
+		// Where it was published.
+		exchange      string  = ""
+		routingKey    string  = ""
+		// For `get`: how many messages the queue still holds.
+		remaining     int     = 0
+		internal lane Lane
+
+		def new(lane Lane, message Message) {
+			self.lane = lane
+			self.message = message
+		}
+
+		// The body as text.
+		def text() string {
+			return string(message.body)
+		}
+
+		// ack tells the broker the message is done with; with `multiple`,
+		// every delivery of the channel up to this one.
+		// Fails with an AmqpError when the channel or the connection is
+		// closed. Acknowledging twice makes the broker close the channel
+		// (ErrorKind.Precondition on its next use).
+		def ack(multiple bool = false) !none {
+			let m = method(basicAck)
+			m.u64(tag)
+			m.bits(multiple)
+			return try lane.send(m.data)
+		}
+
+		// nack gives the message back: to its queue with `requeue`, else
+		// to the queue's dead-letter exchange or to nowhere. With
+		// `multiple`, every delivery of the channel up to this one.
+		// Fails with an AmqpError as `ack` does.
+		def nack(requeue bool = true, multiple bool = false) !none {
+			let m = method(basicNack)
+			m.u64(tag)
+			m.bits(multiple, requeue)
+			return try lane.send(m.data)
+		}
+
+		// reject gives this one message back, as `nack` does; the form
+		// every AMQP 0-9-1 broker knows.
+		// Fails with an AmqpError as `ack` does.
+		def reject(requeue bool = true) !none {
+			let m = method(basicReject)
+			m.u64(tag)
+			m.bits(requeue)
+			return try lane.send(m.data)
+		}
+	}
+
+	// Consumer is a subscription to a queue: the broker sends its messages
+	// as they come.
+	//
+	// ```
+	// let jobs = try ch.consume("jobs")
+	// for {
+	//     let d = try jobs.next()
+	//     continue when d is none
+	//     work(d.text())
+	//     try d.ack()
+	// }
+	// ```
+	type Consumer {
+		// The tag that names the consumer on its channel.
+		tag              string
+		queue            string
+		internal session Session
+		internal feed    Feed
+		// Keeps the channel and its connection for as long as the
+		// consumer is held.
+		internal owner   Channel
+
+		def new(session Session, feed Feed, queue string, owner Channel) {
+			self.session = session
+			self.feed = feed
+			self.owner = owner
+			self.queue = queue
+			tag = feed.tag
+		}
+
+		// next returns the next delivery, waiting up to `timeout` for it
+		// (0s without end); none when the wait ends first.
+		// Fails with an AmqpError once nothing more can come and all that
+		// came was taken: ErrorKind.Closed after `cancel`, when the broker
+		// cancelled the consumer (its queue was deleted) or the channel was
+		// closed, and the broker's own error when it closed the channel.
+		def next(timeout duration = 0s) !?Delivery {
+			return try feed.take(timeout)
+		}
+
+		// cancel ends the subscription. Deliveries that already arrived can
+		// still be taken with `next`.
+		// Fails with an AmqpError as a channel call does.
+		def cancel() !none {
+			return none unless feed.ended is none
+			let m = method(basicCancel)
+			try m.short(tag)
+			m.bits(false)
+			try session.lane.call(m.data, basicCancelOk)
+			session.lane.dropFeed(tag)
+			session.forget("c|{tag}")
+			session.unwatch(tag)
+			feed.stop(errorOf(ErrorKind.Closed, "amqp: the consumer {tag} is cancelled"))
+			return none
+		}
+
+		// Whether deliveries can still come.
+		def isOpen() bool {
+			return feed.ended is none
+		}
+	}
+}

@@ -1,0 +1,628 @@
+// One connection to a broker: the handshake, the task that reads frames
+// and hands them to their channels, heartbeats, and the close.
+internal partial module adm.network.amqp.wire {
+	use (
+		std.net
+		std.net.tls
+		std.sync
+		std.time
+		adm.network.amqp::*
+	)
+
+	const (
+		frameMethod    = 1
+		frameHeader    = 2
+		frameBody      = 3
+		frameHeartbeat = 8
+		frameEnd       = 0xCE
+		// The smallest frame size a peer must take, and the one in use
+		// until the two sides agree on another.
+		frameMinimum   = 4096
+		// What a frame spends beyond its payload: type, channel, size, end.
+		frameOverhead  = 8
+		// A read no deadline is set for.
+		unbounded      = 87600h
+	)
+
+	// Methods, as their class in the high 16 bits and their number in the
+	// low ones.
+	const (
+		connectionStart          = 0x000A000A
+		connectionStartOk        = 0x000A000B
+		connectionSecure         = 0x000A0014
+		connectionTune           = 0x000A001E
+		connectionTuneOk         = 0x000A001F
+		connectionOpen           = 0x000A0028
+		connectionOpenOk         = 0x000A0029
+		connectionClose          = 0x000A0032
+		connectionCloseOk        = 0x000A0033
+		connectionBlocked        = 0x000A003C
+		connectionUnblocked      = 0x000A003D
+		connectionUpdateSecret   = 0x000A0046
+		connectionUpdateSecretOk = 0x000A0047
+		channelOpen              = 0x0014000A
+		channelOpenOk            = 0x0014000B
+		channelFlow              = 0x00140014
+		channelFlowOk            = 0x00140015
+		channelClose             = 0x00140028
+		channelCloseOk           = 0x00140029
+		exchangeDeclare          = 0x0028000A
+		exchangeDeclareOk        = 0x0028000B
+		exchangeDelete           = 0x00280014
+		exchangeDeleteOk         = 0x00280015
+		exchangeBind             = 0x0028001E
+		exchangeBindOk           = 0x0028001F
+		exchangeUnbind           = 0x00280028
+		exchangeUnbindOk         = 0x00280033
+		queueDeclare             = 0x0032000A
+		queueDeclareOk           = 0x0032000B
+		queueBind                = 0x00320014
+		queueBindOk              = 0x00320015
+		queuePurge               = 0x0032001E
+		queuePurgeOk             = 0x0032001F
+		queueDelete              = 0x00320028
+		queueDeleteOk            = 0x00320029
+		queueUnbind              = 0x00320032
+		queueUnbindOk            = 0x00320033
+		basicQos                 = 0x003C000A
+		basicQosOk               = 0x003C000B
+		basicConsume             = 0x003C0014
+		basicConsumeOk           = 0x003C0015
+		basicCancel              = 0x003C001E
+		basicCancelOk            = 0x003C001F
+		basicPublish             = 0x003C0028
+		basicReturn              = 0x003C0032
+		basicDeliver             = 0x003C003C
+		basicGet                 = 0x003C0046
+		basicGetOk               = 0x003C0047
+		basicGetEmpty            = 0x003C0048
+		basicAck                 = 0x003C0050
+		basicReject              = 0x003C005A
+		basicRecoverAsync        = 0x003C0064
+		basicRecover             = 0x003C006E
+		basicRecoverOk           = 0x003C006F
+		basicNack                = 0x003C0078
+		confirmSelect            = 0x0055000A
+		confirmSelectOk          = 0x0055000B
+		txSelect                 = 0x005A000A
+		txSelectOk               = 0x005A000B
+		txCommit                 = 0x005A0014
+		txCommitOk               = 0x005A0015
+		txRollback               = 0x005A001E
+		txRollbackOk             = 0x005A001F
+	)
+
+	// The payload of a method frame, up to its arguments.
+	def method(key int) Encoder {
+		let e = new Encoder()
+		e.u16(key >> 16)
+		e.u16(key & 0xFFFF)
+		return e
+	}
+
+	// The bytes of one frame.
+	def frame(kind int, channel int, payload byte[]) byte[] {
+		let e = new Encoder()
+		e.u8(kind)
+		e.u16(channel)
+		e.long(payload)
+		e.u8(frameEnd)
+		return e.data
+	}
+
+	// Reply is what a channel hands to the task that waits on it: a method
+	// from the broker, with the message that followed it when it carries
+	// one.
+	struct Reply {
+		key      int
+		args     Decoder
+		delivery ?Delivery
+	}
+
+	// Waiter holds the replies of one channel until the task that asked
+	// takes them.
+	type Waiter {
+		atomic replies Reply[]       = []
+		signal         channel<none>
+
+		def new() {
+			signal = new channel<none>(1)
+		}
+
+		def put(r Reply) {
+			push(r)
+			wake()
+		}
+
+		def wake() {
+			signal <- none when signal.len() == 0
+		}
+
+		atomic def push(r Reply) {
+			replies.push(r)
+		}
+
+		atomic def take() ?Reply {
+			return none when replies.len() == 0
+			return replies.shift()
+		}
+	}
+
+	// Target is where a connection goes and how it introduces itself.
+	struct Target {
+		host           string
+		port           int
+		secure         bool
+		tlsConfig      ?tls.Config
+		auth           Auth
+		username       string
+		password       string
+		vhost          string
+		// The name the broker shows for the connection.
+		name           string
+		channelMax     int
+		frameMax       int
+		heartbeat      duration
+		connectTimeout duration
+		timeout        duration
+	}
+
+	// Link is one open connection.
+	type Link {
+		stream           net.Stream
+		// What was read and not yet taken as frames; the reading task's.
+		buf              byte[]
+		head             int
+		tail             int
+		writing          sync.Mutex
+		// How long a write and a reply may take.
+		timeout          duration
+		frameMax         int              = frameMinimum
+		channelMax       int              = 0
+		heartbeat        duration         = 0s
+		// What the broker said about itself.
+		server           map<string, any> = {}
+		control          Waiter
+		atomic lanes     map<int, Lane>
+		atomic failure   ?error           = none
+		atomic lastHeard time.Time
+		atomic blockedBy ?string          = none
+		atomic closing   bool             = false
+		// Told once when the link ends without `close` having been called.
+		onLost           ?def (error)     = none
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			self.timeout = timeout
+			buf.len(16384)
+			writing = new sync.Mutex()
+			control = new Waiter()
+			lastHeard = time.now()
+		}
+
+		def isOpen() bool {
+			return failure is none
+		}
+
+		// ---- writing ----
+
+		// write sends bytes whole; frames of one call are not mixed with
+		// another's.
+		// Fails with the connection's failure, and with ErrorKind.Connection
+		// when the write fails; the connection is then broken.
+		def write(data byte[]) !none {
+			writing.lock()
+			defer writing.unlock()
+			let broken = failure
+			fail broken unless broken is none
+			let sent = 0
+			let n = data.len()
+			for sent < n {
+				let wrote = stream.write(data[sent:n], timeout) onerror (err error) {
+					let failed = errorOf(ErrorKind.Connection, "amqp: write: {err.message}")
+					breakWith(failed)
+					fail failed
+				}
+				if wrote <= 0 {
+					let failed = errorOf(ErrorKind.Connection, "amqp: the connection closed while writing")
+					breakWith(failed)
+					fail failed
+				}
+				sent += wrote
+			}
+			return none
+		}
+
+		// ---- reading ----
+
+		// Makes `count` bytes available from `head`, each read waiting up
+		// to `wait`.
+		def need(count int, wait duration) !none {
+			return none when tail - head >= count
+			if head + count > buf.len() {
+				let kept = tail - head
+				if head > 0 {
+					for let i = 0; i < kept; i++ {
+						buf[i] = buf[head + i]
+					}
+					head = 0
+					tail = kept
+				}
+				if buf.len() < count {
+					let size = buf.len()
+					for size < count {
+						size = size * 2
+					}
+					buf.len(size)
+				}
+			}
+			for tail - head < count {
+				let got = stream.read(buf[tail:buf.len()], wait) onerror (err error) {
+					let late = false
+					late = err.kind == net.ErrorCode.TimedOut when err is net.NetError
+					fail errorOf(late ?? (ErrorKind.TimedOut, ErrorKind.Connection), "amqp: read: {err.message}")
+				}
+				fail errorOf(ErrorKind.Connection, "amqp: the broker closed the connection") when got <= 0
+				tail += got
+			}
+			return none
+		}
+
+		// Reads one frame: its type, its channel and its payload.
+		// Fails with ErrorKind.Protocol for bytes that are not a frame.
+		def readFrame(wait duration) !(int, int, byte[]) {
+			try need(7, wait)
+			let kind = int(buf[head])
+			if kind == 65 {
+				// "AMQP" and a version: the broker's answer to a protocol
+				// header it does not take.
+				try need(8, wait)
+				fail errorOf(ErrorKind.Protocol, "amqp: the broker does not speak AMQP 0-9-1; it offers {int(buf[head + 5])}-{int(buf[head + 6])}-{int(buf[head + 7])}")
+			}
+			let channel = (int(buf[head + 1]) << 8) | int(buf[head + 2])
+			let size = (int(buf[head + 3]) << 24) | (int(buf[head + 4]) << 16) | (int(buf[head + 5]) << 8) | int(buf[head + 6])
+			fail errorOf(ErrorKind.Protocol, "amqp: a frame of {size} bytes where {frameMax} is the limit") when size + frameOverhead > frameMax
+			try need(size + frameOverhead, wait)
+			fail errorOf(ErrorKind.Protocol, "amqp: a frame does not end where its size says") unless int(buf[head + 7 + size]) == frameEnd
+			let payload = buf[head + 7:head + 7 + size].clone()
+			head += size + frameOverhead
+			return (kind, channel, payload)
+		}
+
+		// The next method on channel 0 while the handshake runs, heartbeats
+		// skipped.
+		// Fails with the broker's close as an AmqpError.
+		def greeting(wait duration) !Reply {
+			for {
+				let (kind, channel, payload) = try readFrame(wait)
+				continue when kind == frameHeartbeat
+				fail errorOf(ErrorKind.Protocol, "amqp: a frame of type {kind} on channel {channel} before the connection is open") when kind != frameMethod || channel != 0
+				let reply = try replyOf(payload)
+				return reply unless reply.key == connectionClose
+				fail try closeOf(reply.args, "the broker refused the connection")
+			}
+			fail errorOf(ErrorKind.Protocol, "amqp: no reply")
+		}
+
+		// ---- handshake ----
+
+		// open runs the handshake: protocol header, authentication, tuning
+		// and the virtual host; then starts the reading and the heartbeat
+		// tasks.
+		// Fails with an AmqpError: ErrorKind.Denied when the broker refuses
+		// the user, the password or the virtual host, ErrorKind.Protocol
+		// when it does not speak AMQP 0-9-1, ErrorKind.Connection or
+		// ErrorKind.TimedOut when it stops answering.
+		def open(target Target) !none {
+			let wait = target.connectTimeout
+			try write(byte[65, 77, 81, 80, 0, 0, 9, 1])
+			let start = try greeting(wait)
+			fail errorOf(ErrorKind.Protocol, "amqp: expected connection.start") when start.key != connectionStart
+			let major = try start.args.u8()
+			let minor = try start.args.u8()
+			fail errorOf(ErrorKind.Protocol, "amqp: the broker speaks version {major}-{minor}, not 0-9") when major != 0 || minor != 9
+			server = try start.args.table()
+			let offered = string(try start.args.long()).split(" ")
+			let (mechanism, response) = try credentials(target)
+			fail errorOf(ErrorKind.Denied, "amqp: the broker does not take {mechanism} authentication; it offers {offered.join(", ")}") unless offered.includes(mechanism)
+
+			let capabilities map<string, any> = {"publisher_confirms": true, "consumer_cancel_notify": true, "exchange_exchange_bindings": true, "basic.nack": true, "connection.blocked": true, "authentication_failure_close": true}
+			let client map<string, any> = {"product": "adm.network.amqp", "version": "0.1.0", "platform": "ADM"}
+			client["capabilities"] = capabilities
+			client["connection_name"] = target.name when target.name != ""
+			let startOk = method(connectionStartOk)
+			try startOk.table(client)
+			try startOk.short(mechanism)
+			startOk.long(response)
+			try startOk.short("en_US")
+			try write(frame(frameMethod, 0, startOk.data))
+
+			let tune = greeting(wait) onerror (err error) {
+				// A broker without authentication_failure_close drops the
+				// connection on a wrong password.
+				let dropped = false
+				dropped = err.kind == ErrorKind.Connection when err is AmqpError
+				fail errorOf(ErrorKind.Denied, "amqp: the broker closed the connection during authentication: wrong user or password?") when dropped
+				fail err
+			}
+			fail errorOf(ErrorKind.Denied, "amqp: the broker asks for a challenge {mechanism} does not have") when tune.key == connectionSecure
+			fail errorOf(ErrorKind.Protocol, "amqp: expected connection.tune") when tune.key != connectionTune
+			channelMax = agreed(try tune.args.u16(), target.channelMax)
+			frameMax = agreed(try tune.args.u32(), target.frameMax)
+			fail errorOf(ErrorKind.Protocol, "amqp: the broker asks for frames of {frameMax} bytes, under the {frameMinimum} every peer takes") when frameMax != 0 && frameMax < frameMinimum
+			frameMax = 131072 when frameMax == 0
+			let theirs = try tune.args.u16()
+			let ours = int(int64(target.heartbeat) / 1000000000)
+			// Either side may turn heartbeats off for itself only: the other
+			// one's interval then holds.
+			let beat = theirs == 0 || ours == 0 ?? (theirs > ours ?? (theirs, ours), theirs < ours ?? (theirs, ours))
+			heartbeat = duration(int64(beat) * 1000000000)
+			let tuneOk = method(connectionTuneOk)
+			tuneOk.u16(channelMax)
+			tuneOk.u32(frameMax)
+			tuneOk.u16(beat)
+			try write(frame(frameMethod, 0, tuneOk.data))
+
+			let hello = method(connectionOpen)
+			try hello.short(target.vhost)
+			try hello.short("")
+			hello.bits(false)
+			try write(frame(frameMethod, 0, hello.data))
+			let opened = try greeting(wait)
+			fail errorOf(ErrorKind.Protocol, "amqp: expected connection.open-ok") when opened.key != connectionOpenOk
+
+			lastHeard = time.now()
+			let reader = async readLoop()
+			reader.keepAlive()
+			if beat > 0 {
+				let pulse = async beatLoop()
+				pulse.keepAlive()
+			}
+			return none
+		}
+
+		// What both sides can live with: the smaller of two limits, where 0
+		// is no limit.
+		def agreed(theirs int, ours int) int {
+			return ours when theirs == 0
+			return theirs when ours == 0
+			return theirs < ours ?? (theirs, ours)
+		}
+
+		// The reading task: every frame goes to channel 0 or to its
+		// channel until the connection fails or closes.
+		def readLoop() {
+			for failure is none {
+				let failed ?error = none
+				let (kind, channel, payload) = readFrame(unbounded) onerror (err error) {
+					failed = err
+					recover (0, 0, byte[])
+				}
+				if failed is none {
+					lastHeard = time.now()
+					dispatch(kind, channel, payload) onerror (err error) {
+						failed = err
+						recover none
+					}
+				}
+				breakWith(failed) unless failed is none
+			}
+		}
+
+		def dispatch(kind int, channel int, payload byte[]) !none {
+			return none when kind == frameHeartbeat
+			if channel != 0 {
+				let lane = laneOf(channel)
+				try lane.handle(kind, payload) unless lane is none
+				return none
+			}
+			fail errorOf(ErrorKind.Protocol, "amqp: a frame of type {kind} on channel 0") when kind != frameMethod
+			let reply = try replyOf(payload)
+			switch {
+				case reply.key == connectionClose:
+					let said = try closeOf(reply.args, "the broker closed the connection")
+					write(frame(frameMethod, 0, method(connectionCloseOk).data)) onerror recover none
+					fail said
+				case reply.key == connectionBlocked:
+					blockedBy = try reply.args.short()
+				case reply.key == connectionUnblocked:
+					blockedBy = none
+				default:
+					control.put(reply)
+			}
+			return none
+		}
+
+		// The heartbeat task: a frame every half interval, and the
+		// connection is given up when the broker was silent for two.
+		def beatLoop() {
+			let half = duration(int64(heartbeat) / 2)
+			let beat = frame(frameHeartbeat, 0, [])
+			for failure is none {
+				time.sleep(half)
+				break unless failure is none
+				if time.now() - lastHeard > heartbeat + heartbeat {
+					breakWith(errorOf(ErrorKind.Connection, "amqp: the broker sent nothing for two heartbeat intervals"))
+					break
+				}
+				write(beat) onerror recover none
+			}
+		}
+
+		// breakWith ends the connection with a failure, the first one given:
+		// the stream closes and everything that waits fails with it.
+		def breakWith(err error) {
+			return unless fall(err)
+			stream.close() onerror recover none
+			for let lane in takeLanes() {
+				lane.abort(err)
+			}
+			control.wake()
+			let tell = onLost
+			tell(err) unless tell is none || closing
+		}
+
+		atomic def fall(err error) bool {
+			return false unless failure is none
+			failure = err
+			return true
+		}
+
+		// ---- channel 0 calls ----
+
+		// Sends a method on channel 0 and returns the broker's answer to
+		// it.
+		def call(payload byte[], want int) !Reply {
+			try write(frame(frameMethod, 0, payload))
+			let deadline = time.now() + timeout
+			for {
+				let reply = control.take()
+				if !(reply is none) {
+					continue when reply.key != want
+					return reply
+				}
+				let broken = failure
+				fail broken unless broken is none
+				let left = deadline - time.now()
+				fail errorOf(ErrorKind.TimedOut, "amqp: no answer from the broker within {timeout}") when left <= 0s
+				let sleep = time.sleepChan(left)
+				select {
+					case control.signal:
+						control.signal.flush()
+					case sleep:
+				}
+			}
+			fail errorOf(ErrorKind.Protocol, "amqp: no reply")
+		}
+
+		// close says goodbye and closes the stream. Never fails: a broker
+		// that does not answer is left behind.
+		def close() {
+			return unless failure is none
+			closing = true
+			let bye = method(connectionClose)
+			bye.u16(200)
+			bye.short("") onerror recover none
+			bye.u16(0)
+			bye.u16(0)
+			call(bye.data, connectionCloseOk) onerror recover Reply{key: 0, args: new Decoder([])}
+			breakWith(errorOf(ErrorKind.Closed, "amqp: the connection is closed"))
+		}
+
+		// ---- channels ----
+
+		// openLane opens a channel under the lowest free number.
+		// Fails with an AmqpError: ErrorKind.Argument when every number the
+		// broker allows is in use, and as `Lane.call` does.
+		def openLane() !Lane {
+			let broken = failure
+			fail broken unless broken is none
+			let lane = claim()
+			fail errorOf(ErrorKind.Argument, "amqp: the connection has all its {channelMax} channels open") when lane is none
+			let hello = method(channelOpen)
+			try hello.short("")
+			lane.call(hello.data, channelOpenOk) onerror (err error) {
+				forget(lane.id)
+				fail err
+			}
+			return lane
+		}
+
+		atomic def claim() ?Lane {
+			let limit = channelMax == 0 ?? (65535, channelMax)
+			for let id = 1; id <= limit; id++ {
+				if !lanes.hasKey(id) {
+					let lane = new Lane(self, id)
+					lanes[id] = lane
+					return lane
+				}
+			}
+			return none
+		}
+
+		atomic def laneOf(id int) ?Lane {
+			return lanes.get(id)
+		}
+
+		atomic def forget(id int) {
+			lanes.delete(id)
+		}
+
+		atomic def takeLanes() Lane[] {
+			let all Lane[] = []
+			for let (_, lane) in lanes {
+				all.push(lane)
+			}
+			lanes = {}
+			return all
+		}
+	}
+
+	// The method a frame's payload holds, its arguments still to read.
+	def replyOf(payload byte[]) !Reply {
+		let args = new Decoder(payload)
+		let classId = try args.u16()
+		let methodId = try args.u16()
+		return Reply{key: (classId << 16) | methodId, args: args}
+	}
+
+	// The error a connection.close or a channel.close stands for.
+	def closeOf(args Decoder, about string) !AmqpError {
+		let replyCode = try args.u16()
+		let replyText = try args.short()
+		return serverError(replyCode, replyText, about)
+	}
+
+	// The SASL mechanism a target asks for and its response.
+	// Fails with ErrorKind.Argument when the user or password cannot be
+	// sent.
+	def credentials(target Target) !(string, byte[]) {
+		match target.auth {
+			case Auth.Plain:
+				let response byte[] = [byte(0)]
+				response.push(...target.username.bytes())
+				response.push(byte(0))
+				response.push(...target.password.bytes())
+				return ("PLAIN", response)
+			case Auth.AMQPlain:
+				let fields = new Encoder()
+				try fields.short("LOGIN")
+				try fields.field(target.username, "LOGIN")
+				try fields.short("PASSWORD")
+				try fields.field(target.password, "PASSWORD")
+				return ("AMQPLAIN", fields.data)
+			case Auth.External:
+				return ("EXTERNAL", byte[])
+		}
+	}
+
+	// dial opens a connection, under TLS when the target asks, and runs
+	// the handshake.
+	// Fails with an AmqpError: ErrorKind.Connection when the broker cannot
+	// be reached or TLS fails, and as `Link.open` does.
+	def dial(target Target) !Link {
+		let address = target.host.contains(":") ?? ("[{target.host}]:{target.port}", "{target.host}:{target.port}")
+		let socket = net.dialStream(address, target.connectTimeout) onerror (err error) {
+			fail errorOf(ErrorKind.Connection, "amqp: {err.message}")
+		}
+		let stream net.Stream = socket
+		if target.secure {
+			let config = tls.Config{}
+			let given = target.tlsConfig
+			config = given unless given is none
+			config.serverName = target.host when config.serverName == ""
+			let secured = tls.client(socket, config)
+			secured.handshake(target.connectTimeout) onerror (err error) {
+				socket.close() onerror recover none
+				fail errorOf(ErrorKind.Connection, "amqp: TLS: {err.message}")
+			}
+			stream = secured
+		}
+		let link = new Link(stream, target.timeout)
+		link.open(target) onerror (err error) {
+			link.breakWith(err)
+			fail err
+		}
+		return link
+	}
+}

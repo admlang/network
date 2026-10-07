@@ -1,0 +1,698 @@
+// One channel of a connection: calls and their replies, messages put
+// together from their frames, publisher confirms, consumers.
+internal partial module adm.network.amqp.wire {
+	use (
+		std.sync
+		std.time
+		adm.network.amqp::*
+	)
+
+	// Receipt is the broker's word on one published message.
+	type Receipt {
+		atomic done     bool          = false
+		atomic accepted bool          = false
+		// The message as the broker sent it back, when it could not route
+		// it.
+		atomic returned ?Returned     = none
+		atomic failure  ?error        = none
+		// True when the publisher waits for this receipt itself; the
+		// others are counted for `waitConfirms`.
+		waited          bool          = false
+		signal          channel<none>
+
+		def new() {
+			signal = new channel<none>(1)
+		}
+
+		def settle(accepted bool, returned ?Returned, failure ?error) {
+			self.accepted = accepted
+			self.returned = returned
+			self.failure = failure
+			done = true
+			signal <- none when signal.len() == 0
+		}
+	}
+
+	// Feed is where a consumer's deliveries wait: for `next`, or for the
+	// task that runs its handler one delivery at a time.
+	type Feed {
+		tag            string
+		handler        ?def (Delivery) = none
+		atomic pending Delivery[]      = []
+		atomic running bool            = false
+		// Why no more deliveries come.
+		atomic ended   ?error          = none
+		signal         channel<none>
+
+		def new(tag string, handler ?def (Delivery)) {
+			self.tag = tag
+			self.handler = handler
+			signal = new channel<none>(1)
+		}
+
+		def put(d Delivery) {
+			let starts = push(d)
+			if handler is none {
+				signal <- none when signal.len() == 0
+			} else if starts {
+				let task = async drain()
+				task.keepAlive()
+			}
+		}
+
+		// stop ends the feed; what it holds can still be taken.
+		def stop(err error) {
+			ended = err when ended is none
+			signal <- none when signal.len() == 0
+		}
+
+		// Queues a delivery; true when no task is draining.
+		atomic def push(d Delivery) bool {
+			pending.push(d)
+			return false when running
+			running = true unless handler is none
+			return !(handler is none)
+		}
+
+		atomic def shift() ?Delivery {
+			if pending.len() == 0 {
+				running = false
+				return none
+			}
+			return pending.shift()
+		}
+
+		def drain() {
+			let run = handler
+			return when run is none
+			for {
+				let d = shift()
+				break when d is none
+				run(d)
+			}
+		}
+
+		// The next delivery, waiting up to `wait` (0s without end); none
+		// when the wait ends first.
+		// Fails with what ended the feed once it is empty.
+		def take(wait duration) !?Delivery {
+			let deadline = time.now() + wait
+			for {
+				let d = shift()
+				return d unless d is none
+				let over = ended
+				fail over unless over is none
+				if wait > 0s {
+					let left = deadline - time.now()
+					return none when left <= 0s
+					let sleep = time.sleepChan(left)
+					select {
+						case signal:
+							signal.flush()
+						case sleep:
+					}
+				} else {
+					select {
+						case signal:
+							signal.flush()
+					}
+				}
+			}
+			return none
+		}
+	}
+
+	// Lane is one open channel.
+	type Lane {
+		link              Link
+		id                int
+		replies           Waiter
+		calling           sync.Mutex
+		publishing        sync.Mutex
+		atomic failure    ?error            = none
+		// Set while the channel waits for the broker's answer to its
+		// close: nothing else it sends matters any more.
+		atomic closing    bool              = false
+		atomic feeds      map<string, Feed>
+		atomic nextTag    int               = 1
+		// Publisher confirms: whether they are on, the number of the last
+		// message published, the receipts still open, how many messages
+		// the broker refused since the last `waitConfirms`.
+		atomic confirming bool              = false
+		atomic published  int               = 0
+		atomic receipts   map<int, Receipt>
+		atomic refused    int               = 0
+		atomic lastReturn ?Returned         = none
+		settled           channel<none>
+		// False while the broker asked the channel to stop publishing.
+		atomic flowing    bool              = true
+		onReturn          ?def (Returned)   = none
+		// True on a connection that comes back: a broken link leaves the
+		// consumers waiting for the next one instead of ending them.
+		keep              bool              = false
+		// The message being put together from its frames; the reading
+		// task's.
+		contentKey        int               = 0
+		contentArgs       Decoder
+		content           Message
+		contentSize       int               = 0
+
+		def new(link Link, id int) {
+			self.link = link
+			self.id = id
+			replies = new Waiter()
+			calling = new sync.Mutex()
+			publishing = new sync.Mutex()
+			settled = new channel<none>(1)
+			contentArgs = new Decoder([])
+			content = Message{}
+		}
+
+		def isOpen() bool {
+			return failure is none
+		}
+
+		// ---- calls ----
+
+		// call sends a method and returns the broker's answer to it, which
+		// must be one of `wants`. One task calls at a time.
+		// Fails with an AmqpError: the broker's close of the channel or the
+		// connection, ErrorKind.Closed after `close`, ErrorKind.TimedOut
+		// when no answer comes in time (the channel is then closed),
+		// ErrorKind.Connection when the connection breaks.
+		def call(payload byte[], wants ...int) !Reply {
+			calling.lock()
+			defer calling.unlock()
+			let broken = failure
+			fail broken unless broken is none
+			try link.write(frame(frameMethod, id, payload))
+			return try answer(wants)
+		}
+
+		def answer(wants int[]) !Reply {
+			let deadline = time.now() + link.timeout
+			for {
+				let reply = replies.take()
+				if !(reply is none) {
+					return reply when wants.includes(reply.key)
+					let stray = errorOf(ErrorKind.Protocol, "amqp: the broker answered with method {reply.key >> 16}.{reply.key & 0xFFFF} on channel {id}")
+					abort(stray)
+					fail stray
+				}
+				let broken = failure
+				fail broken unless broken is none
+				let left = deadline - time.now()
+				if left <= 0s {
+					// A late answer would be taken for the next call's.
+					let late = errorOf(ErrorKind.TimedOut, "amqp: no answer from the broker within {link.timeout}")
+					link.forget(id)
+					abort(late)
+					fail late
+				}
+				let sleep = time.sleepChan(left)
+				select {
+					case replies.signal:
+						replies.signal.flush()
+					case sleep:
+				}
+			}
+			fail errorOf(ErrorKind.Protocol, "amqp: no reply")
+		}
+
+		// send writes a method that has no answer.
+		// Fails with an AmqpError as `Link.write` does, and with what closed
+		// the channel.
+		def send(payload byte[]) !none {
+			let broken = failure
+			fail broken unless broken is none
+			return try link.write(frame(frameMethod, id, payload))
+		}
+
+		// ---- publishing ----
+
+		// publish sends a message. With confirms on and `wait`, it returns
+		// once the broker took the message.
+		// Fails with an AmqpError: ErrorKind.Refused when the broker
+		// refuses the message, ErrorKind.Unroutable when it sends it back,
+		// ErrorKind.TimedOut when the confirm does not come or the broker
+		// keeps the channel stopped, ErrorKind.Argument for a property it
+		// cannot send, and as `send` does.
+		def publish(exchange string, routingKey string, m Message, mandatory bool, immediate bool, wait bool) !none {
+			let head = method(basicPublish)
+			head.u16(0)
+			try head.short(exchange)
+			try head.short(routingKey)
+			head.bits(mandatory, immediate)
+			let out = frame(frameMethod, id, head.data)
+			out.push(...frame(frameHeader, id, try propertiesOf(m)))
+			let room = link.frameMax - frameOverhead
+			let size = m.body.len()
+			for let at = 0; at < size; at += room {
+				let end = at + room < size ?? (at + room, size)
+				out.push(...frame(frameBody, id, m.body[at:end]))
+			}
+			try moving()
+			let receipt = try post(out, wait)
+			return none when receipt is none || !wait
+			let deadline = time.now() + link.timeout
+			for !receipt.done {
+				let left = deadline - time.now()
+				fail errorOf(ErrorKind.TimedOut, "amqp: the broker did not confirm the message within {link.timeout}") when left <= 0s
+				let sleep = time.sleepChan(left)
+				select {
+					case receipt.signal:
+						receipt.signal.flush()
+					case sleep:
+				}
+			}
+			let broken = receipt.failure
+			fail broken unless broken is none
+			let back = receipt.returned
+			fail serverError(back.replyCode, back.replyText, "the message to '{exchange}' with key '{routingKey}' came back") unless back is none
+			fail errorOf(ErrorKind.Refused, "amqp: the broker refused the message to '{exchange}' with key '{routingKey}'") unless receipt.accepted
+			return none
+		}
+
+		// Writes a message's frames and, with confirms on, opens its
+		// receipt: both in the order the broker numbers messages.
+		def post(frames byte[], waited bool) !?Receipt {
+			publishing.lock()
+			defer publishing.unlock()
+			let broken = failure
+			fail broken unless broken is none
+			let receipt = expect(waited)
+			try link.write(frames)
+			return receipt
+		}
+
+		atomic def expect(waited bool) ?Receipt {
+			return none unless confirming
+			published++
+			let receipt = new Receipt()
+			receipt.waited = waited
+			receipts[published] = receipt
+			return receipt
+		}
+
+		// Waits while the broker has the channel stopped.
+		def moving() !none {
+			return none when flowing
+			let deadline = time.now() + link.timeout
+			for !flowing {
+				let broken = failure
+				fail broken unless broken is none
+				fail errorOf(ErrorKind.TimedOut, "amqp: the broker kept the channel stopped for {link.timeout}") when time.now() > deadline
+				time.sleep(10ms)
+			}
+			return none
+		}
+
+		// The broker's word on the message numbered `tag`, or on all up to
+		// it.
+		atomic def confirm(tag int, multiple bool, accepted bool) {
+			let numbers int[] = []
+			if multiple {
+				for let (number, _) in receipts {
+					numbers.push(number) when number <= tag
+				}
+			} else if receipts.hasKey(tag) {
+				numbers.push(tag)
+			}
+			for let number in numbers {
+				let receipt = receipts.get(number)
+				receipts.delete(number)
+				continue when receipt is none
+				refused++ unless accepted || receipt.waited
+				// A message that comes back does so right before its
+				// confirm.
+				receipt.settle(accepted, number == tag ?? (lastReturn, none), none)
+			}
+			lastReturn = none
+			settled <- none when settled.len() == 0
+		}
+
+		atomic def openReceipts() int {
+			return receipts.len()
+		}
+
+		atomic def takeRefused() int {
+			let count = refused
+			refused = 0
+			return count
+		}
+
+		// waitConfirms returns when the broker has answered for every
+		// message published so far, waiting up to `wait` (0s without end).
+		// Fails with an AmqpError: ErrorKind.Refused when it refused any
+		// since the last call, ErrorKind.TimedOut when the wait ends first,
+		// and with what closed the channel.
+		def waitConfirms(wait duration) !none {
+			let deadline = time.now() + wait
+			for openReceipts() > 0 {
+				let broken = failure
+				fail broken unless broken is none
+				if wait > 0s {
+					let left = deadline - time.now()
+					fail errorOf(ErrorKind.TimedOut, "amqp: {openReceipts()} messages still unconfirmed after {wait}") when left <= 0s
+					let sleep = time.sleepChan(left)
+					select {
+						case settled:
+							settled.flush()
+						case sleep:
+					}
+				} else {
+					select {
+						case settled:
+							settled.flush()
+					}
+				}
+			}
+			let broken = failure
+			fail broken unless broken is none
+			let count = takeRefused()
+			fail errorOf(ErrorKind.Refused, "amqp: the broker refused {count} published messages") when count > 0
+			return none
+		}
+
+		// ---- consumers ----
+
+		// A consumer tag no consumer of the channel has.
+		atomic def freshTag() string {
+			let tag = "adm-{id}-{nextTag}"
+			nextTag++
+			return tag
+		}
+
+		atomic def addFeed(feed Feed) bool {
+			return false when feeds.hasKey(feed.tag)
+			feeds[feed.tag] = feed
+			return true
+		}
+
+		atomic def feedOf(tag string) ?Feed {
+			return feeds.get(tag)
+		}
+
+		atomic def dropFeed(tag string) ?Feed {
+			let feed = feeds.get(tag)
+			feeds.delete(tag)
+			return feed
+		}
+
+		atomic def takeFeeds() Feed[] {
+			let all Feed[] = []
+			for let (_, feed) in feeds {
+				all.push(feed)
+			}
+			feeds = {}
+			return all
+		}
+
+		atomic def takeReceipts() Receipt[] {
+			let all Receipt[] = []
+			for let (_, receipt) in receipts {
+				all.push(receipt)
+			}
+			receipts = {}
+			return all
+		}
+
+		// ---- frames from the broker ----
+
+		// handle takes one frame of this channel, on the reading task.
+		// Fails with ErrorKind.Protocol for a frame that does not belong
+		// where it comes; the connection is then closed.
+		def handle(kind int, payload byte[]) !none {
+			// A channel that waits for the answer to its close takes
+			// nothing but that answer.
+			if closing {
+				try methodIn(try replyOf(payload)) when kind == frameMethod
+				return none
+			}
+			switch {
+				case kind == frameMethod:
+					fail errorOf(ErrorKind.Protocol, "amqp: a method on channel {id} in the middle of a message") when contentKey != 0
+					let reply = try replyOf(payload)
+					try methodIn(reply)
+				case kind == frameHeader:
+					fail errorOf(ErrorKind.Protocol, "amqp: a message header on channel {id} that no method announced") when contentKey == 0
+					let args = new Decoder(payload)
+					try args.u16()
+					try args.u16()
+					contentSize = try args.u64()
+					content = try messageOf(args)
+					try complete() when contentSize == 0
+				case kind == frameBody:
+					fail errorOf(ErrorKind.Protocol, "amqp: a message body on channel {id} that no header announced") when contentKey == 0
+					content.body.push(...payload)
+					fail errorOf(ErrorKind.Protocol, "amqp: a message body on channel {id} longer than its header says") when content.body.len() > contentSize
+					try complete() when content.body.len() == contentSize
+				default:
+					fail errorOf(ErrorKind.Protocol, "amqp: a frame of unknown type {kind} on channel {id}")
+			}
+			return none
+		}
+
+		def methodIn(reply Reply) !none {
+			if closing {
+				// Only the end of the close matters now.
+				switch {
+					case reply.key == channelCloseOk:
+						replies.put(reply)
+					case reply.key == channelClose:
+						send(method(channelCloseOk).data) onerror recover none
+				}
+				return none
+			}
+			switch {
+				case reply.key := basicDeliver || basicReturn || basicGetOk:
+					contentKey = reply.key
+					contentArgs = reply.args
+				case reply.key == basicAck:
+					let tag = try reply.args.u64()
+					confirm(tag, try reply.args.bit(), true)
+				case reply.key == basicNack:
+					let tag = try reply.args.u64()
+					confirm(tag, try reply.args.bit(), false)
+				case reply.key == basicCancel:
+					let tag = try reply.args.short()
+					let quiet = try reply.args.bit()
+					let feed = dropFeed(tag)
+					feed.stop(errorOf(ErrorKind.Closed, "amqp: the broker cancelled the consumer {tag}: its queue is gone")) unless feed is none
+					if !quiet {
+						let ok = method(basicCancelOk)
+						try ok.short(tag)
+						try send(ok.data)
+					}
+				case reply.key == channelClose:
+					let said = try closeOf(reply.args, "the broker closed channel {id}")
+					link.write(frame(frameMethod, id, method(channelCloseOk).data)) onerror recover none
+					link.forget(id)
+					keep = false
+					abort(said)
+				case reply.key == channelFlow:
+					let active = try reply.args.bit()
+					flowing = active
+					let ok = method(channelFlowOk)
+					ok.bits(active)
+					try send(ok.data)
+				default:
+					replies.put(reply)
+			}
+			return none
+		}
+
+		// The message whose last frame arrived goes where its method says.
+		def complete() !none {
+			let key = contentKey
+			let args = contentArgs
+			let m = content
+			contentKey = 0
+			content = Message{}
+			contentSize = 0
+			switch {
+				case key == basicDeliver:
+					let tag = try args.short()
+					let d = new Delivery(self, m)
+					d.consumer = tag
+					d.tag = try args.u64()
+					d.redelivered = try args.bit()
+					d.exchange = try args.short()
+					d.routingKey = try args.short()
+					let feed = feedOf(tag)
+					feed.put(d) unless feed is none
+				case key == basicGetOk:
+					let d = new Delivery(self, m)
+					d.tag = try args.u64()
+					d.redelivered = try args.bit()
+					d.exchange = try args.short()
+					d.routingKey = try args.short()
+					d.remaining = try args.u32()
+					replies.put(Reply{key: basicGetOk, args: args, delivery: d})
+				case key == basicReturn:
+					let back = Returned{message: m}
+					back.replyCode = try args.u16()
+					back.replyText = try args.short()
+					back.exchange = try args.short()
+					back.routingKey = try args.short()
+					lastReturn = back when confirming
+					if !(onReturn is none) {
+						let task = async tell(back)
+						task.keepAlive()
+					}
+			}
+			return none
+		}
+
+		def tell(back Returned) {
+			let handler = onReturn
+			handler(back) unless handler is none
+		}
+
+		// ---- the end ----
+
+		// abort ends the channel with a failure, the first one given:
+		// calls, publishers and consumers that wait fail with it.
+		def abort(err error) {
+			return unless fall(err)
+			replies.wake()
+			for let feed in takeFeeds() {
+				feed.stop(err) unless keep
+			}
+			for let receipt in takeReceipts() {
+				receipt.settle(false, none, err)
+			}
+			settled <- none when settled.len() == 0
+		}
+
+		atomic def fall(err error) bool {
+			return false unless failure is none
+			failure = err
+			return true
+		}
+
+		// close tells the broker the channel is done. Never fails: a
+		// channel already closed, or a broker that does not answer, is left
+		// as it is.
+		def close() {
+			return unless failure is none
+			let bye = method(channelClose)
+			bye.u16(200)
+			bye.short("") onerror recover none
+			bye.u16(0)
+			bye.u16(0)
+			calling.lock()
+			closing = true
+			let sent = true
+			link.write(frame(frameMethod, id, bye.data)) onerror (err error) {
+				sent = false
+				recover none
+			}
+			if sent {
+				answer([channelCloseOk]) onerror recover Reply{key: 0, args: new Decoder([])}
+			}
+			calling.unlock()
+			link.forget(id)
+			keep = false
+			abort(errorOf(ErrorKind.Closed, "amqp: the channel is closed"))
+		}
+	}
+
+	// The payload of a content header frame for a message.
+	// Fails with ErrorKind.Argument for a property that cannot be sent.
+	def propertiesOf(m Message) !byte[] {
+		let flags = 0
+		let fields = new Encoder()
+		if m.contentType != "" {
+			flags |= 0x8000
+			try fields.short(m.contentType)
+		}
+		if m.contentEncoding != "" {
+			flags |= 0x4000
+			try fields.short(m.contentEncoding)
+		}
+		if m.headers.len() > 0 {
+			flags |= 0x2000
+			try fields.table(m.headers)
+		}
+		if m.persistent {
+			flags |= 0x1000
+			fields.u8(2)
+		}
+		if m.priority >= 0 {
+			fail errorOf(ErrorKind.Argument, "amqp: a priority of {m.priority} is over 255") when m.priority > 255
+			flags |= 0x0800
+			fields.u8(m.priority)
+		}
+		if m.correlationId != "" {
+			flags |= 0x0400
+			try fields.short(m.correlationId)
+		}
+		if m.replyTo != "" {
+			flags |= 0x0200
+			try fields.short(m.replyTo)
+		}
+		if m.expires > 0s {
+			flags |= 0x0100
+			try fields.short((int64(m.expires) / 1000000).str())
+		}
+		if m.messageId != "" {
+			flags |= 0x0080
+			try fields.short(m.messageId)
+		}
+		let stamp = m.timestamp
+		if !(stamp is none) {
+			flags |= 0x0040
+			fields.u64(int(stamp.unixNs() / 1000000000))
+		}
+		if m.kind != "" {
+			flags |= 0x0020
+			try fields.short(m.kind)
+		}
+		if m.userId != "" {
+			flags |= 0x0010
+			try fields.short(m.userId)
+		}
+		if m.appId != "" {
+			flags |= 0x0008
+			try fields.short(m.appId)
+		}
+		let head = new Encoder()
+		head.u16(60)
+		head.u16(0)
+		head.u64(m.body.len())
+		head.u16(flags)
+		head.data.push(...fields.data)
+		return head.data
+	}
+
+	// The message a content header describes, its body still to come.
+	def messageOf(args Decoder) !Message {
+		let flags = try args.u16()
+		// A set low bit says more flag words follow; no property of the
+		// protocol lives there.
+		let more = flags
+		for more & 1 == 1 {
+			more = try args.u16()
+		}
+		let m = Message{}
+		m.contentType = try args.short() when flags & 0x8000 != 0
+		m.contentEncoding = try args.short() when flags & 0x4000 != 0
+		m.headers = try args.table() when flags & 0x2000 != 0
+		m.persistent = (try args.u8()) == 2 when flags & 0x1000 != 0
+		m.priority = try args.u8() when flags & 0x0800 != 0
+		m.correlationId = try args.short() when flags & 0x0400 != 0
+		m.replyTo = try args.short() when flags & 0x0200 != 0
+		if flags & 0x0100 != 0 {
+			let text = try args.short()
+			m.expires = duration(text.toInt<int64>() * 1000000) when /^[0-9]{1,15}$/.test(text)
+		}
+		m.messageId = try args.short() when flags & 0x0080 != 0
+		m.timestamp = time.fromUnixNs(int64(try args.u64()) * 1000000000) when flags & 0x0040 != 0
+		m.kind = try args.short() when flags & 0x0020 != 0
+		m.userId = try args.short() when flags & 0x0010 != 0
+		m.appId = try args.short() when flags & 0x0008 != 0
+		try args.short() when flags & 0x0004 != 0
+		return m
+	}
+}

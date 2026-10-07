@@ -195,16 +195,75 @@ bucket.get("missing") onerror (err error) {
 }
 ```
 
+## Credentials
+
+Give the keys in the address or in `accessKey`, `secretKey` and `sessionToken`, or let the
+client find them where AWS tools do:
+
+```adm
+let store = new s3.Client()
+try store.credentials()                       // or credentials("work") for a profile
+try store.connect("https://s3.amazonaws.com")
+```
+
+`credentials` looks, in this order, at `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+(`AWS_SESSION_TOKEN`); the role of `AWS_ROLE_ARN` for the token in
+`AWS_WEB_IDENTITY_TOKEN_FILE` (a Kubernetes service account); the profile in
+`~/.aws/credentials` and `~/.aws/config` (`AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE`,
+`AWS_CONFIG_FILE`; a `role_arn` with `source_profile`, a `credential_process` (run through
+the shell, so the application's policy must allow starting programs), and a profile signed in
+with `aws sso login`, whose token is renewed when it ends, included); the address a container
+platform gives (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`); the instance metadata
+service of a cloud machine (`AWS_EC2_METADATA_DISABLED=true` skips it). `AWS_REGION`,
+`AWS_DEFAULT_REGION` or the profile's `region` becomes the region unless one was set.
+
+`store.assumeRole(role, session, length, externalId)` trades the client's keys for the temporary
+ones of a role, through STS (AWS's, or the endpoint itself for MinIO and the like); call it
+after `connect`. Temporary credentials of every source are renewed five minutes before they
+end.
+
+`regionSet = "*"` (or a list of regions) signs with Signature Version 4A, which multi-region
+access points ask for.
+
+## Checksums
+
+```adm
+try bucket.put("a.bin", data, "", s3.WriteOptions{checksum: s3.Checksum.Crc32c})
+let object = try bucket.get("a.bin", s3.ReadOptions{checksum: true})
+print(object.info.checksums["crc32c"])        // base64
+let content = try object.bytes()              // checked against it
+```
+
+`Checksum` is `Crc32`, `Crc32c`, `Sha1` or `Sha256`. S3 refuses content that does not match
+and keeps the checksum with the object. Content from memory sends it ahead; a stream sends it
+after the content, signed; `upload` and `multipart` give every part its own, and the object the
+checksum of those (it ends in `-N`).
+
+## Lifecycle and CORS
+
+```adm
+try bucket.lifecycle([
+	s3.LifecycleRule{id: "old-logs", prefix: "logs/", expireAfterDays: 30},
+	s3.LifecycleRule{id: "tier", transitions: [s3.Transition{days: 90, storageClass: "GLACIER"}]},
+])
+try bucket.cors([s3.CorsRule{origins: ["https://app.example.com"], methods: ["GET", "PUT"], headers: ["*"], maxAge: 1h}])
+let rules = try bucket.lifecycle()            // [] when none are set
+```
+
+A `LifecycleRule` covers objects by `prefix`, `labels`, `largerThan` and `smallerThan`, and sets
+`expireAfterDays`/`expireOn`, `expireDeleteMarkers`, `noncurrentAfterDays` with
+`keepNoncurrent`, `abortUploadsAfterDays`, `transitions` and `noncurrentTransitions`. An empty
+list removes the rules.
+
 ## Not built yet
 
-- Credentials from the environment, the shared credentials file, instance metadata or STS:
-  the application reads them and sets `accessKey`, `secretKey` and `sessionToken`.
-- Signature Version 4A (multi-region access points), S3 Express session authentication, and
-  the dual-stack, FIPS and access-point host names of AWS (such an endpoint works when given
-  whole, with `region` set).
-- Additional checksums (`x-amz-checksum-*`) and unsigned streaming with trailers.
-- Typed lifecycle, CORS, replication, notification, ACL and Object Lock settings; they travel
-  as documents through `configuration`.
+- S3 Express session authentication, and the dual-stack, FIPS and access-point host names of
+  AWS (such an endpoint works when given whole, with `region` set).
+- Under Signature Version 4A a stream is sent unsigned (HTTPS only) and carries no checksum.
+- The CRC-64/NVME checksum, and checking a checksum while an object is read as a stream
+  (`Object.bytes` checks it).
+- Typed replication, notification, ACL and Object Lock settings; they travel as documents
+  through `configuration`.
 - S3 Select, Batch Operations, inventory and the control-plane APIs.
 - Parallel ranged download of one object.
 
@@ -222,3 +281,9 @@ ADM_TEST_S3=http://admtest:admtest-secret-key@127.0.0.1:9000 adm test network/s3
 Not covered by the suite: HTTPS endpoints, customer-provided keys (`customerKey`, which S3
 takes over HTTPS only), temporary credentials, copying an object over 5 GiB, and Amazon S3
 itself; the suite runs against MinIO.
+
+`credentials_test.adm` runs the credential sources against files and a metadata server of its
+own, and `assumeRole` against the test server. Bucket CORS is checked as XML only: MinIO keeps
+none per bucket. `testservers/v4a-check.py` compares Signature Version 4A with AWS's signer
+(`awscrt`): its signature must verify over the string the test signed, under the key the test
+derived.

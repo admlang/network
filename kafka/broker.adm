@@ -1,0 +1,667 @@
+// One connection to one broker: requests go out with a correlation
+// number, a reading task hands each response to the task that asked.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.net
+		std.net.sasl
+		std.net.tls
+		std.sync
+		std.time
+		adm.network.kafka::*
+	)
+
+	// The requests the client sends, by their API key.
+	const (
+		apiProduce            = 0
+		apiFetch              = 1
+		apiListOffsets        = 2
+		apiMetadata           = 3
+		apiOffsetCommit       = 8
+		apiOffsetFetch        = 9
+		apiFindCoordinator    = 10
+		apiJoinGroup          = 11
+		apiHeartbeat          = 12
+		apiLeaveGroup         = 13
+		apiSyncGroup          = 14
+		apiDescribeGroups     = 15
+		apiListGroups         = 16
+		apiSaslHandshake      = 17
+		apiVersions           = 18
+		apiCreateTopics       = 19
+		apiDeleteTopics       = 20
+		apiDeleteRecords      = 21
+		apiInitProducerId     = 22
+		apiAddPartitionsToTxn = 24
+		apiAddOffsetsToTxn    = 25
+		apiEndTxn             = 26
+		apiTxnOffsetCommit    = 28
+		apiDescribeConfigs    = 32
+		apiSaslAuthenticate   = 36
+		apiCreatePartitions   = 37
+		apiDeleteGroups       = 42
+		apiAlterConfigs       = 44
+		apiGroupHeartbeat     = 68
+	)
+
+	// The version of each request the client speaks: the newest one
+	// before the "flexible" encodings, which every broker from Kafka 2.4
+	// on understands.
+	def versionOf(api int) int {
+		match api {
+			case 0:
+				return 7
+			case 1:
+				return 11
+			case 2:
+				return 4
+			case 3:
+				return 5
+			case 8:
+				return 7
+			case 9:
+				return 5
+			case 10:
+				return 2
+			case 11:
+				return 5
+			case 12:
+				return 3
+			case 13:
+				return 3
+			case 14:
+				return 3
+			case 15:
+				return 4
+			case 16:
+				return 2
+			case 17:
+				return 1
+			case 18:
+				return 0
+			case 19:
+				return 4
+			case 20:
+				return 3
+			case 21:
+				return 1
+			case 22:
+				return 1
+			case 24:
+				return 1
+			case 25:
+				return 1
+			case 26:
+				return 1
+			case 28:
+				return 2
+			case 32:
+				return 2
+			case 36:
+				return 1
+			case 37:
+				return 1
+			case 42:
+				return 1
+			case 44:
+				return 0
+			default:
+				return 0
+		}
+	}
+
+	// Login is how a connection is secured and who it logs in as.
+	struct Login {
+		secure         bool
+		tlsConfig      ?tls.Config
+		// "" for none, or PLAIN, SCRAM-SHA-256, SCRAM-SHA-512,
+		// OAUTHBEARER.
+		mechanism      string
+		username       string
+		password       string
+		clientId       string
+		connectTimeout duration
+		timeout        duration
+	}
+
+	// Pending is a request that waits for its response.
+	type Pending {
+		correlation     int
+		atomic response ?byte[]       = none
+		signal          channel<none>
+
+		def new(correlation int) {
+			self.correlation = correlation
+			signal = new channel<none>(1)
+		}
+
+		def settle(response byte[]) {
+			self.response = response
+			signal <- none when signal.len() == 0
+		}
+	}
+
+	// Broker is one open connection.
+	type Broker {
+		stream          net.Stream
+		host            string
+		port            int
+		clientId        string
+		timeout         duration
+		writing         sync.Mutex
+		// Requests in the order they were written: a broker answers in
+		// that order.
+		atomic waiting  Pending[]     = []
+		atomic sequence int           = 0
+		atomic failure  ?error        = none
+		// What was read and not yet taken as responses; the reading
+		// task's.
+		buf             byte[]
+		head            int
+		tail            int
+		// The newest version of each request the broker takes, by API key.
+		newest          map<int, int>
+		oldest          map<int, int>
+
+		def new(stream net.Stream, host string, port int, clientId string, timeout duration) {
+			self.stream = stream
+			self.host = host
+			self.port = port
+			self.clientId = clientId
+			self.timeout = timeout
+			writing = new sync.Mutex()
+			buf.len(65536)
+		}
+
+		def isOpen() bool {
+			return failure is none
+		}
+
+		// call sends a request and returns its response, waiting up to
+		// `wait` beyond what the request itself asks the broker to wait.
+		// Fails with a KafkaError: ErrorKind.Connection when the connection
+		// breaks, ErrorKind.TimedOut when no response comes (the connection
+		// is then closed: later responses could not be told apart),
+		// ErrorKind.Unsupported when the broker does not take the version.
+		def call(api int, body Encoder, wait duration = 0s) !Decoder {
+			return try callAt(api, versionOf(api), false, body, wait)
+		}
+
+		// callAt is `call` for a version named by the caller. A `flexible`
+		// one has tagged fields after its headers: the request's is
+		// written, the response's passed over.
+		def callAt(api int, version int, flexible bool, body Encoder, wait duration = 0s) !Decoder {
+			if newest.len() > 0 {
+				let fits = false
+				if newest.hasKey(api) && oldest.hasKey(api) {
+					fits = version <= newest[api] && version >= oldest[api]
+				}
+				fail errorOf(ErrorKind.Unsupported, "kafka: the broker {host}:{port} does not take request {api} in version {version}") unless fits
+			}
+			let pending = try post(api, version, body, true, flexible)
+			let limit = timeout + wait
+			let deadline = time.now() + limit
+			for {
+				let response = pending.response
+				if !(response is none) {
+					let answer = new Decoder(response)
+					try answer.tagged() when flexible
+					return answer
+				}
+				let broken = failure
+				fail broken unless broken is none
+				let left = deadline - time.now()
+				if left <= 0s {
+					let late = errorOf(ErrorKind.TimedOut, "kafka: no response from {host}:{port} within {limit}")
+					breakWith(late)
+					fail late
+				}
+				let sleep = time.sleepChan(left)
+				select {
+					case pending.signal:
+						pending.signal.flush()
+					case sleep:
+				}
+			}
+			fail errorOf(ErrorKind.Protocol, "kafka: no response")
+		}
+
+		// cast sends a request the broker does not answer (a produce
+		// request that asks for no acknowledgement).
+		// Fails with a KafkaError as `call` does when writing.
+		def cast(api int, body Encoder) !none {
+			try post(api, versionOf(api), body, false)
+			return none
+		}
+
+		// Writes a request and, when it has a response, queues it for it,
+		// in one order.
+		def post(api int, version int, body Encoder, answered bool = true, flexible bool = false) !Pending {
+			writing.lock()
+			defer writing.unlock()
+			let broken = failure
+			fail broken unless broken is none
+			let pending = answered ?? (enqueue(), new Pending(number()))
+			let head = new Encoder()
+			head.i32(0)
+			head.i16(api)
+			head.i16(version)
+			head.i32(pending.correlation)
+			head.text(clientId)
+			head.tagged() when flexible
+			head.raw(body.data)
+			let size = head.data.len() - 4
+			head.data[0] = byte((size >> 24) & 0xFF)
+			head.data[1] = byte((size >> 16) & 0xFF)
+			head.data[2] = byte((size >> 8) & 0xFF)
+			head.data[3] = byte(size & 0xFF)
+			let sent = 0
+			let n = head.data.len()
+			for sent < n {
+				let wrote = stream.write(head.data[sent:n], timeout) onerror (err error) {
+					let failed = errorOf(ErrorKind.Connection, "kafka: write to {host}:{port}: {err.message}")
+					breakWith(failed)
+					fail failed
+				}
+				if wrote <= 0 {
+					let failed = errorOf(ErrorKind.Connection, "kafka: the connection to {host}:{port} closed while writing")
+					breakWith(failed)
+					fail failed
+				}
+				sent += wrote
+			}
+			return pending
+		}
+
+		atomic def number() int {
+			sequence = (sequence + 1) & 0x7FFFFFFF
+			return sequence
+		}
+
+		atomic def enqueue() Pending {
+			sequence = (sequence + 1) & 0x7FFFFFFF
+			let pending = new Pending(sequence)
+			waiting.push(pending)
+			return pending
+		}
+
+		atomic def dequeue() ?Pending {
+			return none when waiting.len() == 0
+			return waiting.shift()
+		}
+
+		atomic def takeWaiting() Pending[] {
+			let all = waiting
+			waiting = []
+			return all
+		}
+
+		// Makes `count` bytes available from `head`.
+		def need(count int, wait duration) !none {
+			return none when tail - head >= count
+			if head + count > buf.len() {
+				let kept = tail - head
+				if head > 0 {
+					for let i = 0; i < kept; i++ {
+						buf[i] = buf[head + i]
+					}
+					head = 0
+					tail = kept
+				}
+				if buf.len() < count {
+					let size = buf.len()
+					for size < count {
+						size = size * 2
+					}
+					buf.len(size)
+				}
+			}
+			for tail - head < count {
+				let got = stream.read(buf[tail:buf.len()], wait) onerror (err error) {
+					fail errorOf(ErrorKind.Connection, "kafka: read from {host}:{port}: {err.message}")
+				}
+				fail errorOf(ErrorKind.Connection, "kafka: the broker {host}:{port} closed the connection") when got <= 0
+				tail += got
+			}
+			return none
+		}
+
+		// One response: its correlation number and what follows it.
+		def readResponse(wait duration) !(int, byte[]) {
+			try need(4, wait)
+			let size = (int(buf[head]) << 24) | (int(buf[head + 1]) << 16) | (int(buf[head + 2]) << 8) | int(buf[head + 3])
+			fail errorOf(ErrorKind.Protocol, "kafka: a response of {size} bytes from {host}:{port}") when size < 4 || size > (1 << 30)
+			try need(4 + size, wait)
+			let correlation = (int(buf[head + 4]) << 24) | (int(buf[head + 5]) << 16) | (int(buf[head + 6]) << 8) | int(buf[head + 7])
+			let body = buf[head + 8:head + 4 + size].clone()
+			head += 4 + size
+			return (correlation, body)
+		}
+
+		// The reading task: every response goes to the oldest request that
+		// waits.
+		def readLoop() {
+			for failure is none {
+				let failed ?error = none
+				let (correlation, body) = readResponse(87600h) onerror (err error) {
+					failed = err
+					recover (0, byte[])
+				}
+				if failed is none {
+					let pending = dequeue()
+					if pending is none || pending.correlation != correlation {
+						failed = errorOf(ErrorKind.Protocol, "kafka: {host}:{port} answered a request that was not asked")
+					} else {
+						pending.settle(body)
+					}
+				}
+				breakWith(failed) unless failed is none
+			}
+		}
+
+		// breakWith ends the connection with a failure, the first one given.
+		def breakWith(err error) {
+			return unless fall(err)
+			stream.close() onerror recover none
+			for let pending in takeWaiting() {
+				pending.signal <- none when pending.signal.len() == 0
+			}
+		}
+
+		atomic def fall(err error) bool {
+			return false unless failure is none
+			failure = err
+			return true
+		}
+
+		def close() {
+			breakWith(errorOf(ErrorKind.Closed, "kafka: the connection is closed"))
+		}
+
+		// ---- opening ----
+
+		// greet asks the broker which requests it takes and logs in.
+		// Fails with a KafkaError: ErrorKind.Denied when the broker refuses
+		// the user or password, ErrorKind.Unsupported when it does not
+		// know the mechanism, and as `call` does.
+		def greet(login Login) !none {
+			let versions = try call(apiVersions, new Encoder())
+			let code = try versions.i16()
+			fail brokerError(code, "asking {host}:{port} for its versions") when code != 0
+			for let n = try versions.count(); n > 0; n-- {
+				let api = try versions.i16()
+				oldest[api] = try versions.i16()
+				newest[api] = try versions.i16()
+			}
+			return none when login.mechanism == ""
+
+			let hello = new Encoder()
+			hello.text(login.mechanism)
+			let offered = try call(apiSaslHandshake, hello)
+			code = try offered.i16()
+			let mechanisms = try offered.texts()
+			fail errorOf(ErrorKind.Unsupported, "kafka: {host}:{port} does not take {login.mechanism} logins; it offers {mechanisms.join(", ")}", code) when code != 0
+			match login.mechanism {
+				case "PLAIN":
+					let token byte[] = [byte(0)]
+					token.push(...login.username.bytes())
+					token.push(byte(0))
+					token.push(...login.password.bytes())
+					try authenticate(token)
+				case "OAUTHBEARER":
+					// RFC 7628: the bearer token is the password.
+					let token = "n,,".bytes()
+					token.push(byte(1))
+					token.push(...("auth=Bearer {login.password}".bytes()))
+					token.push(byte(1), byte(1))
+					try authenticate(token)
+				default:
+					let kind = sasl.scramMechanismOf(login.mechanism)
+					fail errorOf(ErrorKind.Argument, "kafka: '{login.mechanism}' is not a login mechanism the client knows") when kind is none
+					let secret Secret<string> = login.password
+					let scram = new sasl.ScramClient(login.username, secret, kind)
+					let first = scram.first() onerror (err error) {
+						fail errorOf(ErrorKind.Denied, "kafka: {err.message}")
+					}
+					let challenge = try authenticate(first.bytes())
+					let final = scram.final(string(challenge)) onerror (err error) {
+						fail errorOf(ErrorKind.Denied, "kafka: {host}:{port}: {err.message}")
+					}
+					let proof = try authenticate(final.bytes())
+					scram.verify(string(proof)) onerror (err error) {
+						fail errorOf(ErrorKind.Denied, "kafka: {host}:{port} did not prove it knows the password: {err.message}")
+					}
+			}
+			return none
+		}
+
+		// One step of a login: sends the client's bytes, returns the
+		// broker's.
+		def authenticate(token byte[]) !byte[] {
+			let step = new Encoder()
+			step.bytes(token)
+			let answer = try call(apiSaslAuthenticate, step)
+			let code = try answer.i16()
+			let said = try answer.maybe()
+			if code != 0 {
+				let why = said is none ?? ("the broker refused the login", said)
+				fail errorOf(ErrorKind.Denied, "kafka: {host}:{port}: {why}", code)
+			}
+			return try answer.bytes()
+		}
+	}
+
+	// dial opens a connection to a broker, under TLS when the login asks,
+	// and greets it.
+	// Fails with a KafkaError: ErrorKind.Connection when the broker cannot
+	// be reached or TLS fails, and as `Broker.greet` does.
+	def dial(host string, port int, login Login) !Broker {
+		let address = host.contains(":") ?? ("[{host}]:{port}", "{host}:{port}")
+		let socket = net.dialStream(address, login.connectTimeout) onerror (err error) {
+			fail errorOf(ErrorKind.Connection, "kafka: {err.message}")
+		}
+		let stream net.Stream = socket
+		if login.secure {
+			let config = tls.Config{}
+			let given = login.tlsConfig
+			config = given unless given is none
+			config.serverName = host when config.serverName == ""
+			let secured = tls.client(socket, config)
+			secured.handshake(login.connectTimeout) onerror (err error) {
+				socket.close() onerror recover none
+				fail errorOf(ErrorKind.Connection, "kafka: TLS with {host}:{port}: {err.message}")
+			}
+			stream = secured
+		}
+		let broker = new Broker(stream, host, port, login.clientId, login.timeout)
+		let reader = async broker.readLoop()
+		reader.keepAlive()
+		broker.greet(login) onerror (err error) {
+			broker.breakWith(err)
+			fail err
+		}
+		return broker
+	}
+
+	// Whether a broker's error passes with time or with fresh metadata, so
+	// the request is worth sending again.
+	def retriable(code int) bool {
+		return code := 3 || 5 || 6 || 7 || 9 || 13 || 14 || 15 || 16 || 19 || 20 || 51 || 56 || 74 || 75
+	}
+
+	// The KafkaError a broker's error number stands for.
+	def brokerError(code int, about string) KafkaError {
+		let kind = ErrorKind.Server
+		let name = "error {code}"
+		match code {
+			case 1:
+				kind = ErrorKind.OutOfRange
+				name = "OFFSET_OUT_OF_RANGE"
+			case 2:
+				kind = ErrorKind.Corrupt
+				name = "CORRUPT_MESSAGE"
+			case 3:
+				kind = ErrorKind.NotFound
+				name = "UNKNOWN_TOPIC_OR_PARTITION"
+			case 5:
+				name = "LEADER_NOT_AVAILABLE"
+			case 6:
+				name = "NOT_LEADER_OR_FOLLOWER"
+			case 7:
+				kind = ErrorKind.TimedOut
+				name = "REQUEST_TIMED_OUT"
+			case 10:
+				kind = ErrorKind.TooLarge
+				name = "MESSAGE_TOO_LARGE"
+			case 12:
+				kind = ErrorKind.TooLarge
+				name = "OFFSET_METADATA_TOO_LARGE"
+			case 14:
+				name = "COORDINATOR_LOAD_IN_PROGRESS"
+			case 15:
+				name = "COORDINATOR_NOT_AVAILABLE"
+			case 16:
+				name = "NOT_COORDINATOR"
+			case 17:
+				kind = ErrorKind.Argument
+				name = "INVALID_TOPIC_EXCEPTION"
+			case 18:
+				kind = ErrorKind.TooLarge
+				name = "RECORD_LIST_TOO_LARGE"
+			case 19:
+				name = "NOT_ENOUGH_REPLICAS"
+			case 20:
+				name = "NOT_ENOUGH_REPLICAS_AFTER_APPEND"
+			case 21:
+				kind = ErrorKind.Argument
+				name = "INVALID_REQUIRED_ACKS"
+			case 22:
+				kind = ErrorKind.Rebalanced
+				name = "ILLEGAL_GENERATION"
+			case 23:
+				kind = ErrorKind.Argument
+				name = "INCONSISTENT_GROUP_PROTOCOL"
+			case 24:
+				kind = ErrorKind.Argument
+				name = "INVALID_GROUP_ID"
+			case 25:
+				kind = ErrorKind.Rebalanced
+				name = "UNKNOWN_MEMBER_ID"
+			case 26:
+				kind = ErrorKind.Argument
+				name = "INVALID_SESSION_TIMEOUT"
+			case 27:
+				kind = ErrorKind.Rebalanced
+				name = "REBALANCE_IN_PROGRESS"
+			case 28:
+				kind = ErrorKind.Argument
+				name = "INVALID_COMMIT_OFFSET_SIZE"
+			case 29:
+				kind = ErrorKind.Denied
+				name = "TOPIC_AUTHORIZATION_FAILED"
+			case 30:
+				kind = ErrorKind.Denied
+				name = "GROUP_AUTHORIZATION_FAILED"
+			case 31:
+				kind = ErrorKind.Denied
+				name = "CLUSTER_AUTHORIZATION_FAILED"
+			case 33:
+				kind = ErrorKind.Unsupported
+				name = "UNSUPPORTED_SASL_MECHANISM"
+			case 34:
+				kind = ErrorKind.Protocol
+				name = "ILLEGAL_SASL_STATE"
+			case 35:
+				kind = ErrorKind.Unsupported
+				name = "UNSUPPORTED_VERSION"
+			case 36:
+				kind = ErrorKind.Exists
+				name = "TOPIC_ALREADY_EXISTS"
+			case 37:
+				kind = ErrorKind.Argument
+				name = "INVALID_PARTITIONS"
+			case 38:
+				kind = ErrorKind.Argument
+				name = "INVALID_REPLICATION_FACTOR"
+			case 39:
+				kind = ErrorKind.Argument
+				name = "INVALID_REPLICA_ASSIGNMENT"
+			case 40:
+				kind = ErrorKind.Argument
+				name = "INVALID_CONFIG"
+			case 41:
+				name = "NOT_CONTROLLER"
+			case 42:
+				kind = ErrorKind.Argument
+				name = "INVALID_REQUEST"
+			case 44:
+				kind = ErrorKind.Argument
+				name = "POLICY_VIOLATION"
+			case 45:
+				kind = ErrorKind.Protocol
+				name = "OUT_OF_ORDER_SEQUENCE_NUMBER"
+			case 46:
+				kind = ErrorKind.Protocol
+				name = "DUPLICATE_SEQUENCE_NUMBER"
+			case 47:
+				kind = ErrorKind.Fenced
+				name = "INVALID_PRODUCER_EPOCH"
+			case 48:
+				kind = ErrorKind.State
+				name = "INVALID_TXN_STATE"
+			case 49:
+				kind = ErrorKind.Protocol
+				name = "INVALID_PRODUCER_ID_MAPPING"
+			case 50:
+				kind = ErrorKind.Argument
+				name = "INVALID_TRANSACTION_TIMEOUT"
+			case 51:
+				name = "CONCURRENT_TRANSACTIONS"
+			case 53:
+				kind = ErrorKind.Denied
+				name = "TRANSACTIONAL_ID_AUTHORIZATION_FAILED"
+			case 58:
+				kind = ErrorKind.Denied
+				name = "SASL_AUTHENTICATION_FAILED"
+			case 59:
+				kind = ErrorKind.Protocol
+				name = "UNKNOWN_PRODUCER_ID"
+			case 68:
+				kind = ErrorKind.State
+				name = "NON_EMPTY_GROUP"
+			case 69:
+				kind = ErrorKind.NotFound
+				name = "GROUP_ID_NOT_FOUND"
+			case 76:
+				kind = ErrorKind.Unsupported
+				name = "UNSUPPORTED_COMPRESSION_TYPE"
+			case 79:
+				kind = ErrorKind.Rebalanced
+				name = "MEMBER_ID_REQUIRED"
+			case 82:
+				kind = ErrorKind.Fenced
+				name = "FENCED_INSTANCE_ID"
+			case 87:
+				kind = ErrorKind.Argument
+				name = "INVALID_RECORD"
+			case 90:
+				kind = ErrorKind.Fenced
+				name = "PRODUCER_FENCED"
+			case 100:
+				kind = ErrorKind.NotFound
+				name = "UNKNOWN_TOPIC_ID"
+			case 110:
+				kind = ErrorKind.Rebalanced
+				name = "FENCED_MEMBER_EPOCH"
+			case 111:
+				kind = ErrorKind.Fenced
+				name = "UNRELEASED_INSTANCE_ID"
+			case 112:
+				kind = ErrorKind.Argument
+				name = "UNSUPPORTED_ASSIGNOR"
+			case 113:
+				kind = ErrorKind.Rebalanced
+				name = "STALE_MEMBER_EPOCH"
+		}
+		return errorOf(kind, "kafka: {about}: {name}", code)
+	}
+}

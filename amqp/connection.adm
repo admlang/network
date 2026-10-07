@@ -1,0 +1,266 @@
+// An AMQP 0-9-1 client, written in ADM over std.net. It talks to RabbitMQ
+// and to brokers that speak the same protocol (LavinMQ, Apache Qpid).
+partial module adm.network.amqp {
+	use (
+		std.net.tls
+		std.net.url
+		adm.network.amqp.wire::*
+	)
+
+	// Connection is one connection to a broker. Work happens on its
+	// channels; any number of tasks may open and use them at the same
+	// time.
+	//
+	// ```
+	// let mq = try amqp.connect("amqp://app:secret@broker.internal/orders")
+	// let ch = try mq.channel()
+	// try ch.declareQueue("jobs", durable = true)
+	// try ch.publish("", "jobs", "resize 7.png")
+	// let jobs = try ch.consume("jobs")
+	// let d = try jobs.next(5s)
+	// try mq.close()
+	// ```
+	//
+	// Everything fails with an AmqpError: the broker's reason when it
+	// closes a channel or the connection (`kind` names the common ones,
+	// `replyCode` holds its number), ErrorKind.Connection when the broker
+	// cannot be reached or the connection breaks, ErrorKind.TimedOut when
+	// an answer does not come within `timeout`, ErrorKind.Closed after
+	// `close`. A broken connection stays broken: connect again and declare
+	// what the new connection needs.
+	//
+	// The connection closes when `close` is called or when the Connection
+	// and every channel and consumer made from it are let go.
+	type Connection {
+		username       string          = "guest"
+		password       ?Secret<string> = none
+		// The virtual host: the broker's name for one set of exchanges
+		// and queues.
+		vhost          string          = "/"
+		auth           Auth            = Auth.Plain
+		// The name the broker shows for the connection.
+		name           string          = ""
+		// TLS settings for `amqps:`; none checks the certificate against
+		// the system's authorities and the host name.
+		tls            ?tls.Config     = none
+		// How often the two sides send a sign of life when nothing else
+		// travels; the broker may ask for less. 0s turns it off unless the
+		// broker wants it.
+		heartbeat      duration        = 60s
+		// The largest frame the client takes (a message body travels in
+		// as many as it needs) and how many channels it opens at most; 0
+		// leaves both to the broker.
+		frameMax       int             = 131072
+		channelMax     int             = 2047
+		// How long opening the connection may take.
+		connectTimeout duration        = 30s
+		// How long an answer from the broker may take.
+		timeout        duration        = 30s
+		// Come back after the connection breaks: dial again (first after
+		// `reconnectWait`, then twice as long each time up to 30 seconds),
+		// reopen the channels, and declare, bind and consume again what they
+		// did. What was on its way is lost with the connection: calls fail
+		// with ErrorKind.Connection until it is back, unanswered deliveries
+		// come again (their `ack` fails), and a queue the broker named has
+		// a new name (`Channel.queueName`).
+		reconnect      bool            = false
+		reconnectWait  duration        = 1s
+		// Called after the connection came back and its channels were
+		// restored.
+		onReconnect    ?def ()         = none
+		internal hub   ?Hub            = none
+
+		def new() {}
+
+		// connect names the broker and opens the connection:
+		//
+		//     amqp://[user[:password]@]host[:port][/vhost]
+		//     amqps://...                 the same under TLS
+		//     host[:port]
+		//
+		// The port is 5672, or 5671 under TLS, when left out. The user,
+		// password and virtual host of the URL replace the connection's
+		// fields; without a path the virtual host stays as it is ("/").
+		// Options in the query: `heartbeat`, `connection_timeout` and
+		// `timeout` in seconds, `frame_max`, `channel_max`, `name`,
+		// `auth_mechanism` (`plain`, `amqplain`, `external`).
+		// Fails with an AmqpError: ErrorKind.Argument for an address or an
+		// option the client does not take, ErrorKind.Denied when the
+		// broker refuses the user, the password or the virtual host,
+		// ErrorKind.Protocol when it does not speak AMQP 0-9-1,
+		// ErrorKind.Connection or ErrorKind.TimedOut when it cannot be
+		// reached.
+		def connect(address string) !none {
+			fail errorOf(ErrorKind.Protocol, "amqp: the connection is already open") unless hub is none
+			let target = try targetOf(self, address)
+			let made = new Hub(target, try dial(target), reconnect, reconnectWait)
+			made.onReconnect = onReconnect
+			hub = made
+			return none
+		}
+
+		internal def opened() !Hub {
+			let h = hub
+			fail errorOf(ErrorKind.Closed, "amqp: the connection is not open; call connect first") when h is none
+			return h
+		}
+
+		// channel opens a channel.
+		// Fails with an AmqpError: ErrorKind.Argument when the connection
+		// has as many open as the broker allows, and as every call does.
+		def channel() !Channel {
+			let h = try opened()
+			return new Channel(try h.open(), self)
+		}
+
+		// Whether the connection is up.
+		def isOpen() bool {
+			let h = hub
+			return !(h is none) && h.link.isOpen()
+		}
+
+		// blocked is the broker's reason for not taking published
+		// messages at the moment (it is short of memory or disk); none
+		// when it takes them. Publishes meanwhile wait in the connection.
+		def blocked() ?string {
+			let h = hub
+			return none when h is none
+			return h.link.blockedBy
+		}
+
+		// What the broker says about itself: `product`, `version`,
+		// `platform`, `cluster_name`, `capabilities`.
+		def server() map<string, any> {
+			let h = hub
+			return {} when h is none
+			return h.link.server
+		}
+
+		// The largest frame the two sides agreed on.
+		def agreedFrameMax() int {
+			let h = hub
+			return h is none ?? (0, h.link.frameMax)
+		}
+
+		// The heartbeat interval the two sides agreed on.
+		def agreedHeartbeat() duration {
+			let h = hub
+			return h is none ?? (0s, h.link.heartbeat)
+		}
+
+		// updateSecret gives the broker a new secret for the connection,
+		// for credentials that expire (an OAuth 2 token).
+		// Fails with an AmqpError when the broker refuses it, and as every
+		// call does.
+		def updateSecret(secret Secret<string>, reason string = "") !none {
+			let l = (try opened()).link
+			let m = method(connectionUpdateSecret)
+			m.long(secret.reveal().bytes())
+			try m.short(reason)
+			try l.call(m.data, connectionUpdateSecretOk)
+			return none
+		}
+
+		// close closes every channel and the connection. Never fails.
+		def close() !none {
+			let h = hub
+			h.close() unless h is none
+			return none
+		}
+
+		def dispose() {
+			let h = hub
+			h.close() unless h is none
+		}
+	}
+
+	// The target an address names; the user, password, virtual host and
+	// options it carries replace the connection's fields.
+	// Fails with ErrorKind.Argument for an address or an option the client
+	// does not take.
+	internal def targetOf(c Connection, address string) !Target {
+		let text = address
+		text = "amqp://{text}" unless text.contains("://")
+		let parsed = url.parse(text) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "amqp: '{address}' is not an address: {err.message}")
+		}
+		let secure = false
+		match parsed.scheme {
+			case "amqp":
+			case "amqps":
+				secure = true
+			default:
+				fail errorOf(ErrorKind.Argument, "amqp: the scheme of '{address}' is not amqp or amqps")
+		}
+		let host = parsed.hostname()
+		host = "localhost" when host == ""
+		let port = parsed.port()
+		port = secure ?? (5671, 5672) when port <= 0
+		let path = parsed.path
+		c.vhost = path.slice(1, path.len()) when path.startsWith("/")
+		let info = parsed.user
+		if !(info is none) {
+			c.username = info.username
+			let given = info.password
+			if !(given is none) {
+				let secret Secret<string> = given
+				c.password = secret
+			}
+		}
+		for let (_, pair) in parsed.query().pairs() {
+			let numeric = /^[0-9]{1,9}$/.test(pair.value)
+			match pair.key {
+				case "heartbeat":
+					fail errorOf(ErrorKind.Argument, "amqp: heartbeat '{pair.value}' is not a number of seconds") unless numeric
+					c.heartbeat = duration(pair.value.toInt<int64>() * 1000000000)
+				case "connection_timeout":
+					fail errorOf(ErrorKind.Argument, "amqp: connection_timeout '{pair.value}' is not a number of seconds") unless numeric
+					c.connectTimeout = duration(pair.value.toInt<int64>() * 1000000000)
+				case "timeout":
+					fail errorOf(ErrorKind.Argument, "amqp: timeout '{pair.value}' is not a number of seconds") unless numeric
+					c.timeout = duration(pair.value.toInt<int64>() * 1000000000)
+				case "frame_max":
+					fail errorOf(ErrorKind.Argument, "amqp: frame_max '{pair.value}' is not a number") unless numeric
+					c.frameMax = pair.value.toInt<int>()
+				case "channel_max":
+					fail errorOf(ErrorKind.Argument, "amqp: channel_max '{pair.value}' is not a number") unless numeric
+					c.channelMax = pair.value.toInt<int>()
+				case "name":
+					c.name = pair.value
+				case "auth_mechanism":
+					match pair.value.lower() {
+						case "plain":
+							c.auth = Auth.Plain
+						case "amqplain":
+							c.auth = Auth.AMQPlain
+						case "external":
+							c.auth = Auth.External
+						default:
+							fail errorOf(ErrorKind.Argument, "amqp: auth_mechanism '{pair.value}' is not plain, amqplain or external")
+					}
+				default:
+					fail errorOf(ErrorKind.Argument, "amqp: '{pair.key}' is not an option of an address")
+			}
+		}
+		fail errorOf(ErrorKind.Argument, "amqp: frameMax {c.frameMax} is under the 4096 bytes every peer takes") when c.frameMax != 0 && c.frameMax < 4096
+		fail errorOf(ErrorKind.Argument, "amqp: channelMax {c.channelMax} is not between 0 and 65535") when c.channelMax < 0 || c.channelMax > 65535
+		fail errorOf(ErrorKind.Argument, "amqp: a heartbeat of {c.heartbeat} is over 65535 seconds") when c.heartbeat > 65535s
+		let secret = c.password
+		let word = secret is none ?? ("guest", secret.reveal())
+		return Target{host: host, port: port, secure: secure, tlsConfig: c.tls, auth: c.auth, username: c.username, password: word, vhost: c.vhost, name: c.name, channelMax: c.channelMax, frameMax: c.frameMax, heartbeat: c.heartbeat, connectTimeout: c.connectTimeout, timeout: c.timeout}
+	}
+
+	// connect opens a connection to the broker at an address; see
+	// `Connection.connect` for its forms.
+	//
+	// ```
+	// let mq = try amqp.connect("amqps://app:secret@broker.internal/orders")
+	// ```
+	//
+	// Fails with an AmqpError as `Connection.connect` does.
+	def connect(address string) !Connection {
+		let c = new Connection()
+		try c.connect(address)
+		return c
+	}
+}

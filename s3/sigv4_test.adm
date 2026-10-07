@@ -4,7 +4,11 @@
 partial module adm.network.s3 {
 	use (
 		std.bytes
+		std.crypto
+		std.crypto.hash
+		std.data.encoding::(hexdecode)
 		std.io
+		std.os
 		std.testing
 		adm.network.s3.sigv4::*
 	)
@@ -25,7 +29,7 @@ partial module adm.network.s3 {
 
 	check "SigV4" {
 		@test()
-		def TestEncoding() {
+		def TestEncoding() !none {
 			assert uriEncode("AZaz09-._~") == "AZaz09-._~"
 			assert uriEncode("a b/c+d=é") == "a%20b%2Fc%2Bd%3D%C3%A9"
 			assert uriEncode("photos/2026/a b.jpg", true) == "photos/2026/a%20b.jpg"
@@ -37,37 +41,37 @@ partial module adm.network.s3 {
 		}
 
 		@test()
-		def TestGetObject() {
+		def TestGetObject() !none {
 			let headers = exampleHeaders(emptyHash)
 			headers.push(Field{name: "Range", value: "bytes=0-9"})
-			let stamp = sign(exampleSigner(), "GET", "/test.txt", "", headers, emptyHash, exampleDate)
+			let stamp = try sign(exampleSigner(), "GET", "/test.txt", "", headers, emptyHash, exampleDate)
 			assert stamp.signature == "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
 			assert stamp.authorization == "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
 		}
 
 		@test()
-		def TestPutObject() {
+		def TestPutObject() !none {
 			let body = "Welcome to Amazon S3."
 			let digest = sha256Hex(body.bytes())
 			assert digest == "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072"
 			let headers = exampleHeaders(digest)
 			headers.push(Field{name: "Date", value: "Fri, 24 May 2013 00:00:00 GMT"})
 			headers.push(Field{name: "x-amz-storage-class", value: "REDUCED_REDUNDANCY"})
-			let stamp = sign(exampleSigner(), "PUT", "/" + uriEncode("test$file.text", true), "", headers, digest, exampleDate)
+			let stamp = try sign(exampleSigner(), "PUT", "/" + uriEncode("test$file.text", true), "", headers, digest, exampleDate)
 			assert stamp.signature == "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
 		}
 
 		@test()
-		def TestQueries() {
-			let lifecycle = sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"lifecycle", value:""}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
+		def TestQueries() !none {
+			let lifecycle = try sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"lifecycle", value:""}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
 			assert lifecycle.signature == "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
-			let list = sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"prefix", value:"J"}, Field{name:"max-keys", value:"2"}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
+			let list = try sign(exampleSigner(), "GET", "/", canonicalQuery([Field{name:"prefix", value:"J"}, Field{name:"max-keys", value:"2"}]), exampleHeaders(emptyHash), emptyHash, exampleDate)
 			assert list.signature == "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
 		}
 
 		@test()
-		def TestPresign() {
-			let query = presignedQuery(exampleSigner(), "GET", "/test.txt", [], [Field{name:"Host", value:"examplebucket.s3.amazonaws.com"}], exampleDate, 86400)
+		def TestPresign() !none {
+			let query = try presignedQuery(exampleSigner(), "GET", "/test.txt", [], [Field{name:"Host", value:"examplebucket.s3.amazonaws.com"}], exampleDate, 86400)
 			assert query == "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
 		}
 
@@ -84,7 +88,7 @@ partial module adm.network.s3 {
 				Field{name: "Content-Length", value: chunkedLength(size, 64 * 1024).str()},
 			]
 			assert chunkedLength(size, 64 * 1024) == 66824
-			let stamp = sign(exampleSigner(), "PUT", "/examplebucket/chunkObject.txt", "", headers, streamingPayload, exampleDate)
+			let stamp = try sign(exampleSigner(), "PUT", "/examplebucket/chunkObject.txt", "", headers, streamingPayload, exampleDate)
 			assert stamp.signature == "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
 			let payload byte[] = []
 			payload.len(size)
@@ -96,6 +100,47 @@ partial module adm.network.s3 {
 			assert text.contains("\r\n400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n")
 			assert text.endsWith("\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n")
 			return none
+		}
+	}
+
+	// Where TestWideSignature leaves what `testservers/v4a-check.py`
+	// compares with AWS's own signer.
+	@env("ADM_TEST_S3_V4A_OUT")
+	internal const wideOut string
+
+	check "Signature Version 4A" {
+		@test()
+		def TestWideKey() !none {
+			// The key of AWS's example credentials, as its SDKs derive it.
+			let key = keyA("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+			assert key.point.x.hex().lower().padStart(64, "0") == "b6618f6a65740a99e650b33b6b4b5bd0d43b176d721a3edfea7e7d2d56d936b1"
+			assert key.point.y.hex().lower().padStart(64, "0") == "865ed22a7eadc9c5cb9d2cbaca1b3699139fedc5043dc6661864218330c8e518"
+		}
+
+		@test()
+		def TestWideSignature() !none {
+			let signer = Signer{accessKey: "AKIDEXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", region: "us-east-1", regionSet: "*"}
+			signer.keyA = keyA(signer.accessKey, signer.secretKey)
+			let date = "20260102T030405Z"
+			let headers Field[] = [Field{name:"Host", value:"bucket.s3.amazonaws.com"}, Field{name:"x-amz-date", value:date}, Field{name:"x-amz-region-set", value:"*"}, Field{name:"x-amz-content-sha256", value:emptyHash}]
+			let stamp = try sign(signer, "GET", "/reports/2026.csv", "", headers, emptyHash, date)
+			assert stamp.authorization.startsWith("AWS4-ECDSA-P256-SHA256 Credential=AKIDEXAMPLE/20260102/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, Signature=30")
+			// The signature holds under the key's public half.
+			let request = canonicalRequest("GET", "/reports/2026.csv", "", canonicalHeaders(headers), emptyHash)
+			let text = [algorithmA, date, "20260102/s3/aws4_request", sha256Hex(request.bytes())].join("\n")
+			let digest = new hash.SHA256().hash(text.bytes())
+			let wide = signer.keyA
+			fail "no key" when wide is none
+			let (r, s) = try crypto.parseECDSASignature(try hexdecode(stamp.signature))
+			assert wide.publicKey().verify(digest, r, s)
+			let other = new hash.SHA256().hash("{text}x".bytes())
+			assert !wide.publicKey().verify(other, r, s)
+
+			let link = try presignedQuery(signer, "GET", "/reports/2026.csv", [], [Field{name:"Host", value:"bucket.s3.amazonaws.com"}], date, 600)
+			assert link.contains("X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256") && link.contains("X-Amz-Region-Set=%2A") && link.contains("X-Amz-Credential=AKIDEXAMPLE%2F20260102%2Fs3%2Faws4_request") && link.contains("&X-Amz-Signature=30")
+			if wideOut != "" {
+				try os.writeFile(wideOut, "{digest.hex().lower()}\n{stamp.signature}\n{wide.point.x.hex().lower()}\n{wide.point.y.hex().lower()}\n".bytes())
+			}
 		}
 	}
 }

@@ -7,4 +7,8 @@ schema = 1
 
 [publisher]
 pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
-repo_salt = "base64:4wc85zlHmsMEXMtwdG8Fzy08dg6AGi0HKBtD/YXq1kw="
+repo_salt = "base64:++oAD/FLJkfqhM2pR0CxkyQffUg3t65wATNn6MMNcKQ="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.network.redis"]
+description = "Redis and Valkey client: RESP2 and RESP3, typed commands, pipelines, transactions, pub/sub, Cluster and Sentinel"

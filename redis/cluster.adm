@@ -230,6 +230,25 @@ internal partial module adm.network.redis.resp {
 		return addressOf(host, node.items[1].toInt())
 	}
 
+	// Board is where the tasks that send a pipeline's batches to their
+	// nodes put the replies.
+	type Board {
+		atomic out   Value[]
+		atomic again int[]   = []
+
+		def new(out Value[]) {
+			self.out = out
+		}
+
+		atomic def put(i int, reply Value) {
+			out[i] = reply
+		}
+
+		atomic def retry(members int[]) {
+			again.push(...members)
+		}
+	}
+
 	// ClusterLink sends each command to the node that serves its keys.
 	type ClusterLink {
 		base         Target
@@ -247,6 +266,8 @@ internal partial module adm.network.redis.resp {
 		refreshed    time.Time
 		turn         int
 		atomic shut  bool                 = false
+		// Counts the changes of the set of masters; guarded by `lock`.
+		version      int                  = 0
 
 		def new(base Target, seeds string[], limit int, readReplicas bool) {
 			self.base = base
@@ -358,6 +379,7 @@ internal partial module adm.network.redis.resp {
 			}
 			let gone Pool[] = []
 			lock.lock()
+			version++ when layout.masters.join(",") != next.masters.join(",")
 			layout = next
 			refreshed = time.now()
 			for let id in nodes.keys() {
@@ -553,31 +575,50 @@ internal partial module adm.network.redis.resp {
 					members.push(i)
 				}
 			}
-			for let (pool, members) in groups {
-				let batch = new Batch()
-				for let i in members {
-					try batch.add(commands[i])
+			let board = new Board(out)
+			if groups.len() == 1 {
+				for let (pool, members) in groups {
+					try sendGroup(pool, members, commands, wait, board)
 				}
-				let conn = (try reach(pool)).conn
-				if conn is none {
-					again.push(...members)
-					continue
+			} else {
+				// Every node gets its batch at the same time.
+				let round = new AsyncScope()
+				for let (pool, members) in groups {
+					async<round> sendGroup(pool, members, commands, wait, board)
 				}
-				let replies = try sendOnce(pool, conn, batch, wait)
-				if replies is none {
-					again.push(...members)
-					continue
-				}
-				for let (k, i) in members {
-					out[i] = replies[k]
-					continue unless replies[k].isError()
-					again.push(i) when replies[k].text().split(" ")[0] := "MOVED" || "ASK" || "TRYAGAIN" || "CLUSTERDOWN"
-				}
+				try await round
 			}
+			out = board.out
+			again.push(...board.again)
 			for let i in again {
 				out[i] = try attempt(wait, commands[i])
 			}
 			return out
+		}
+
+		// Sends the commands of one node as a batch and notes their
+		// replies, and which of them have to be sent again on their own.
+		def sendGroup(pool Pool, members int[], commands any[][], wait duration, board Board) !none {
+			let batch = new Batch()
+			for let i in members {
+				try batch.add(commands[i])
+			}
+			let conn = (try reach(pool)).conn
+			if conn is none {
+				board.retry(members)
+				return none
+			}
+			let replies = try sendOnce(pool, conn, batch, wait)
+			if replies is none {
+				board.retry(members)
+				return none
+			}
+			for let (k, i) in members {
+				board.put(i, replies[k])
+				continue unless replies[k].isError()
+				board.retry([i]) when replies[k].text().split(" ")[0] := "MOVED" || "ASK" || "TRYAGAIN" || "CLUSTERDOWN"
+			}
+			return none
 		}
 
 		// The pool a command goes to.
@@ -605,6 +646,34 @@ internal partial module adm.network.redis.resp {
 			let slot = -1
 			(slot, _) = try slotFor(args) when args.len() > 0
 			return (try poolOf(slot, false)).target
+		}
+
+		def shards(keys string[]) string[][] {
+			let order int[] = []
+			let bySlot map<int, string[]> = {}
+			for let key in keys {
+				let slot = slotOf(key.bytes())
+				let group = bySlot.get(slot)
+				if group is none {
+					order.push(slot)
+					bySlot[slot] = [key]
+				} else {
+					group.push(key)
+					bySlot[slot] = group
+				}
+			}
+			let out string[][] = []
+			for let slot in order {
+				out.push(bySlot[slot])
+			}
+			return out
+		}
+
+		def epoch() int {
+			lock.lock()
+			let now = version
+			lock.unlock()
+			return now
 		}
 
 		def pools() !Pool[] {

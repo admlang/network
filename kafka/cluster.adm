@@ -1,0 +1,416 @@
+// What the client knows about the cluster (brokers, topics, who leads
+// each partition) and the connections it keeps to its brokers.
+internal partial module adm.network.kafka.wire {
+	use (
+		std.sync
+		std.time
+		adm.network.kafka::*
+	)
+
+	struct Node {
+		id   int
+		host string
+		port int
+		rack string
+	}
+
+	struct Part {
+		index    int
+		// The broker that leads the partition; -1 while it has none.
+		leader   int
+		replicas int[]
+		inSync   int[]
+		error    int
+	}
+
+	struct Topic {
+		name   string
+		hidden bool
+		parts  Part[]
+		error  int
+	}
+
+	// Cluster is the client's view of the brokers and its connections to
+	// them.
+	type Cluster {
+		login             Login
+		// The addresses the client was given.
+		seeds             Node[]
+		atomic nodes      map<int, Node>
+		atomic topics     map<string, Topic>
+		atomic conns      map<string, Broker>
+		atomic controller int                 = -1
+		atomic clusterId  string              = ""
+		atomic closed     bool                = false
+		// The name of each topic the client asked the id of, by id.
+		atomic byId       map<string, string>
+		opening           sync.Mutex
+
+		def new(login Login, seeds Node[]) {
+			self.login = login
+			self.seeds = seeds
+			opening = new sync.Mutex()
+		}
+
+		// ---- connections ----
+
+		// conn returns the connection to a broker kept for a purpose,
+		// opening it when there is none. Requests on one connection are
+		// answered in turn, so what waits long (fetching, joining a group)
+		// has a connection of its own.
+		// Fails with a KafkaError: ErrorKind.Closed after `close`,
+		// ErrorKind.Connection when the broker is unknown or cannot be
+		// reached, and as `dial` does.
+		def conn(node int, purpose string) !Broker {
+			fail errorOf(ErrorKind.Closed, "kafka: the client is closed") when closed
+			let key = "{node}/{purpose}"
+			let open = connOf(key)
+			return open unless open is none
+			opening.lock()
+			defer opening.unlock()
+			let raced = connOf(key)
+			return raced unless raced is none
+			let place = nodeOf(node)
+			fail errorOf(ErrorKind.Connection, "kafka: the cluster names no broker {node}") when place is none
+			let broker = try dial(place.host, place.port, login)
+			keep(key, broker)
+			return broker
+		}
+
+		atomic def connOf(key string) ?Broker {
+			let broker = conns.get(key)
+			return none when broker is none
+			return broker when broker.isOpen()
+			conns.delete(key)
+			return none
+		}
+
+		atomic def keep(key string, broker Broker) {
+			conns[key] = broker
+		}
+
+		atomic def nodeOf(id int) ?Node {
+			return nodes.get(id)
+		}
+
+		atomic def anyNode() int {
+			for let (id, _) in nodes {
+				return id
+			}
+			return -1
+		}
+
+		atomic def nodeIds() int[] {
+			let ids int[] = []
+			for let (id, _) in nodes {
+				ids.push(id)
+			}
+			return ids
+		}
+
+		// drop closes every connection kept for a purpose (a consumer or a
+		// producer that is done).
+		def drop(purpose string) {
+			for let broker in takeConns("/{purpose}") {
+				broker.close()
+			}
+		}
+
+		atomic def takeConns(suffix string) Broker[] {
+			let out Broker[] = []
+			let keys string[] = []
+			for let (key, broker) in conns {
+				if suffix == "" || key.endsWith(suffix) {
+					keys.push(key)
+					out.push(broker)
+				}
+			}
+			for let key in keys {
+				conns.delete(key)
+			}
+			return out
+		}
+
+		// any returns a connection to some broker: one that is known, else
+		// one of the addresses the client was given.
+		// Fails with ErrorKind.Connection when none answers, with the last
+		// failure as its reason.
+		def any() !Broker {
+			fail errorOf(ErrorKind.Closed, "kafka: the client is closed") when closed
+			let last ?error = none
+			for let id in nodeIds() {
+				let broker = reach(id) onerror (err error) {
+					last = err
+					recover none
+				}
+				return broker unless broker is none
+			}
+			for let (i, seed) in seeds {
+				let key = "seed{i}/meta"
+				let open = connOf(key)
+				return open unless open is none
+				let broker = dialSeed(seed.host, seed.port) onerror (err error) {
+					last = err
+					recover none
+				}
+				if !(broker is none) {
+					keep(key, broker)
+					return broker
+				}
+			}
+			// A login the first broker refuses is refused by all.
+			fail last unless last is none
+			fail errorOf(ErrorKind.Connection, "kafka: no broker to connect to")
+		}
+
+		def reach(id int) !?Broker {
+			return try conn(id, "meta")
+		}
+
+		def dialSeed(host string, port int) !?Broker {
+			return try dial(host, port, login)
+		}
+
+		// ---- metadata ----
+
+		// refresh asks a broker for the cluster's brokers and for topics:
+		// the named ones, or all of them for an empty list. With `create`
+		// a broker that is set up for it makes a missing topic.
+		// Fails with a KafkaError as `any` and `Broker.call` do.
+		def refresh(names string[], create bool = false) !none {
+			let ask = new Encoder()
+			if names.len() == 0 {
+				ask.i32(-1)
+			} else {
+				ask.texts(names)
+			}
+			ask.bool(create)
+			let broker = try any()
+			let answer = try broker.call(apiMetadata, ask)
+			try answer.i32()
+			let found Node[] = []
+			for let n = try answer.count(); n > 0; n-- {
+				let node = Node{id: try answer.i32()}
+				node.host = try answer.text()
+				node.port = try answer.i32()
+				node.rack = try answer.text()
+				found.push(node)
+			}
+			let id = try answer.text()
+			let lead = try answer.i32()
+			let seen Topic[] = []
+			for let n = try answer.count(); n > 0; n-- {
+				let topic = Topic{error: try answer.i16()}
+				topic.name = try answer.text()
+				topic.hidden = try answer.bool()
+				for let p = try answer.count(); p > 0; p-- {
+					let part = Part{error: try answer.i16()}
+					part.index = try answer.i32()
+					part.leader = try answer.i32()
+					part.replicas = try answer.ints()
+					part.inSync = try answer.ints()
+					try answer.ints()
+					topic.parts.push(part)
+				}
+				topic.parts = topic.parts.sort((a, b) => a.index < b.index)
+				seen.push(topic)
+			}
+			learn(found, id, lead, seen, names.len() == 0)
+			return none
+		}
+
+		atomic def learn(found Node[], id string, lead int, seen Topic[], whole bool) {
+			if found.len() > 0 {
+				nodes = {}
+				for let node in found {
+					nodes[node.id] = node
+				}
+			}
+			clusterId = id
+			controller = lead
+			topics = {} when whole
+			for let topic in seen {
+				topics[topic.name] = topic
+			}
+		}
+
+		// learnIds asks a broker for the ids of topics (Kafka 2.8 and
+		// later name topics by id in some requests) and returns them by
+		// name; a topic that does not exist is left out.
+		// Fails with a KafkaError as `any` and `Broker.callAt` do.
+		def learnIds(names string[]) !map<string, string> {
+			let ask = new Encoder()
+			ask.ccount(names.len())
+			for let name in names {
+				ask.uuid("00000000000000000000000000000000")
+				ask.cmaybe(name)
+				ask.tagged()
+			}
+			ask.bool(false)
+			ask.bool(false)
+			ask.tagged()
+			let broker = try any()
+			let answer = try broker.callAt(apiMetadata, 12, true, ask)
+			try answer.i32()
+			for let n = try answer.ccount(); n > 0; n-- {
+				try answer.i32()
+				try answer.ctext()
+				try answer.i32()
+				try answer.cmaybe()
+				try answer.tagged()
+			}
+			try answer.cmaybe()
+			try answer.i32()
+			let out map<string, string> = {}
+			for let n = try answer.ccount(); n > 0; n-- {
+				let code = try answer.i16()
+				let name = try answer.ctext()
+				let id = try answer.uuid()
+				try answer.bool()
+				for let p = try answer.ccount(); p > 0; p-- {
+					try answer.i16()
+					try answer.i32()
+					try answer.i32()
+					try answer.i32()
+					for let k = 0; k < 3; k++ {
+						for let m = try answer.ccount(); m > 0; m-- {
+							try answer.i32()
+						}
+					}
+					try answer.tagged()
+				}
+				try answer.i32()
+				try answer.tagged()
+				if code == 0 {
+					out[name] = id
+					nameId(id, name)
+				}
+			}
+			return out
+		}
+
+		atomic def nameId(id string, name string) {
+			byId[id] = name
+		}
+
+		atomic def nameOf(id string) ?string {
+			return byId.get(id)
+		}
+
+		atomic def cached(name string) ?Topic {
+			return topics.get(name)
+		}
+
+		atomic def forget(name string) {
+			topics.delete(name)
+		}
+
+		atomic def names() string[] {
+			let out string[] = []
+			for let (name, _) in topics {
+				out.push(name)
+			}
+			return out
+		}
+
+		// topic returns what the cluster says about a topic once every
+		// partition of it has a leader, asking again for up to the
+		// client's timeout while it does not.
+		// Fails with a KafkaError: ErrorKind.NotFound when the topic does
+		// not exist, ErrorKind.TimedOut when its partitions stay without a
+		// leader, ErrorKind.Denied without the permission, and as `refresh`
+		// does.
+		def topic(name string, create bool = false, fresh bool = false) !Topic {
+			if !fresh {
+				let known = cached(name)
+				return known when !(known is none) && settled(known)
+			}
+			let deadline = time.now() + login.timeout
+			for {
+				try refresh([name], create)
+				let found = cached(name)
+				let code = found is none ?? (3, found.error)
+				if !(found is none) && code == 0 && settled(found) {
+					return found
+				}
+				// A topic just made is unknown to some brokers for a moment,
+				// and one being made has no leaders yet.
+				let passing = code == 0 || code == 5 || (code == 3 && create)
+				fail brokerError(code, "topic '{name}'") unless passing
+				fail errorOf(ErrorKind.TimedOut, "kafka: the partitions of topic '{name}' have no leader after {login.timeout}") when time.now() > deadline
+				time.sleep(100ms)
+			}
+			fail errorOf(ErrorKind.Protocol, "kafka: no metadata")
+		}
+
+		def settled(topic Topic) bool {
+			return false when topic.error != 0 || topic.parts.len() == 0
+			for let part in topic.parts {
+				return false when part.leader < 0
+			}
+			return true
+		}
+
+		// leader returns the broker that leads a partition.
+		// Fails with a KafkaError: ErrorKind.NotFound when the topic has no
+		// such partition, and as `topic` does.
+		def leader(name string, partition int, fresh bool = false) !int {
+			let topic = try topic(name, false, fresh)
+			for let part in topic.parts {
+				return part.leader when part.index == partition
+			}
+			fail errorOf(ErrorKind.NotFound, "kafka: topic '{name}' has no partition {partition}; it has {topic.parts.len()}")
+		}
+
+		// coordinator returns the broker that keeps a consumer group
+		// (kind 0) or a transactional producer (kind 1).
+		// Fails with a KafkaError: ErrorKind.TimedOut when the cluster names
+		// none within the client's timeout, and as `any` and `Broker.call`
+		// do.
+		def coordinator(key string, kind int) !int {
+			let deadline = time.now() + login.timeout
+			for {
+				let ask = new Encoder()
+				ask.text(key)
+				ask.i8(kind)
+				let broker = try any()
+				let answer = try broker.call(apiFindCoordinator, ask)
+				try answer.i32()
+				let code = try answer.i16()
+				try answer.maybe()
+				let node = Node{id: try answer.i32()}
+				node.host = try answer.text()
+				node.port = try answer.i32()
+				if code == 0 {
+					addNode(node)
+					return node.id
+				}
+				fail brokerError(code, "finding the coordinator of '{key}'") unless retriable(code)
+				fail errorOf(ErrorKind.TimedOut, "kafka: the cluster named no coordinator for '{key}' within {login.timeout}") when time.now() > deadline
+				time.sleep(100ms)
+			}
+			fail errorOf(ErrorKind.Protocol, "kafka: no coordinator")
+		}
+
+		atomic def addNode(node Node) {
+			nodes[node.id] = node unless nodes.hasKey(node.id)
+		}
+
+		// admin sends a request to the controller, the broker that changes
+		// the cluster, finding it anew when it moved.
+		// Fails with a KafkaError as `refresh`, `conn` and `Broker.call` do.
+		def admin(api int, body Encoder, wait duration = 0s) !Decoder {
+			try refresh(names()) when controller < 0
+			let target = controller < 0 ?? (anyNode(), controller)
+			let broker = try conn(target, "meta")
+			return try broker.call(api, body, wait)
+		}
+
+		def close() {
+			closed = true
+			for let broker in takeConns("") {
+				broker.close()
+			}
+		}
+	}
+}

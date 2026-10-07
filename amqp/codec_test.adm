@@ -1,0 +1,206 @@
+internal partial module adm.network.amqp.wire {
+	use (
+		std.testing
+		std.time
+		adm.network.amqp::*
+	)
+
+	internal def failureKind(err error) ErrorKind {
+		return err.kind when err is AmqpError
+		return ErrorKind.Server
+	}
+
+	check "Codec" {
+		@test()
+		def TestIntegersAndStrings() !none {
+			let e = new Encoder()
+			e.u8(0xAB)
+			e.u16(0xBEEF)
+			e.u32(0xDEADBEEF)
+			e.u64(0x0102030405060708)
+			e.bits(true, false, true)
+			try e.short("héllo")
+			e.long("body".bytes())
+			assert e.data[:15].hex() == "ABBEEFDEADBEEF010203040506070805"[:30]
+			let d = new Decoder(e.data)
+			assert (try d.u8()) == 0xAB
+			assert (try d.u16()) == 0xBEEF
+			assert (try d.u32()) == 0xDEADBEEF
+			assert (try d.u64()) == 0x0102030405060708
+			assert try d.bit()
+			assert !(try d.bit())
+			assert try d.bit()
+			assert (try d.short()) == "héllo"
+			assert string(try d.long()) == "body"
+			assert d.left() == 0
+			let kind = ErrorKind.Server
+			d.u8() onerror (err error) {
+				kind = failureKind(err)
+				recover 0
+			}
+			assert kind == ErrorKind.Protocol
+
+			let long = new Encoder()
+			kind = ErrorKind.Server
+			long.short("x".repeat(256)) onerror (err error) {
+				kind = failureKind(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+		}
+
+		@test()
+		def TestTables() !none {
+			let inner map<string, any> = {"deep": "value", "count": 3}
+			let list any[] = [1, "two", true, none]
+			let small int8 = -5
+			let wide uint16 = 60000
+			let fields map<string, any> = {"flag": true, "int": -7, "big": 5000000000, "float": 2.5, "text": "héllo", "void": none}
+			fields["bytes"] = byte[0, 1, 2]
+			fields["when"] = time.fromUnixNs(1700000000 * 1000000000)
+			fields["decimal"] = Decimal{scale: 2, value: -314}
+			fields["list"] = list
+			fields["names"] = ["a", "b"]
+			fields["counts"] = [1, 2]
+			fields["table"] = inner
+			fields["small"] = small
+			fields["wide"] = wide
+			let e = new Encoder()
+			try e.table(fields)
+			let back = try new Decoder(e.data).table()
+			assert back.len() == fields.len()
+			assert describe(back["flag"]) == "bool:true"
+			assert describe(back["int"]) == "int:-7"
+			assert describe(back["big"]) == "int:5000000000"
+			assert describe(back["float"]) == "float:2.500000"
+			assert describe(back["text"]) == "text:héllo"
+			assert describe(back["void"]) == "none"
+			assert describe(back["bytes"]) == "bytes:000102"
+			assert describe(back["when"]) == "time:1700000000"
+			assert describe(back["decimal"]) == "decimal:-314/2"
+			assert describe(back["list"]) == "[int:1,text:two,bool:true,none]"
+			assert describe(back["names"]) == "[text:a,text:b]"
+			assert describe(back["counts"]) == "[int:1,int:2]"
+			assert describe(back["table"]) == "\{count=int:3,deep=text:value}"
+			assert describe(back["small"]) == "int:-5"
+			assert describe(back["wide"]) == "int:60000"
+
+			// Every type a broker may send, the narrow ones included.
+			let raw = new Encoder()
+			let body = new Encoder()
+			try body.short("b")
+			body.mark('b')
+			body.u8(0xFE)
+			try body.short("B")
+			body.mark('B')
+			body.u8(0xFE)
+			try body.short("s")
+			body.mark('s')
+			body.u16(0xFFFE)
+			try body.short("u")
+			body.mark('u')
+			body.u16(0xFFFE)
+			try body.short("i")
+			body.mark('i')
+			body.u32(0xFFFFFFFE)
+			try body.short("l")
+			body.mark('l')
+			body.u64(-9)
+			try body.short("f")
+			body.mark('f')
+			body.u32(0x3FC00000)
+			raw.long(body.data)
+			let narrow = try new Decoder(raw.data).table()
+			assert describe(narrow["b"]) == "int:-2"
+			assert describe(narrow["B"]) == "int:254"
+			assert describe(narrow["s"]) == "int:-2"
+			assert describe(narrow["u"]) == "int:65534"
+			assert describe(narrow["i"]) == "int:4294967294"
+			assert describe(narrow["l"]) == "int:-9"
+			assert describe(narrow["f"]) == "float:1.500000"
+
+			let kind = ErrorKind.Server
+			let bad map<string, any> = {"lane": new Waiter()}
+			new Encoder().table(bad) onerror (err error) {
+				kind = failureKind(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			let nothing map<string, any> = {}
+			new Decoder(byte[0, 0, 0, 3, 1, 107, 63]).table() onerror (err error) {
+				kind = failureKind(err)
+				recover nothing
+			}
+			assert kind == ErrorKind.Protocol
+		}
+
+		@test()
+		def TestProperties() !none {
+			let headers map<string, any> = {"x-retries": 2, "source": "billing"}
+			let m = Message{body: "payload".bytes(), contentType: "application/json", contentEncoding: "gzip", headers: headers, persistent: true, priority: 7, correlationId: "c-1", replyTo: "replies", expires: 90s, messageId: "m-1", kind: "invoice.paid", userId: "guest", appId: "billing"}
+			m.timestamp = time.fromUnixNs(1700000000 * 1000000000)
+			let d = new Decoder(try propertiesOf(m))
+			assert (try d.u16()) == 60
+			assert (try d.u16()) == 0
+			assert (try d.u64()) == 7
+			let back = try messageOf(d)
+			assert d.left() == 0
+			assert back.contentType == "application/json" && back.contentEncoding == "gzip"
+			assert back.persistent && back.priority == 7
+			assert back.correlationId == "c-1" && back.replyTo == "replies" && back.messageId == "m-1"
+			assert back.expires == 90s
+			assert back.kind == "invoice.paid" && back.userId == "guest" && back.appId == "billing"
+			assert describe(back.headers["x-retries"]) == "int:2"
+			assert describe(back.timestamp) == "time:1700000000"
+
+			let plain = new Decoder(try propertiesOf(Message{}))
+			try plain.u64()
+			try plain.u32()
+			let bare = try messageOf(plain)
+			assert plain.left() == 0
+			assert bare.priority == -1 && !bare.persistent && bare.timestamp is none && bare.headers.len() == 0
+
+			let framed = frame(frameBody, 7, "abc".bytes())
+			assert framed.hex() == "030007000000036162" + "63CE"
+			assert method(basicPublish).data.hex() == "003C0028"
+		}
+	}
+
+	// A table value with its type, for comparing in tests.
+	internal def describe(v any) string {
+		match v {
+			case none:
+				return "none"
+			case bool:
+				return "bool:{v}"
+			case int:
+				return "int:{v}"
+			case float:
+				return "float:{v}"
+			case string:
+				return "text:{v}"
+			case byte[]:
+				return "bytes:{v.hex()}"
+			case time.Time:
+				return "time:{v.unixNs() / 1000000000}"
+			case Decimal:
+				return "decimal:{v.value}/{v.scale}"
+			case any[]:
+				let parts string[] = []
+				for let item in v {
+					parts.push(describe(item))
+				}
+				return "[{parts.join(",")}]"
+			case map<string, any>:
+				let parts string[] = []
+				for let (key, item) in v {
+					parts.push("{key}={describe(item)}")
+				}
+				parts = parts.sort((a, b) => a < b)
+				return "\{{parts.join(",")}}"
+			default:
+				return "other"
+		}
+	}
+}

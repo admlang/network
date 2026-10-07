@@ -1,0 +1,57 @@
+partial module adm.network.kafka {
+	use std.time
+
+	// Header is one named value that travels with a record. Names may
+	// repeat, and their order is kept.
+	struct Header {
+		name  string
+		value byte[]
+	}
+
+	// Record is one message of a topic, as a consumer reads it.
+	struct Record {
+		topic     string
+		partition int
+		// The record's place in its partition.
+		offset    int
+		// Empty when the record has no key.
+		key       byte[]
+		value     byte[]
+		// True for a record without a value: in a compacted topic it
+		// deletes its key.
+		deleted   bool
+		// When the producer made the record, or when the broker took it,
+		// as the topic is set up; to the millisecond.
+		timestamp time.Time
+		headers   Header[]
+	}
+
+	// Compression is how a producer packs its batches. Brokers and
+	// consumers unpack every kind.
+	enum Compression {
+		None,
+		Gzip,
+		Snappy,
+		Lz4,
+		Zstd,
+	}
+
+	// The value of a record as text.
+	def text(record Record) string {
+		return string(record.value)
+	}
+
+	// The key of a record as text.
+	def keyText(record Record) string {
+		return string(record.key)
+	}
+
+	// The value of the first header with a name, as text; none when the
+	// record has no such header.
+	def header(record Record, name string) ?string {
+		for let h in record.headers {
+			return string(h.value) when h.name == name
+		}
+		return none
+	}
+}

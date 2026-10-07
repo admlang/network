@@ -1,0 +1,1147 @@
+// These tests need a Kafka broker; without ADM_TEST_KAFKA they pass
+// without running. See README.md for the broker they expect.
+partial module adm.network.kafka {
+	use (
+		std.crypto.x509::(CertPool)
+		std.data.encoding::(base64encode)
+		std.net.tls
+		std.os
+		std.testing
+		adm.network.kafka.wire::(Node, Outgoing, Identity, encodeBatch, decodeBatches, murmur2)
+		std.time
+	)
+
+	// A broker as `host:port`. The tests make and delete topics and
+	// groups whose names start with `adm-test-`.
+	@env("ADM_TEST_KAFKA")
+	internal const testBroker string
+
+	// A broker that asks for a login, as `host:port`;
+	// `testservers/sasl.sh` starts one and makes its users.
+	@env("ADM_TEST_KAFKA_SASL")
+	internal const testLogin string
+
+	// A broker that takes TLS, as `host:port`, and the folder with its
+	// `ca.pem`; `testservers/tls.sh` starts one.
+	@env("ADM_TEST_KAFKA_TLS")
+	internal const testSecure string
+
+	@env("ADM_TEST_KAFKA_CERTS")
+	internal const testCerts string
+
+	// Set while the broker is restarted under the test (`docker restart`
+	// a few seconds after TestRestart begins).
+	@env("ADM_TEST_KAFKA_HARD")
+	internal const testHard string
+
+	// Set after `testservers/java-side.sh produce` filled the topic
+	// adm-test-interop with Kafka's own producer.
+	@env("ADM_TEST_KAFKA_JAVA")
+	internal const testJava string
+
+	// The id of a group a Java consumer of adm-test-interop is in while
+	// the test runs (`kafka-console-consumer.sh --group <id>`).
+	@env("ADM_TEST_KAFKA_JAVA_GROUP")
+	internal const testJavaGroup string
+
+	// How that Java consumer deals partitions, when not by range:
+	// `cooperative-sticky` or `sticky`.
+	@env("ADM_TEST_KAFKA_JAVA_STRATEGY")
+	internal const testJavaStrategy string
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is KafkaError
+		return ErrorKind.Server
+	}
+
+	// A topic of its own for one test: a name no earlier run used, since a
+	// topic made right after one of the same name was deleted is not
+	// reliably empty.
+	def scratch(k Client, name string, partitions int = 3) !string {
+		let full = "adm-test-{name}-{time.now().unixNs()}"
+		try k.createTopic(full, partitions, 1)
+		return full
+	}
+
+	// Waits until a topic's setting reads as `want`; false after 10 s.
+	def settled(k Client, topic string, key string, want string) !bool {
+		for let i = 0; i < 100; i++ {
+			let now = (try k.topicConfig(topic)).get(key)
+			return true when !(now is none) && now == want
+			time.sleep(100ms)
+		}
+		return false
+	}
+
+	// Removes the topics earlier runs left behind when they failed.
+	def sweepTopics(k Client) !none {
+		for let topic in try k.topics() {
+			continue unless topic.name.startsWith("adm-test-") && topic.name != "adm-test-interop"
+			k.deleteTopic(topic.name) onerror recover none
+		}
+		return none
+	}
+
+	def base64url(text string) string {
+		return base64encode(text.bytes()).replace("+", "-").replace("/", "_").replace("=", "")
+	}
+
+	check "Cluster" {
+		@test()
+		def TestAddresses() !none {
+			let k = new Client()
+			let plain = try seedOf(k, "broker.example")
+			assert plain.host == "broker.example" && plain.port == 9092 && !k.secure && k.sasl == Sasl.None
+			let full = try seedOf(k, "kafkas://ana:s3cret@broker.example:9093/")
+			assert full.host == "broker.example" && full.port == 9093 && k.secure
+			assert k.username == "ana" && k.sasl == Sasl.ScramSha256
+			let six = try seedOf(k, "[::1]:9094")
+			assert six.host == "::1" && six.port == 9094
+			assert (try seedOf(k, "[fe80::1]")).port == 9092
+			for let bad in ["http://broker", "broker:port", "kafka://user@broker", ":9092", "[::1"] {
+				let kind = ErrorKind.Server
+				seedOf(new Client(), bad) onerror (err error) {
+					kind = kindOfFailure(err)
+					recover Node{}
+				}
+				assert kind == ErrorKind.Argument
+			}
+			let kind = ErrorKind.Server
+			connect("127.0.0.1:1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Connection
+			kind = ErrorKind.Server
+			k.topics() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover TopicInfo[]
+			}
+			assert kind == ErrorKind.Closed
+		}
+
+		@test()
+		def TestLogins() !none {
+			return none when testLogin == ""
+			let plain = new Client()
+			plain.sasl = Sasl.Plain
+			try plain.connect("kafka://admin:admin-secret@{testLogin}")
+			assert (try plain.brokers()).len() == 1
+			try plain.close()
+
+			// A user in the address logs in with SCRAM-SHA-256.
+			let k = try connect("kafka://ana:ana-secret@{testLogin}")
+			assert k.sasl == Sasl.ScramSha256
+			let name = try scratch(k, "login", 1)
+			let out = try k.producer()
+			try out.send(name, "behind a login")
+			let src = try k.reader(name)
+			let got = try drain(src, 1)
+			assert got.len() == 1 && string(got[0].value) == "behind a login"
+			try src.close()
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+
+			let strong = new Client()
+			strong.sasl = Sasl.ScramSha512
+			try strong.connect("kafka://ana:ana-secret@{testLogin}")
+			assert (try strong.brokers()).len() == 1
+			try strong.close()
+
+			// An unsigned token, which the test broker is set up to take.
+			let claims = "\{\"sub\":\"ana\",\"exp\":{time.now().unixNs() / 1000000000 + 3600}}"
+			let token = "{base64url("\{\"alg\":\"none\"}")}.{base64url(claims)}."
+			let bearer = new Client()
+			bearer.sasl = Sasl.OAuthBearer
+			let secret Secret<string> = token
+			bearer.password = secret
+			try bearer.connect(testLogin)
+			assert (try bearer.brokers()).len() == 1
+			try bearer.close()
+
+			for let address in ["kafka://ana:wrong@{testLogin}", "kafka://nobody:ana-secret@{testLogin}", testLogin] {
+				let kind = ErrorKind.Server
+				let refused = new Client()
+				refused.timeout = 5s
+				refused.connect(address) onerror (err error) {
+					kind = kindOfFailure(err)
+					recover none
+				}
+				// Without a login the broker drops the connection.
+				assert kind == (address == testLogin ?? (ErrorKind.Connection, ErrorKind.Denied))
+			}
+			let wrong = new Client()
+			wrong.sasl = Sasl.Plain
+			let kind = ErrorKind.Server
+			wrong.connect("kafka://admin:nope@{testLogin}") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Denied
+		}
+
+		@test()
+		def TestSecure() !none {
+			return none when testSecure == "" || testCerts == ""
+			let pool = new CertPool()
+			pool.appendCertsFromPEM(string(try os.readFile("{testCerts}/ca.pem")))
+			let k = new Client()
+			k.tls = tls.Config{serverName: "localhost", rootCAs: pool}
+			try k.connect("kafkas://{testSecure}")
+			assert k.secure && (try k.brokers()).len() == 1
+			let name = try scratch(k, "tls", 2)
+			let out = try k.producer()
+			out.compression = Compression.Lz4
+			for let i = 0; i < 300; i++ {
+				try out.sendLater(name, "sealed {i}", key = "k{i % 7}")
+			}
+			try out.flush()
+			let src = try k.consumer("adm-test-tls-{time.now().unixNs()}", name)
+			let got = try drain(src, 300)
+			assert got.len() == 300
+			try src.close()
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+			// An authority the client does not trust.
+			let kind = ErrorKind.Server
+			connect("kafkas://{testSecure}") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Connection
+		}
+
+		@test()
+		def TestTopics() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			try sweepTopics(k)
+			let brokers = try k.brokers()
+			assert brokers.len() >= 1 && brokers[0].host != "" && k.clusterId() != "" && k.controller() >= 0
+			let name = try scratch(k, "topics", 3)
+			let info = try k.topic(name)
+			assert info.name == name && info.partitions.len() == 3 && !info.hidden
+			assert info.partitions[2].index == 2 && info.partitions[2].leader >= 0 && info.partitions[2].replicas.len() == 1
+			let listed = false
+			for let t in try k.topics() {
+				listed = true when t.name == name
+			}
+			assert listed
+
+			let kind = ErrorKind.Server
+			k.createTopic(name) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Exists
+			kind = ErrorKind.Server
+			k.createTopic("adm-test-bad", partitions = 1, replication = 99) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			k.topic("adm-test-no-such-topic") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover TopicInfo{}
+			}
+			assert kind == ErrorKind.NotFound
+
+			try k.addPartitions(name, 5)
+			assert (try k.topic(name)).partitions.len() == 5
+			kind = ErrorKind.Server
+			k.addPartitions(name, 2) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+
+			let config = try k.topicConfig(name)
+			assert config.hasKey("retention.ms") && config["cleanup.policy"] == "delete"
+			try k.setTopicConfig(name, {"retention.ms": "60000", "cleanup.policy": "compact"})
+			// A change shows a moment after the broker took it.
+			assert try settled(k, name, "cleanup.policy", "compact")
+			config = try k.topicConfig(name)
+			assert config["retention.ms"] == "60000" && config["cleanup.policy"] == "compact"
+			try k.setTopicConfig(name, {}, ["cleanup.policy"])
+			assert try settled(k, name, "cleanup.policy", "delete")
+			config = try k.topicConfig(name)
+			assert config["retention.ms"] == "60000" && config["cleanup.policy"] == "delete"
+			kind = ErrorKind.Server
+			k.setTopicConfig(name, {"retention.ms": "soon"}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+			assert (try k.brokerConfig(brokers[0].id)).hasKey("log.retention.hours")
+
+			assert (try k.earliest(name, 0)) == 0 && (try k.latest(name, 4)) == 0
+			assert (try k.offsetAt(name, 0, time.now())) is none
+			kind = ErrorKind.Server
+			k.latest(name, 9) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover 0
+			}
+			assert kind == ErrorKind.NotFound
+
+			try k.deleteTopic(name)
+			kind = ErrorKind.Server
+			k.deleteTopic("adm-test-no-such-topic") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotFound
+			try k.close()
+			kind = ErrorKind.Server
+			k.topics() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover TopicInfo[]
+			}
+			assert kind == ErrorKind.Closed
+		}
+	}
+
+	// Polls until `count` records came or `wait` passed.
+	def drain(src Consumer, count int, wait duration = 20s) !Record[] {
+		let out Record[] = []
+		let deadline = time.now() + wait
+		for out.len() < count && time.now() < deadline {
+			out.push(...(try src.poll(500ms)))
+		}
+		return out
+	}
+
+	check "Records" {
+		@test()
+		def TestBatchFormat() !none {
+			// The hash every client places keys with; values from Kafka's
+			// own tests.
+			assert int32(murmur2("21".bytes())) == -973932308
+			assert int32(murmur2("foobar".bytes())) == -790332482
+			assert int32(murmur2("a-little-bit-long-string".bytes())) == -985981536
+			assert int32(murmur2("a-little-bit-longer-string".bytes())) == -1486304829
+			assert int32(murmur2("lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8".bytes())) == -58897971
+			assert int32(murmur2("abc".bytes())) == 479470107
+			let records Outgoing[] = []
+			for let i = 0; i < 5; i++ {
+				let record = Outgoing{key: "k{i}".bytes(), value: "value {i}".bytes(), timestamp: 1700000000000 + i * 10}
+				record.headers = [Header{name:"n", value:"v{i}".bytes()}]
+				records.push(record)
+			}
+			records.push(Outgoing{key: "gone".bytes(), value: none, timestamp: 1700000000100})
+			for let how in [Compression.None, Compression.Gzip, Compression.Snappy, Compression.Lz4, Compression.Zstd] {
+				let batch = try encodeBatch(records, how, Identity{producerId: 7, producerEpoch: 1, sequence: 40})
+				let (back, next) = try decodeBatches(batch, "t", 2, 0, [])
+				assert back.len() == 6 && next == 6
+				assert back[3].offset == 3 && string(back[3].key) == "k3" && string(back[3].value) == "value 3"
+				assert back[3].timestamp.unixNs() == (1700000000000 + 30) * 1000000
+				assert back[3].headers.len() == 1 && back[3].headers[0].name == "n" && string(back[3].headers[0].value) == "v3"
+				assert back[5].deleted && back[5].value.len() == 0 && !back[0].deleted
+				let (later, _) = try decodeBatches(batch, "t", 2, 4, [])
+				assert later.len() == 2 && later[0].offset == 4
+				// A batch cut short waits for the next fetch.
+				let (cut, same) = try decodeBatches(batch[:batch.len() - 3], "t", 2, 0, [])
+				assert cut.len() == 0 && same == 0
+				batch[batch.len() - 1] ^= 1
+				let kind = ErrorKind.Server
+				decodeBatches(batch, "t", 2, 0, []) onerror (err error) {
+					kind = kindOfFailure(err)
+					recover (Record[], 0)
+				}
+				assert kind == ErrorKind.Corrupt
+			}
+		}
+
+		@test()
+		def TestSendAndRead() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "send", 3)
+			let out = try k.producer()
+			let first = try out.send(name, "one", key = "a")
+			let again = try out.send(name, "two", key = "a")
+			assert first.partition == again.partition && again.offset == first.offset + 1 && first.topic == name
+			let fixed = try out.send(name, "three".bytes(), partition = 2, headers = [Header{name:"trace", value:"t-1".bytes()}])
+			assert fixed.partition == 2 && fixed.offset == 0
+			let gone = try out.tombstone(name, "a")
+			assert gone.partition == first.partition
+			let kind = ErrorKind.Server
+			out.send(name, "nowhere", partition = 7) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Sent{}
+			}
+			assert kind == ErrorKind.NotFound
+
+			let src = try k.reader(name)
+			let got = try drain(src, 4)
+			assert got.len() == 4
+			let texts string[] = []
+			for let record in got {
+				texts.push("{record.partition}:{record.offset}:{string(record.key)}={string(record.value)}{record.deleted ?? ("!", "")}")
+			}
+			texts = texts.sort((a, b) => a < b)
+			let p = first.partition
+			let want = ["2:0:=three", "{p}:{first.offset}:a=one", "{p}:{first.offset + 1}:a=two", "{p}:{first.offset + 2}:a=!"].sort((a, b) => a < b)
+			assert texts.join(" ") == want.join(" ")
+			for let record in got {
+				if record.partition == 2 && p != 2 {
+					let trace = header(record, "trace")
+					fail "no trace header" when trace is none
+					assert trace == "t-1" && header(record, "other") is none
+					assert time.now() - record.timestamp < 1min
+				}
+			}
+			assert (try src.poll(300ms)).len() == 0
+			assert (try k.latest(name, 2)) >= 1
+
+			// Back to the start of one partition, and to a place in it.
+			try src.seek(name, p, Start.Earliest)
+			let replay = try drain(src, 3)
+			assert replay.len() == 3 && replay[0].offset == 0
+			try src.seek(name, p, first.offset + 1)
+			let tail = try drain(src, 2)
+			assert tail.len() == 2 && string(tail[0].value) == "two"
+			src.pause(name, p)
+			try src.seek(name, p, 0)
+			assert (try src.poll(300ms)).len() == 0
+			src.resume(name, p)
+			assert (try drain(src, 3)).len() == 3
+			kind = ErrorKind.Server
+			src.seek(name, 9, 0) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.State
+			try src.close()
+
+			// One named partition, then the rest of the topic too.
+			let picked = try k.reader(name, p)
+			assert picked.positions()[name].len() == 0
+			let held = p == 2 ?? (4, 3)
+			let mine = try drain(picked, held)
+			assert mine.len() == held && keyText(mine[0]) == string(mine[0].key) && text(mine[0]) == string(mine[0].value)
+			assert picked.positions()[name][p] == held
+			try picked.assign(name)
+			assert picked.assignment()[name].len() == 3
+			assert (try drain(picked, 4 - held, 3s)).len() == 4 - held
+			try picked.close()
+			// Records before an offset can be dropped for good.
+			assert (try k.deleteRecords(name, p, first.offset + 2)) == first.offset + 2
+			assert (try k.earliest(name, p)) == first.offset + 2
+			let kind2 = ErrorKind.Server
+			k.deleteRecords(name, p, 999) onerror (err error) {
+				kind2 = kindOfFailure(err)
+				recover 0
+			}
+			assert kind2 == ErrorKind.OutOfRange
+
+			// A reader that starts at the end sees only what comes after.
+			let live = try k.reader(name, 2)
+			live.startFrom = Start.Latest
+			assert (try live.poll(300ms)).len() == 0
+			try out.send(name, "late", partition = 2)
+			let fresh = try drain(live, 1)
+			assert fresh.len() == 1 && string(fresh[0].value) == "late"
+			try live.close()
+			try out.close()
+			kind = ErrorKind.Server
+			out.send(name, "after close") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Sent{}
+			}
+			assert kind == ErrorKind.Closed
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		@test()
+		def TestCompressionAndBatches() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "packed", 1)
+			let total = 0
+			for let how in [Compression.None, Compression.Gzip, Compression.Snappy, Compression.Lz4, Compression.Zstd] {
+				let out = try k.producer()
+				out.compression = how
+				out.linger = 20ms
+				out.batchBytes = 65536
+				for let i = 0; i < 400; i++ {
+					try out.sendLater(name, "record {total + i} of a batch that compresses well, well, well, well")
+				}
+				try out.flush()
+				try out.close()
+				total += 400
+			}
+			assert (try k.latest(name, 0)) == total
+			let src = try k.reader(name)
+			let got = try drain(src, total)
+			assert got.len() == total
+			let ordered = true
+			for let (i, record) in got {
+				ordered = false unless record.offset == i && string(record.value).startsWith("record {i} of")
+			}
+			assert ordered
+
+			// A record of a megabyte and a half needs room on both sides.
+			let big byte[] = []
+			big.len(1500000)
+			for let i = 0; i < big.len(); i++ {
+				big[i] = byte((i * 7) & 0xFF)
+			}
+			let out = try k.producer()
+			let kind = ErrorKind.Server
+			out.send(name, big) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Sent{}
+			}
+			assert kind == ErrorKind.TooLarge
+			try k.setTopicConfig(name, {"max.message.bytes": "4000000"})
+			time.sleep(500ms)
+			let sent = try out.send(name, big)
+			assert sent.offset == total
+			let wide = try k.reader(name)
+			wide.partitionBytes = 4000000
+			try wide.seek(name, 0, total)
+			let back = try drain(wide, 1)
+			assert back.len() == 1 && back[0].value.equals(big)
+			try wide.close()
+			try src.close()
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		// Records Kafka's Java producer wrote with every compression are
+		// read, and keys land in the partitions Java put them in.
+		@test()
+		def TestJavaSide() !none {
+			return none when testBroker == "" || testJava == ""
+			let k = try connect(testBroker)
+			let src = try k.reader("adm-test-interop")
+			let got = try drain(src, 15)
+			assert got.len() == 15
+			let theirs map<string, int> = {}
+			for let record in got {
+				let key = string(record.key)
+				assert string(record.value) == "java {key.slice(4, key.len()).replace("-", " ")}"
+				theirs[key] = record.partition
+			}
+			assert theirs.len() == 15
+			for let how in [Compression.None, Compression.Gzip, Compression.Snappy, Compression.Lz4, Compression.Zstd] {
+				let out = try k.producer()
+				out.compression = how
+				out.linger = 20ms
+				for let (key, partition) in theirs {
+					let sent = try out.send("adm-test-interop", "adm {how} {key}", key = key)
+					assert sent.partition == partition
+				}
+				try out.close()
+			}
+			try src.close()
+			try k.close()
+		}
+
+		// The broker goes away and comes back while a producer sends and a
+		// group member reads: every record arrives once, in order.
+		@test()
+		def TestRestart() !none {
+			return none when testBroker == "" || testHard == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "restart", 1)
+			let out = try k.producer()
+			let src = try k.consumer("adm-test-restart-{time.now().unixNs()}", name)
+			src.heartbeatEvery = 500ms
+			let seen int[] = []
+			let sent = 0
+			let until = time.now() + 25s
+			for time.now() < until {
+				try out.send(name, "{sent}")
+				sent++
+				for let record in try src.poll(50ms) {
+					seen.push(string(record.value).toInt<int>())
+				}
+				time.sleep(20ms)
+			}
+			let deadline = time.now() + 30s
+			for seen.len() < sent && time.now() < deadline {
+				for let record in try src.poll(500ms) {
+					seen.push(string(record.value).toInt<int>())
+				}
+			}
+			println("TestRestart: sent {sent}, read {seen.len()}")
+			assert seen.len() == sent
+			let ordered = true
+			for let (i, n) in seen {
+				ordered = false unless n == i
+			}
+			assert ordered
+			try src.close()
+			try out.close()
+			try k.close()
+		}
+
+		@test()
+		def TestManySenders() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "many", 3)
+			let out = try k.producer()
+			let senders = new AsyncScope()
+			for let worker = 0; worker < 8; worker++ {
+				async<senders> burst(out, name, worker)
+			}
+			try await senders
+			let src = try k.reader(name)
+			let got = try drain(src, 800)
+			assert got.len() == 800
+			// Each sender's records stay in the order it sent them.
+			let last map<string, int> = {}
+			let ordered = true
+			for let record in got {
+				let who = string(record.key)
+				let n = string(record.value).toInt<int>()
+				let before = last.get(who)
+				ordered = false when !(before is none) && n != before + 1
+				last[who] = n
+			}
+			assert ordered && last.len() == 8
+			try src.close()
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+		}
+	}
+
+	check "Groups" {
+		@test()
+		def TestCommitAndResume() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "group", 3)
+			let group = "adm-test-group-{time.now().unixNs()}"
+			let out = try k.producer()
+			for let i = 0; i < 30; i++ {
+				try out.sendLater(name, "{i}", partition = i % 3)
+			}
+			try out.flush()
+
+			let first = try k.consumer(group, name)
+			first.autoCommit = false
+			let got = try drain(first, 30)
+			assert got.len() == 30
+			assert first.assignment()[name].len() == 3
+			// Half of partition 0 is done with, the rest not.
+			for let record in got {
+				try first.commit(record) when record.partition == 0 && record.offset == 4
+			}
+			try first.close()
+			let saved = try k.committed(group, name)
+			assert saved.len() == 1 && saved[0] == 5
+
+			// The next member goes on from the group's place.
+			let second = try k.consumer(group, name)
+			let rest = try drain(second, 25)
+			assert rest.len() == 25
+			let low = 99
+			for let record in rest {
+				low = record.offset when record.partition == 0 && record.offset < low
+			}
+			assert low == 5
+			try second.commit()
+			let all = try k.committed(group, name)
+			assert all.len() == 3 && all[0] == 10 && all[1] == 10 && all[2] == 10
+			let info = try k.group(group)
+			assert info.id == group && info.state == "Stable" && info.members.len() == 1 && info.strategy == "range"
+			assert info.members[0].partitions[name].len() == 3
+			assert (try k.groups()).includes(group)
+			let kind = ErrorKind.Server
+			k.deleteGroup(group) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.State
+			try second.close()
+
+			// With autoCommit, closing stores the place.
+			try out.send(name, "more", partition = 1)
+			let third = try k.consumer(group, name)
+			assert (try drain(third, 1)).len() == 1
+			try third.close()
+			let after = (try k.committed(group, name)).get(1)
+			fail "no offset stored on close" when after is none
+			assert after == 11
+			// A new group starts at the end when told to.
+			let late = try k.consumer("{group}-late", name)
+			late.startFrom = Start.Latest
+			assert (try late.poll(2s)).len() == 0
+			try out.send(name, "newest", partition = 2)
+			let newest = try drain(late, 1)
+			assert newest.len() == 1 && string(newest[0].value) == "newest"
+			try late.close()
+
+			try k.deleteGroup(group)
+			try k.deleteGroup("{group}-late")
+			kind = ErrorKind.Server
+			k.deleteGroup(group) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotFound
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		@test()
+		def TestRebalance() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "rebalance", 4)
+			let group = "adm-test-rebalance-{time.now().unixNs()}"
+			let out = try k.producer()
+			let one = try k.consumer(group, name)
+			one.heartbeatEvery = 300ms
+			one.strategy = Strategy.RoundRobin
+			let gained string[] = []
+			let lost string[] = []
+			one.onAssigned = def (parts map<string, int[]>) {
+				gained.push("{parts[name].len()}")
+			}
+			one.onRevoked = def (parts map<string, int[]>) {
+				lost.push("{parts[name].len()}")
+			}
+			try one.poll(1s)
+			assert one.assignment()[name].len() == 4 && gained.join(",") == "4"
+
+			// A second member takes half; the first learns of it from a
+			// heartbeat and gives its partitions up on its next poll.
+			let two = try k.consumer(group, name)
+			two.heartbeatEvery = 300ms
+			two.strategy = Strategy.RoundRobin
+			let joining = async settle(two, 2)
+			let deadline = time.now() + 30s
+			for one.assignment()[name].len() != 2 && time.now() < deadline {
+				try one.poll(200ms)
+			}
+			assert await joining
+			assert one.assignment()[name].len() == 2 && two.assignment()[name].len() == 2
+			assert gained.join(",") == "4,2" && lost.join(",") == "4"
+			let both int[] = []
+			both.push(...one.assignment()[name])
+			both.push(...two.assignment()[name])
+			both = both.sort((a, b) => a < b)
+			assert both.len() == 4 && both[0] == 0 && both[3] == 3
+			assert (try k.group(group)).members.len() == 2 && (try k.group(group)).strategy == "roundrobin"
+
+			// Every record reaches one of the two.
+			for let i = 0; i < 40; i++ {
+				try out.sendLater(name, "{i}", partition = i % 4)
+			}
+			try out.flush()
+			let seen = 0
+			deadline = time.now() + 30s
+			for seen < 40 && time.now() < deadline {
+				seen += (try one.poll(200ms)).len()
+				seen += (try two.poll(200ms)).len()
+			}
+			assert seen == 40
+
+			// The second leaves: the first gets everything back.
+			try two.close()
+			deadline = time.now() + 30s
+			for one.assignment()[name].len() != 4 && time.now() < deadline {
+				try one.poll(200ms)
+			}
+			assert one.assignment()[name].len() == 4
+			try one.close()
+			try out.close()
+			try k.deleteGroup(group)
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		// A group shared with a Java consumer: both understand what the
+		// other asks for and is given.
+		@test()
+		def TestJavaMember() !none {
+			return none when testBroker == "" || testJavaGroup == ""
+			let k = try connect(testBroker)
+			let member = try k.consumer(testJavaGroup, "adm-test-interop")
+			member.heartbeatEvery = 300ms
+			member.strategy = Strategy.CooperativeSticky when testJavaStrategy == "cooperative-sticky"
+			member.strategy = Strategy.Sticky when testJavaStrategy == "sticky"
+			if testJavaStrategy == "next" {
+				// The Java consumer runs with group.protocol=consumer: the
+				// coordinator deals, and the old way of describing a group
+				// does not apply.
+				member.protocol = GroupProtocol.Next
+				let until = time.now() + 40s
+				let shared = 0
+				for time.now() < until {
+					try member.poll(300ms)
+					shared = held(member, "adm-test-interop")
+					break when shared == 1 || shared == 2
+				}
+				assert shared == 1 || shared == 2
+				try member.close()
+				try k.close()
+				return none
+			}
+			let deadline = time.now() + 30s
+			let mine = 0
+			for time.now() < deadline {
+				try member.poll(300ms)
+				let parts = member.assignment().get("adm-test-interop")
+				mine = parts is none ?? (0, parts.len())
+				break when (mine == 1 || mine == 2) && (try k.group(testJavaGroup)).members.len() == 2
+			}
+			assert mine == 1 || mine == 2
+			let info = try k.group(testJavaGroup)
+			assert info.members.len() == 2 && info.state == "Stable"
+			let total = 0
+			for let m in info.members {
+				let parts = m.partitions.get("adm-test-interop")
+				total += parts.len() unless parts is none
+			}
+			assert total == 3
+			try member.close()
+			try k.close()
+		}
+
+		@test()
+		def TestCooperative() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "cooperative", 4)
+			let group = "adm-test-cooperative-{time.now().unixNs()}"
+			let out = try k.producer()
+			let one = try k.consumer(group, name)
+			one.heartbeatEvery = 300ms
+			one.strategy = Strategy.CooperativeSticky
+			let gained string[] = []
+			let lost string[] = []
+			one.onAssigned = def (parts map<string, int[]>) {
+				gained.push("{parts[name].len()}")
+			}
+			one.onRevoked = def (parts map<string, int[]>) {
+				lost.push("{parts[name].len()}")
+			}
+			for let i = 0; i < 8; i++ {
+				try out.send(name, "early {i}", partition = i % 4)
+			}
+			assert (try drain(one, 8)).len() == 8
+			assert one.assignment()[name].len() == 4 && gained.join(",") == "4" && lost.len() == 0
+			let places = one.positions()[name]
+
+			// A second member: the first gives up two partitions and keeps
+			// reading the other two from where it was.
+			let two = try k.consumer(group, name)
+			two.heartbeatEvery = 300ms
+			two.strategy = Strategy.CooperativeSticky
+			// The partitions that move reach the second member a round after
+			// the first let go of them, so the first keeps polling meanwhile.
+			let joining = async settle(two, 2)
+			let deadline = time.now() + 30s
+			for held(two, name) != 2 && time.now() < deadline {
+				try one.poll(200ms)
+			}
+			assert await joining
+			assert one.assignment()[name].len() == 2 && two.assignment()[name].len() == 2
+			assert lost.join(",") == "2" && gained.join(",") == "4"
+			for let partition in one.assignment()[name] {
+				assert one.positions()[name][partition] == places[partition]
+			}
+			let both int[] = []
+			both.push(...one.assignment()[name])
+			both.push(...two.assignment()[name])
+			both = both.sort((a, b) => a < b)
+			assert both.len() == 4 && both[0] == 0 && both[1] == 1 && both[2] == 2 && both[3] == 3
+			assert (try k.group(group)).strategy == "cooperative-sticky"
+
+			// Each record reaches one of them, once.
+			for let i = 0; i < 40; i++ {
+				try out.sendLater(name, "late {i}", partition = i % 4)
+			}
+			try out.flush()
+			let seen = 0
+			deadline = time.now() + 30s
+			for seen < 40 && time.now() < deadline {
+				seen += (try one.poll(200ms)).len()
+				seen += (try two.poll(200ms)).len()
+			}
+			assert seen == 40
+			assert (try one.poll(300ms)).len() == 0 && (try two.poll(300ms)).len() == 0
+
+			// The second leaves: the first is given its two partitions, and
+			// told of those two only.
+			try two.close()
+			deadline = time.now() + 30s
+			for one.assignment()[name].len() != 4 && time.now() < deadline {
+				try one.poll(200ms)
+			}
+			assert one.assignment()[name].len() == 4 && gained.join(",") == "4,2" && lost.join(",") == "2"
+			try one.close()
+			try out.close()
+			try k.deleteGroup(group)
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		// The group protocol of Kafka 4: the coordinator deals.
+		@test()
+		def TestNextProtocol() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "next", 4)
+			let group = "adm-test-next-{time.now().unixNs()}"
+			let out = try k.producer()
+			let one = try k.consumer(group, name)
+			one.protocol = GroupProtocol.Next
+			one.autoCommit = false
+			let gained string[] = []
+			let lost string[] = []
+			one.onAssigned = def (parts map<string, int[]>) {
+				gained.push("{parts[name].len()}")
+			}
+			one.onRevoked = def (parts map<string, int[]>) {
+				lost.push("{parts[name].len()}")
+			}
+			for let i = 0; i < 8; i++ {
+				try out.send(name, "early {i}", partition = i % 4)
+			}
+			assert (try drain(one, 8)).len() == 8
+			assert held(one, name) == 4 && gained.join(",") == "4" && lost.len() == 0
+			try one.commit()
+			let saved = try k.committed(group, name)
+			assert saved.len() == 4 && saved[0] == 2 && saved[3] == 2
+
+			let two = try k.consumer(group, name)
+			two.protocol = GroupProtocol.Next
+			let deadline = time.now() + 40s
+			for (held(one, name) != 2 || held(two, name) != 2) && time.now() < deadline {
+				try one.poll(200ms)
+				try two.poll(200ms)
+			}
+			assert held(one, name) == 2 && held(two, name) == 2 && lost.join(",") == "2"
+			let both int[] = []
+			both.push(...one.assignment()[name])
+			both.push(...two.assignment()[name])
+			both = both.sort((a, b) => a < b)
+			assert both.len() == 4 && both[0] == 0 && both[3] == 3
+
+			for let i = 0; i < 40; i++ {
+				try out.sendLater(name, "late {i}", partition = i % 4)
+			}
+			try out.flush()
+			let seen = 0
+			deadline = time.now() + 30s
+			for seen < 40 && time.now() < deadline {
+				seen += (try one.poll(200ms)).len()
+				seen += (try two.poll(200ms)).len()
+			}
+			assert seen == 40
+			try one.commit()
+
+			try two.close()
+			deadline = time.now() + 40s
+			for held(one, name) != 4 && time.now() < deadline {
+				try one.poll(200ms)
+			}
+			assert held(one, name) == 4 && gained.join(",") == "4,2"
+			try one.close()
+			try out.close()
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		@test()
+		def TestSticky() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "sticky", 6)
+			let group = "adm-test-sticky-{time.now().unixNs()}"
+			let members Consumer[] = []
+			for let i = 0; i < 2; i++ {
+				let member = try k.consumer(group, name)
+				member.heartbeatEvery = 300ms
+				member.strategy = Strategy.Sticky
+				members.push(member)
+			}
+			// Both in, three partitions each. Each member polls on a task of
+			// its own: joining waits for the others to join too.
+			let pair = new AsyncScope()
+			async<pair> settle(members[0], 3)
+			async<pair> settle(members[1], 3)
+			try await pair
+			assert held(members[0], name) == 3 && held(members[1], name) == 3
+			let first = members[0].assignment()[name].clone()
+			let second = members[1].assignment()[name].clone()
+			assert first.len() == 3 && second.len() == 3
+
+			// A third: each of the two keeps two of its own and passes one
+			// on.
+			let third = try k.consumer(group, name)
+			third.heartbeatEvery = 300ms
+			third.strategy = Strategy.Sticky
+			members.push(third)
+			let trio = new AsyncScope()
+			for let member in members {
+				async<trio> settle(member, 2)
+			}
+			try await trio
+			let even = held(members[0], name) == 2 && held(members[1], name) == 2 && held(members[2], name) == 2
+			assert even
+			for let partition in members[0].assignment()[name] {
+				assert first.includes(partition)
+			}
+			for let partition in members[1].assignment()[name] {
+				assert second.includes(partition)
+			}
+			assert (try k.group(group)).strategy == "sticky"
+			for let member in members {
+				try member.close()
+			}
+			try k.deleteGroup(group)
+			try k.deleteTopic(name)
+			try k.close()
+		}
+
+		@test()
+		def TestTransactions() !none {
+			return none when testBroker == ""
+			let k = try connect(testBroker)
+			let name = try scratch(k, "tx", 1)
+			let source = try scratch(k, "tx-source", 1)
+			let group = "adm-test-tx-{time.now().unixNs()}"
+			let out = try k.producer()
+			out.transactionalId = "adm-test-tx-{time.now().unixNs()}"
+			let kind = ErrorKind.Server
+			out.send(name, "outside") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Sent{}
+			}
+			assert kind == ErrorKind.State
+			kind = ErrorKind.Server
+			out.commitTx() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.State
+
+			try out.beginTx()
+			try out.send(name, "kept 1")
+			try out.send(name, "kept 2")
+			let committed = try k.reader(name)
+			committed.readCommitted = true
+			let everything = try k.reader(name)
+			// Open: visible only to a reader that does not ask for
+			// committed records.
+			assert (try drain(everything, 2)).len() == 2
+			assert (try committed.poll(500ms)).len() == 0
+			try out.commitTx()
+			let kept = try drain(committed, 2)
+			assert kept.len() == 2 && string(kept[1].value) == "kept 2"
+
+			try out.beginTx()
+			try out.send(name, "dropped 1")
+			try out.send(name, "dropped 2")
+			try out.abortTx()
+			try out.beginTx()
+			try out.send(name, "kept 3")
+			try out.commitTx()
+			let after = try drain(committed, 1)
+			assert after.len() == 1 && string(after[0].value) == "kept 3"
+			assert (try committed.poll(300ms)).len() == 0
+			let raw = try drain(everything, 3)
+			assert raw.len() == 3 && string(raw[0].value) == "dropped 1" && string(raw[2].value) == "kept 3"
+
+			// Read, transform, write: the group's place moves with the
+			// transaction or not at all.
+			let feed = try k.producer()
+			for let i = 0; i < 6; i++ {
+				try feed.send(source, "in {i}")
+			}
+			let worker = try k.consumer(group, source)
+			worker.autoCommit = false
+			let batch = try drain(worker, 6)
+			assert batch.len() == 6
+			try out.beginTx()
+			for let record in batch {
+				try out.send(name, "out of {string(record.value)}")
+			}
+			try out.sendOffsets(worker)
+			try out.abortTx()
+			assert (try k.committed(group, source)).len() == 0
+			try out.beginTx()
+			for let record in batch {
+				try out.send(name, "out of {string(record.value)}")
+			}
+			try out.sendOffsets(worker)
+			try out.commitTx()
+			// The offsets show once the transaction's end reached the
+			// group's coordinator.
+			let place = -1
+			for let i = 0; i < 100 && place < 0; i++ {
+				let stored = (try k.committed(group, source)).get(0)
+				place = stored unless stored is none
+				time.sleep(50ms) when place < 0
+			}
+			assert place == 6
+			let moved = try drain(committed, 6)
+			assert moved.len() == 6 && string(moved[5].value) == "out of in 5"
+			assert (try committed.poll(300ms)).len() == 0
+
+			// A newer producer with the same id takes over.
+			let heir = try k.producer()
+			heir.transactionalId = out.transactionalId
+			try heir.beginTx()
+			try heir.send(name, "from the heir")
+			try heir.commitTx()
+			kind = ErrorKind.Server
+			try out.beginTx()
+			out.send(name, "from the old one") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover Sent{}
+			}
+			assert kind == ErrorKind.Fenced
+			try worker.close()
+			try committed.close()
+			try everything.close()
+			try heir.close()
+			try feed.close()
+			try k.deleteGroup(group)
+			try k.deleteTopic(name)
+			try k.deleteTopic(source)
+			try k.close()
+		}
+	}
+
+	// How many partitions of a topic a consumer reads now.
+	def held(member Consumer, topic string) int {
+		let mine = member.assignment().get(topic)
+		return mine is none ?? (0, mine.len())
+	}
+
+	// Polls until the consumer has `count` partitions; true when it got
+	// there.
+	def settle(member Consumer, count int) bool {
+		let deadline = time.now() + 30s
+		for time.now() < deadline {
+			member.poll(200ms) onerror recover Record[]
+			let parts = member.assignment()
+			for let (_, mine) in parts {
+				return true when mine.len() == count
+			}
+		}
+		return false
+	}
+
+	def burst(out Producer, topic string, worker int) !none {
+		for let i = 0; i < 100; i++ {
+			try out.send(topic, "{i}", key = "worker-{worker}")
+		}
+		return none
+	}
+}

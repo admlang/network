@@ -62,23 +62,61 @@ partial module adm.network.redis {
 		}
 
 		// The values of several keys, by key; a key that does not exist or
-		// holds no string is left out.
+		// holds no string is left out. With a cluster the keys may live in
+		// any slots: each slot's keys are read by a command of their own,
+		// so the values are not of one moment.
 		// Fails as `command` does.
 		def mget(keys ...string) !map<string, string> {
 			let out = new map<string, string>()
 			return out when keys.len() == 0
-			let reply = try call(timeout, ...joined(["MGET"], keys))
-			for let (i, item) in reply.items {
-				out.set(keys[i], item.text()) unless item.isNull()
+			let groups = link.shards(keys)
+			if groups.len() <= 1 {
+				let reply = try call(timeout, ...joined(["MGET"], keys))
+				for let (i, item) in reply.items {
+					out.set(keys[i], item.text()) unless item.isNull()
+				}
+				return out
+			}
+			let commands any[][] = []
+			for let group in groups {
+				commands.push(joined(["MGET"], group))
+			}
+			for let (g, reply) in try link.run(commands, timeout) {
+				fail serverError(reply.text()) when reply.isError()
+				for let (i, item) in reply.items {
+					out.set(groups[g][i], item.text()) unless item.isNull()
+				}
 			}
 			return out
 		}
 
-		// Sets several keys at once.
+		// Sets several keys at once. With a cluster the keys may live in
+		// any slots: each slot's keys are set by a command of their own, so
+		// a failure may leave some set and others not.
 		// Fails as `command` does.
 		def mset(values map<string, any>) !none {
 			return none when values.len() == 0
-			try call(timeout, ...joinedPairs(["MSET"], values))
+			let keys string[] = []
+			for let (key, _) in values {
+				keys.push(key)
+			}
+			let groups = link.shards(keys)
+			if groups.len() <= 1 {
+				try call(timeout, ...joinedPairs(["MSET"], values))
+				return none
+			}
+			let commands any[][] = []
+			for let group in groups {
+				let command any[] = ["MSET"]
+				for let key in group {
+					command.push(key)
+					command.push(values[key])
+				}
+				commands.push(command)
+			}
+			for let reply in try link.run(commands, timeout) {
+				fail serverError(reply.text()) when reply.isError()
+			}
 			return none
 		}
 

@@ -1,0 +1,277 @@
+partial module adm.network.kafka {
+	use (
+		std.time
+		adm.network.kafka.wire::*
+	)
+
+	// Start is where a consumer begins in a partition its group has no
+	// offset for.
+	enum Start {
+		// At the oldest record the partition still holds.
+		Earliest,
+		// After the newest: only what is written from now on.
+		Latest,
+	}
+
+	// GroupProtocol is how a consumer and its group's coordinator talk.
+	enum GroupProtocol {
+		// The members join, one of them deals the partitions, all take
+		// their share: Kafka since 0.9.
+		Classic,
+		// The coordinator deals, and each heartbeat says what changed:
+		// Kafka 4 (KIP-848).
+		Next,
+	}
+
+	// Strategy is how a group deals out partitions among its members.
+	// Every member of a group should name the same one.
+	enum Strategy {
+		// Each member gets a run of every topic's partitions, so the same
+		// partition numbers of two topics land on one member.
+		Range      = "range",
+		// All partitions are dealt one by one.
+		RoundRobin = "roundrobin",
+		// Each partition stays with the member that has it, as far as an
+		// even deal allows.
+		Sticky = "sticky",
+		// As `Sticky`, and without the stop: members keep reading through
+		// a rebalance and give up only the partitions that move, which
+		// reach their new member one round later. `onRevoked` and
+		// `onAssigned` get just what changed.
+		CooperativeSticky = "cooperative-sticky",
+	}
+
+	// Consumer reads records from topics. As a member of a group
+	// (`Client.consumer`) it shares the topics' partitions with the other
+	// members and keeps the group's place in each; with partitions of its
+	// own (`Client.reader`) it reads them alone.
+	//
+	// ```
+	// let orders = try k.consumer("billing", "orders", "refunds")
+	// for {
+	//     for let record in try orders.poll(1s) {
+	//         handle(record)
+	//     }
+	// }
+	// ```
+	//
+	// One task polls a consumer. Set the fields before the first `poll`.
+	// With `autoCommit` the offsets of the records `poll` returned are
+	// committed on a later `poll` and on `close`, so a record is seen
+	// again after a crash unless it was handled before the next `poll`.
+	//
+	// When members join or leave, the group deals its partitions anew:
+	// the next `poll` gives up the old ones (`onRevoked`), takes the new
+	// (`onAssigned`) and goes on from the group's committed offsets.
+	// Call `poll` at least once per `rebalanceTimeout`, or the group
+	// counts the consumer as gone.
+	type Consumer {
+		// The group's id; "" for a consumer without one.
+		group             string
+		startFrom         Start                     = Start.Earliest
+		autoCommit        bool                      = true
+		// How often `poll` commits with `autoCommit`.
+		commitEvery       duration                  = 5s
+		// Without a heartbeat for this long the group gives the member's
+		// partitions away.
+		sessionTimeout    duration                  = 45s
+		// How long the members have to rejoin when the group changes, and
+		// the longest pause between two polls.
+		rebalanceTimeout  duration                  = 5min
+		heartbeatEvery    duration                  = 3s
+		// How long a broker may hold a fetch while it has under `minBytes`
+		// to send.
+		maxWait           duration                  = 500ms
+		minBytes          int                       = 1
+		// The most one fetch returns, in all and for one partition. A
+		// batch larger than `partitionBytes` cannot be read.
+		maxBytes          int                       = 52428800
+		partitionBytes    int                       = 1048576
+		// True leaves out the records of transactions that are still open
+		// or were rolled back.
+		readCommitted     bool                      = false
+		strategy          Strategy                  = Strategy.Range
+		// How the consumer takes part in its group. `Classic` works with
+		// every broker; with `Next` (Kafka 4) the coordinator deals the
+		// partitions itself and a change moves only what must move:
+		// `strategy` then picks its way of dealing, `Range` for runs and
+		// any other for an even spread, and `onRevoked`/`onAssigned` name
+		// just what changed. A group speaks one protocol.
+		protocol          GroupProtocol             = GroupProtocol.Classic
+		// A name that stays the same across restarts: the group then
+		// keeps the member's partitions for it for `sessionTimeout`
+		// instead of dealing them out when it leaves.
+		instanceId        string                    = ""
+		// Called from `poll` with the partitions (by topic) the group
+		// took back, and with those it gave.
+		onRevoked         ?def (map<string, int[]>) = none
+		onAssigned        ?def (map<string, int[]>) = none
+		internal engine   Reader
+		internal started  bool                      = false
+		internal lastSave time.Time
+		// Keeps the client open for as long as the consumer is held.
+		internal owner    Client
+
+		def new(engine Reader, owner Client) {
+			self.engine = engine
+			self.owner = owner
+			group = engine.group
+			lastSave = time.now()
+		}
+
+		internal def ready() Reader {
+			return engine when started
+			engine.fromEarliest = startFrom == Start.Earliest
+			engine.sessionTimeout = sessionTimeout
+			engine.rebalanceTimeout = rebalanceTimeout
+			engine.heartbeatEvery = heartbeatEvery
+			engine.maxWait = maxWait
+			engine.minBytes = minBytes
+			engine.maxBytes = maxBytes
+			engine.partitionBytes = partitionBytes
+			engine.committedOnly = readCommitted
+			engine.strategy = strategy.value
+			engine.modern = protocol == GroupProtocol.Next
+			engine.instanceId = instanceId
+			let revoked = onRevoked
+			let auto = autoCommit
+			// What the consumer read goes to the group before its
+			// partitions do.
+			engine.onRevoked = def (parts map<string, int[]>) {
+				if auto {
+					engine.commit(engine.positions()) onerror recover none
+				}
+				revoked(parts) unless revoked is none
+			}
+			engine.onAssigned = onAssigned
+			started = true
+			return engine
+		}
+
+		// poll returns the records that arrive within `timeout`, as soon
+		// as some do, in the order of their offsets within each partition;
+		// an empty list when the time passes first.
+		// Fails with a KafkaError: ErrorKind.NotFound for a topic that
+		// does not exist, ErrorKind.Denied without the permission,
+		// ErrorKind.Fenced when another member with the same `instanceId`
+		// took over, ErrorKind.Corrupt for records that fail their
+		// checksum, ErrorKind.TooLarge for a batch over `partitionBytes`,
+		// ErrorKind.Closed after `close`.
+		def poll(timeout duration = 1s) !Record[] {
+			let reader = ready()
+			if autoCommit && group != "" && time.now() - lastSave >= commitEvery {
+				lastSave = time.now()
+				// A commit the group refuses because it changes is made up
+				// for by the rebalance.
+				reader.commit(reader.positions()) onerror (err error) {
+					let moved = false
+					moved = err.kind == ErrorKind.Rebalanced when err is KafkaError
+					fail err unless moved
+					recover none
+				}
+			}
+			return try reader.poll(timeout)
+		}
+
+		// commit stores the consumer's place in every partition it reads:
+		// after a restart or a rebalance the group goes on from there.
+		// Fails with a KafkaError: ErrorKind.Rebalanced when the group
+		// changed and nothing was stored (the records since the last
+		// commit may be seen again), ErrorKind.State without a group.
+		def commit() !none {
+			let reader = ready()
+			lastSave = time.now()
+			return try reader.commit(reader.positions())
+		}
+
+		// commit stores the place right after one record.
+		// Fails as `commit()` does.
+		def commit(record Record) !none {
+			let offsets map<int, int> = {}
+			offsets[record.partition] = record.offset + 1
+			let all map<string, map<int, int>> = {}
+			all[record.topic] = offsets
+			return try ready().commit(all)
+		}
+
+		// assign makes the consumer read partitions of a topic that it
+		// names itself, in addition to those it already reads; with none
+		// named, all the topic has. A consumer with a group starts each at
+		// the group's committed offset. Not for a consumer that subscribed
+		// to topics.
+		// Fails with a KafkaError: ErrorKind.State for a consumer that
+		// subscribed, ErrorKind.NotFound for a topic or partition that
+		// does not exist.
+		def assign(topic string, partitions ...int) !none {
+			let reader = ready()
+			fail errorOf(ErrorKind.State, "kafka: a consumer that subscribed to topics gets its partitions from the group") when reader.topics.len() > 0
+			let known = try reader.cluster.topic(topic)
+			let wanted int[] = []
+			for let partition in partitions {
+				fail errorOf(ErrorKind.NotFound, "kafka: topic '{topic}' has no partition {partition}; it has {known.parts.len()}") when partition < 0 || partition >= known.parts.len()
+				wanted.push(partition)
+			}
+			if wanted.len() == 0 {
+				for let part in known.parts {
+					wanted.push(part.index)
+				}
+			}
+			reader.addOwned(topic, wanted)
+			return try reader.locate()
+		}
+
+		// assignment is the partitions the consumer reads now, by topic.
+		def assignment() map<string, int[]> {
+			return engine.ownedCopy()
+		}
+
+		// positions is the offset of the next record of each partition
+		// the consumer reads, by topic and partition.
+		def positions() map<string, map<int, int>> {
+			return engine.positions()
+		}
+
+		// seek moves the consumer's place in a partition it reads: the
+		// next `poll` goes on from `offset`.
+		// Fails with ErrorKind.State for a partition the consumer does not
+		// read.
+		def seek(topic string, partition int, offset int) !none {
+			fail errorOf(ErrorKind.State, "kafka: the consumer does not read '{topic}' partition {partition}") unless engine.owns(topic, partition)
+			engine.setPlace(topic, partition, offset)
+			return none
+		}
+
+		// seek to the first record a partition holds, or to its end.
+		// Fails as `seek(topic, partition, offset)` does, and as a call to
+		// the brokers does.
+		def seek(topic string, partition int, to Start) !none {
+			fail errorOf(ErrorKind.State, "kafka: the consumer does not read '{topic}' partition {partition}") unless engine.owns(topic, partition)
+			let offset = try offsetFor(engine.cluster, "{engine.purpose}g", topic, partition, to == Start.Earliest ?? (offsetEarliest, offsetLatest))
+			engine.setPlace(topic, partition, offset)
+			return none
+		}
+
+		// pause makes `poll` leave a partition out until `resume`; the
+		// consumer keeps it and its place.
+		def pause(topic string, partition int) {
+			engine.setPaused(topic, partition, true)
+		}
+
+		// resume lets `poll` read a paused partition again.
+		def resume(topic string, partition int) {
+			engine.setPaused(topic, partition, false)
+		}
+
+		// close commits the consumer's place (with `autoCommit`), leaves
+		// the group so its partitions go to the other members at once, and
+		// closes the consumer's connections. Never fails.
+		def close() !none {
+			let reader = ready()
+			if autoCommit && group != "" && !reader.closed {
+				reader.commit(reader.positions()) onerror recover none
+			}
+			reader.close()
+			return none
+		}
+	}
+}

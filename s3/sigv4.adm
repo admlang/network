@@ -2,6 +2,7 @@
 // URLs, signed chunked bodies and POST policies.
 internal partial module adm.network.s3.sigv4 {
 	use (
+		std.crypto
 		std.crypto.hash
 		std.crypto.hash::(Hash)
 		std.io
@@ -15,6 +16,8 @@ internal partial module adm.network.s3.sigv4 {
 	// does not cover, and for one signed chunk by chunk.
 	const unsignedPayload = "UNSIGNED-PAYLOAD"
 	const streamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	const streamingTrailerPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	const trailerAlgorithm = "AWS4-HMAC-SHA256-TRAILER"
 	// SHA-256 of no bytes.
 	const emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	// Payload bytes per signed chunk. S3 wants at least 8 KiB in every
@@ -35,7 +38,12 @@ internal partial module adm.network.s3.sigv4 {
 		token     string
 		region    string
 		// The service name of the credential scope: `s3`.
-		product   string = "s3"
+		product   string                  = "s3"
+		// For Signature Version 4A: the regions the signature holds for
+		// (`*` for all) and the key made from the credentials. "" signs
+		// for `region` alone, with Signature Version 4.
+		regionSet string                  = ""
+		keyA      ?crypto.ECDSAPrivateKey = none
 	}
 
 	// Stamp is a finished signature and what later chunk signatures chain
@@ -177,9 +185,16 @@ internal partial module adm.network.s3.sigv4 {
 	// sign signs a request for the `Authorization` header. `headers` are
 	// the headers to sign as they will be sent, `Host` and `x-amz-date`
 	// among them.
-	def sign(signer Signer, method string, path string, query string, headers Field[], payloadHash string, amzDate string) Stamp {
+	def sign(signer Signer, method string, path string, query string, headers Field[], payloadHash string, amzDate string) !Stamp {
 		let canonical = canonicalHeaders(headers)
 		let request = canonicalRequest(method, path, query, canonical, payloadHash)
+		let wide = signer.keyA
+		if !(wide is none) {
+			let scope = scopeA(signer, amzDate)
+			let signature = try signatureA(wide, amzDate, scope, request)
+			let text = "{algorithmA} Credential={signer.accessKey}/{scope}, SignedHeaders={signedNames(canonical)}, Signature={signature}"
+			return Stamp{authorization: text, signature: signature, key: [], scope: scope, amzDate: amzDate}
+		}
 		let scope = scopeOf(signer, amzDate)
 		let key = signingKey(signer, amzDate)
 		let signature = macHex(key, [algorithm, amzDate, scope, sha256Hex(request.bytes())].join("\n"))
@@ -190,12 +205,14 @@ internal partial module adm.network.s3.sigv4 {
 	// presign returns the query string of a presigned URL: the given
 	// parameters, the `X-Amz-*` ones and the signature. The body is not
 	// signed. `headers` must hold `Host`.
-	def presignedQuery(signer Signer, method string, path string, query Field[], headers Field[], amzDate string, expires int) string {
+	def presignedQuery(signer Signer, method string, path string, query Field[], headers Field[], amzDate string, expires int) !string {
 		let canonical = canonicalHeaders(headers)
-		let scope = scopeOf(signer, amzDate)
+		let wide = signer.keyA
+		let scope = wide is none ?? (scopeOf(signer, amzDate), scopeA(signer, amzDate))
 		let all Field[] = []
 		all.push(...query)
-		all.push(Field{name: "X-Amz-Algorithm", value: algorithm})
+		all.push(Field{name: "X-Amz-Algorithm", value: wide is none ?? (algorithm, algorithmA)})
+		all.push(Field{name: "X-Amz-Region-Set", value: signer.regionSet}) unless wide is none
 		all.push(Field{name: "X-Amz-Credential", value: "{signer.accessKey}/{scope}"})
 		all.push(Field{name: "X-Amz-Date", value: amzDate})
 		all.push(Field{name: "X-Amz-Expires", value: expires.str()})
@@ -203,6 +220,7 @@ internal partial module adm.network.s3.sigv4 {
 		all.push(Field{name: "X-Amz-Security-Token", value: signer.token}) when signer.token != ""
 		let text = canonicalQuery(all)
 		let request = canonicalRequest(method, path, text, canonical, unsignedPayload)
+		return "{text}&X-Amz-Signature={try signatureA(wide, amzDate, scope, request)}" unless wide is none
 		let signature = macHex(signingKey(signer, amzDate), [algorithm, amzDate, scope, sha256Hex(request.bytes())].join("\n"))
 		return "{text}&X-Amz-Signature={signature}"
 	}
@@ -215,14 +233,21 @@ internal partial module adm.network.s3.sigv4 {
 
 	// How many bytes a body of `size` bytes takes once it is cut into
 	// signed chunks of `piece` bytes.
-	def chunkedLength(size int, piece int = chunkSize) int {
+	def chunkedLength(size int, piece int = chunkSize, sum Checksum = Checksum.None) int {
 		// A chunk is `<hex size>;chunk-signature=<64 hex>\r\n<data>\r\n`.
 		let overhead = 17 + 64 + 2 + 2
 		let whole = size / piece
 		let rest = size % piece
 		let total = whole * (piece.hex().len() + overhead + piece)
 		total += rest.hex().len() + overhead + rest when rest > 0
-		return total + 1 + overhead
+		return total + 1 + overhead + trailerLength(sum)
+	}
+
+	// What a checksum sent after the body adds to its length: the
+	// checksum's line and the line of its signature.
+	def trailerLength(sum Checksum) int {
+		return 0 when sum == Checksum.None
+		return checksumHeader(sum).len() + 1 + checksumLength(sum) + 2 + 24 + 64 + 2
 	}
 
 	// SignedChunks reads a body as S3's `aws-chunked` encoding: each chunk
@@ -240,11 +265,14 @@ internal partial module adm.network.s3.sigv4 {
 		pending  byte[]
 		offset   int
 		ended    bool
+		// The checksum sent after the body, when one is asked for.
+		digest   ?Digest
 
-		def new(source io.Reader, size int, stamp Stamp, piece int = chunkSize) {
+		def new(source io.Reader, size int, stamp Stamp, piece int = chunkSize, sum Checksum = Checksum.None) {
 			self.source = source
 			left = size
 			self.piece = piece
+			digest = new Digest(sum) unless sum == Checksum.None
 			key = stamp.key
 			amzDate = stamp.amzDate
 			scope = stamp.scope
@@ -279,7 +307,18 @@ internal partial module adm.network.s3.sigv4 {
 			previous = chunkSignature(key, amzDate, scope, previous, data)
 			let frame = "{want.hex().lower()};chunk-signature={previous}\r\n".bytes()
 			frame.push(...data)
-			frame.push(byte(13), byte(10))
+			let sum = digest
+			if sum is none {
+				frame.push(byte(13), byte(10))
+			} else if want > 0 {
+				sum.write(data)
+				frame.push(byte(13), byte(10))
+			} else {
+				// After the last chunk: the checksum, signed in its turn.
+				let line = "{checksumHeader(sum.kind)}:{sum.value()}"
+				let signature = macHex(key, [trailerAlgorithm, amzDate, scope, previous, sha256Hex("{line}\n".bytes())].join("\n"))
+				frame.push(...("{line}\r\nx-amz-trailer-signature:{signature}\r\n\r\n".bytes()))
+			}
 			pending = frame
 			offset = 0
 			return none

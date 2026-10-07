@@ -14,6 +14,8 @@ partial module adm.network.s3 {
 		etag     string
 		size     int
 		modified time.Time
+		// The part's checksum in base64, for an upload that keeps one.
+		checksum string
 	}
 
 	// UploadInfo is a multipart upload that was started and neither
@@ -41,6 +43,10 @@ partial module adm.network.s3 {
 		key             string
 		// The upload id; `Bucket.resume` takes it to go on later.
 		id              string
+		// The checksum S3 keeps for the parts and the object; set it on an
+		// upload taken up again with `Bucket.resume` when it was started
+		// with one.
+		checksum        Checksum = Checksum.None
 		internal engine Engine
 		internal bucket string
 
@@ -56,7 +62,7 @@ partial module adm.network.s3 {
 		// ErrorKind.NoUpload once the upload is completed or aborted, and
 		// ErrorKind.Argument for a number outside 1 to 10000.
 		def part(number int, data byte[]) !Part {
-			return try sendPart(engine, bucket, key, id, number, data)
+			return try sendPart(engine, bucket, key, id, number, data, checksum)
 		}
 
 		// copyPart fills one part from an object already in S3: `length`
@@ -87,7 +93,9 @@ partial module adm.network.s3 {
 				call.param("part-number-marker", marker) when marker != ""
 				let root = try engine.document(call)
 				for let node in root.elements("Part") {
-					out.push(Part{number: numberOf(node, "PartNumber"), etag: bareTag(textOf(node, "ETag")), size: numberOf(node, "Size"), modified: timeOf(node, "LastModified")})
+					let part = Part{number: numberOf(node, "PartNumber"), etag: bareTag(textOf(node, "ETag")), size: numberOf(node, "Size"), modified: timeOf(node, "LastModified")}
+					part.checksum = textOf(node, checksumElement(checksum)) unless checksum == Checksum.None
+					out.push(part)
 				}
 				marker = textOf(root, "NextPartNumberMarker")
 				break unless textOf(root, "IsTruncated") == "true" && marker != ""
@@ -110,6 +118,7 @@ partial module adm.network.s3 {
 				doc.start("Part")
 				doc.element("PartNumber", p.number.str())
 				doc.element("ETag", "\"{p.etag}\"")
+				doc.element(checksumElement(checksum), p.checksum) when checksum != Checksum.None && p.checksum != ""
 				doc.end()
 				size += p.size
 			}
@@ -157,10 +166,13 @@ partial module adm.network.s3 {
 			let call = new Call("POST", name, key)
 			call.param("uploads")
 			applyWrite(call, contentType, options)
+			let sum = nameChecksum(call)
 			let root = try engine.document(call)
 			let id = textOf(root, "UploadId")
 			fail errorOf(ErrorKind.Protocol, "s3: starting the upload of {key} returned no upload id") when id == ""
-			return new Upload(engine, name, key, id)
+			let started = new Upload(engine, name, key, id)
+			started.checksum = sum
+			return started
 		}
 
 		// resume returns a multipart upload started earlier, by the id it
@@ -214,7 +226,7 @@ partial module adm.network.s3 {
 			let started = try multipart(key, contentType, options)
 			let failure ?error = none
 			let none_ Part[] = []
-			let parts = sendPieces(engine, name, key, started.id, first, body) onerror (err error) {
+			let parts = sendPieces(engine, name, key, started.id, first, body, started.checksum) onerror (err error) {
 				failure = err
 				recover none_
 			}

@@ -52,30 +52,106 @@ partial module adm.network.s3 {
 	partial type Client {
 		// The region requests are signed for. An AWS endpoint that names a
 		// region (`s3.eu-central-1.amazonaws.com`) sets it.
-		region          string             = "us-east-1"
-		accessKey       string             = ""
-		secretKey       ?Secret<string>    = none
+		region           string             = "us-east-1"
+		accessKey        string             = ""
+		secretKey        ?Secret<string>    = none
 		// The session token of temporary credentials.
-		sessionToken    ?Secret<string>    = none
-		addressing      Addressing         = Addressing.Auto
+		sessionToken     ?Secret<string>    = none
+		// Signs with Signature Version 4A for these regions instead of
+		// Signature Version 4 for `region`: `*` for every region, or a
+		// list (`us-east-1,eu-west-1`). Multi-region access points ask for
+		// it; other endpoints refuse it. "" leaves it off.
+		regionSet        string             = ""
+		addressing       Addressing         = Addressing.Auto
 		// How long one request may take, its body included; 0s sets no
 		// limit.
-		timeout         duration           = 0s
+		timeout          duration           = 0s
 		// How many times a request is sent again after a 500, 502, 503 or
 		// 504, or a broken connection. A streamed body is never resent.
-		retries         int                = 3
+		retries          int                = 3
 		// The size of the parts `Bucket.upload` cuts a stream into: 5 MiB
 		// to 5 GiB. An upload has at most 10000 parts.
-		partSize        int                = 16 * 1024 * 1024
+		partSize         int                = 16 * 1024 * 1024
 		// How many parts `Bucket.upload` sends at a time.
-		uploadTasks     int                = 4
+		uploadTasks      int                = 4
 		// What sends the requests; none uses std.net.http's shared
 		// transport.
-		transport       ?http.RoundTripper = none
-		internal engine Engine
+		transport        ?http.RoundTripper = none
+		internal engine  Engine
+		// How temporary credentials are renewed, and when the current ones
+		// end.
+		internal renewal ?def () !Keys      = none
+		internal ending  ?time.Time         = none
 
 		def new() {
 			engine = new Engine()
+		}
+
+		// credentials looks for credentials where AWS tools do and makes
+		// them the client's, in this order: `AWS_ACCESS_KEY_ID` and
+		// `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`); the role of
+		// `AWS_ROLE_ARN` for the token in `AWS_WEB_IDENTITY_TOKEN_FILE` (a
+		// Kubernetes service account); the profile `profile` (else
+		// `AWS_PROFILE`, else `default`) in `~/.aws/credentials` and
+		// `~/.aws/config`, a `role_arn` with `source_profile` and a profile
+		// signed in with `aws sso login` included; the
+		// address a container platform gives
+		// (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`); the
+		// instance metadata service of a cloud machine. `AWS_REGION` or the
+		// profile's `region` becomes the client's region unless one was
+		// set. Temporary credentials are renewed before they end.
+		//
+		// ```
+		// let store = new s3.Client()
+		// try store.credentials()
+		// try store.connect("https://s3.amazonaws.com")
+		// ```
+		//
+		// Fails with an S3Error: ErrorKind.Denied when no source has
+		// credentials (the message names what was tried) or STS refuses the
+		// role, ErrorKind.Connection when a source that should answer does
+		// not.
+		def credentials(profile string = "") !none {
+			take(try findKeys(realSources(), profile))
+			return none
+		}
+
+		// assumeRole trades the client's credentials for the temporary
+		// ones of a role, asked of STS (of AWS, or of the endpoint itself
+		// for a server of one's own), and renews them before they end.
+		// Call it after `connect`.
+		// Fails with an S3Error: ErrorKind.Denied when STS refuses,
+		// ErrorKind.Argument for a session shorter than 15 minutes or a
+		// client that is not connected, ErrorKind.Connection when STS does
+		// not answer.
+		def assumeRole(role string, session string = "adm", length duration = 1h, externalId string = "") !none {
+			fail errorOf(ErrorKind.Argument, "s3: connect before taking a role") when engine.host == ""
+			fail errorOf(ErrorKind.Argument, "s3: a role's session lasts at least 15 minutes, not {length}") when length < 15min
+			let endpoint = engine.aws ?? (stsEndpoint(engine.region), "{engine.scheme}://{engine.host}")
+			let base = engine.current()
+			let signedFor = engine.region
+			let through = engine.web.transport
+			let renew = def () !Keys {
+				return try roleKeys(endpoint, signedFor, base, role, session, length, externalId, through)
+			}
+			take(Found{keys: try renew(), renew: renew})
+			return none
+		}
+
+		internal def take(found Found) {
+			accessKey = found.keys.accessKey
+			let secret Secret<string> = found.keys.secretKey
+			secretKey = secret
+			sessionToken = none
+			if found.keys.token != "" {
+				let token Secret<string> = found.keys.token
+				sessionToken = token
+			}
+			region = found.region when found.region != "" && region == "us-east-1"
+			renewal = found.renew
+			ending = found.keys.expires
+			engine.adopt(found.keys)
+			engine.renew = found.renew
 		}
 
 		// connect names the endpoint. No request is sent.
@@ -154,6 +230,9 @@ partial module adm.network.s3 {
 			next.secretKey = secret.reveal() unless secret is none
 			let session = sessionToken
 			next.token = session.reveal() unless session is none
+			next.expires = ending
+			next.renew = renewal
+			next.regionSet = regionSet
 			next.partSize = partSize
 			next.uploadTasks = uploadTasks
 			next.web.timeout = timeout

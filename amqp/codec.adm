@@ -1,0 +1,333 @@
+// How values travel in AMQP 0-9-1: integers big-endian, short and long
+// strings, field tables with RabbitMQ's value types.
+internal partial module adm.network.amqp.wire {
+	use (
+		std.reflection
+		std.reflection::(FieldKind)
+		std.time
+		adm.network.amqp::*
+	)
+
+	// errorOf builds the AmqpError the library fails with.
+	def errorOf(kind ErrorKind, message string, replyCode int = 0) AmqpError {
+		return AmqpError{message: message, code: kind.value, kind: kind, replyCode: replyCode}
+	}
+
+	// The AmqpError a close or a return from the broker stands for.
+	def serverError(replyCode int, replyText string, about string) AmqpError {
+		let kind = ErrorKind.Server
+		match replyCode {
+			case 403, 530:
+				kind = ErrorKind.Denied
+			case 404:
+				kind = ErrorKind.NotFound
+			case 405:
+				kind = ErrorKind.Locked
+			case 406:
+				kind = ErrorKind.Precondition
+			case 312, 313:
+				kind = ErrorKind.Unroutable
+			case 501, 502, 503, 504, 505:
+				kind = ErrorKind.Protocol
+		}
+		return errorOf(kind, "amqp: {about}: {replyText} ({replyCode})", replyCode)
+	}
+
+	// Encoder appends fields to a frame's payload.
+	type Encoder {
+		data byte[] = []
+
+		def new() {}
+
+		def u8(v int) {
+			data.push(byte(v & 0xFF))
+		}
+
+		// The letter that names a table value's type.
+		def mark(letter char) {
+			data.push(byte(int(letter)))
+		}
+
+		def u16(v int) {
+			data.push(byte((v >> 8) & 0xFF), byte(v & 0xFF))
+		}
+
+		def u32(v int) {
+			data.push(byte((v >> 24) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 8) & 0xFF), byte(v & 0xFF))
+		}
+
+		def u64(v int) {
+			u32((v >> 32) & 0xFFFFFFFF)
+			u32(v & 0xFFFFFFFF)
+		}
+
+		// Up to eight consecutive bit fields, the first in the lowest bit.
+		def bits(flags ...bool) {
+			let octet = 0
+			for let (i, on) in flags {
+				octet |= 1 << i when on
+			}
+			u8(octet)
+		}
+
+		// A short string: at most 255 bytes.
+		// Fails with ErrorKind.Argument for a longer one.
+		def short(text string) !none {
+			let raw = text.bytes()
+			fail errorOf(ErrorKind.Argument, "amqp: '{text.slice(0, 40)}...' is longer than the 255 bytes a name may have") when raw.len() > 255
+			u8(raw.len())
+			data.push(...raw)
+			return none
+		}
+
+		def long(raw byte[]) {
+			u32(raw.len())
+			data.push(...raw)
+		}
+
+		// A field table.
+		// Fails with ErrorKind.Argument for a key longer than 255 bytes or
+		// a value of a type tables do not hold.
+		def table(fields map<string, any>) !none {
+			let inner = new Encoder()
+			for let (key, value) in fields {
+				try inner.short(key)
+				try inner.field(value, key)
+			}
+			long(inner.data)
+			return none
+		}
+
+		// One value of a table or an array, after its type letter.
+		def field(v any, name string) !none {
+			match v {
+				case none:
+					mark('V')
+				case bool:
+					mark('t')
+					u8(v ?? (1, 0))
+				case int:
+					integer(v)
+				case float:
+					mark('d')
+					u64(int(__bitcast_u64_from_f64(float64(v))))
+				case string:
+					mark('S')
+					long(v.bytes())
+				case byte[]:
+					mark('x')
+					long(v)
+				case time.Time:
+					mark('T')
+					u64(int(v.unixNs() / 1000000000))
+				case Decimal:
+					mark('D')
+					u8(v.scale)
+					u32(v.value & 0xFFFFFFFF)
+				case any[]:
+					let inner = new Encoder()
+					for let item in v {
+						try inner.field(item, name)
+					}
+					mark('A')
+					long(inner.data)
+				case map<string, any>:
+					mark('F')
+					try table(v)
+				case string[]:
+					let inner = new Encoder()
+					for let item in v {
+						try inner.field(item, name)
+					}
+					mark('A')
+					long(inner.data)
+				case int[]:
+					let inner = new Encoder()
+					for let item in v {
+						try inner.field(item, name)
+					}
+					mark('A')
+					long(inner.data)
+				case float[]:
+					let inner = new Encoder()
+					for let item in v {
+						try inner.field(item, name)
+					}
+					mark('A')
+					long(inner.data)
+				case bool[]:
+					let inner = new Encoder()
+					for let item in v {
+						try inner.field(item, name)
+					}
+					mark('A')
+					long(inner.data)
+				default:
+					match reflection.kindOf(v) {
+						case FieldKind.Int, FieldKind.Uint:
+							integer(reflection.scalarText(v).toInt<int>())
+						case FieldKind.Float:
+							mark('d')
+							u64(int(__bitcast_u64_from_f64(parseFloat<float64>(reflection.scalarText(v)))))
+						default:
+							fail errorOf(ErrorKind.Argument, "amqp: '{name}' is a {reflection.typeName(v)}; a table takes booleans, numbers, text, bytes, times, arrays and tables")
+					}
+			}
+			return none
+		}
+
+		// An integer in the smaller of the two signed forms that hold it.
+		def integer(v int) {
+			if v >= -2147483648 && v <= 2147483647 {
+				mark('I')
+				u32(v & 0xFFFFFFFF)
+			} else {
+				mark('l')
+				u64(v)
+			}
+		}
+	}
+
+	// Decoder reads fields from a frame's payload.
+	type Decoder {
+		data byte[]
+		at   int    = 0
+		// The bit fields of the octet being read, and how many are used.
+		held int    = 0
+		used int    = 8
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def left() int {
+			return data.len() - at
+		}
+
+		// Fails with ErrorKind.Protocol when the payload ends first.
+		def need(count int) !none {
+			fail errorOf(ErrorKind.Protocol, "amqp: a frame ends in the middle of a field") when count < 0 || at + count > data.len()
+			used = 8
+			return none
+		}
+
+		def u8() !int {
+			try need(1)
+			at++
+			return int(data[at - 1])
+		}
+
+		def u16() !int {
+			try need(2)
+			at += 2
+			return (int(data[at - 2]) << 8) | int(data[at - 1])
+		}
+
+		def u32() !int {
+			try need(4)
+			at += 4
+			return (int(data[at - 4]) << 24) | (int(data[at - 3]) << 16) | (int(data[at - 2]) << 8) | int(data[at - 1])
+		}
+
+		def u64() !int {
+			let high = try u32()
+			let low = try u32()
+			return (high << 32) | low
+		}
+
+		// The next of a run of bit fields.
+		def bit() !bool {
+			if used == 8 {
+				let octet = try u8()
+				held = octet
+				used = 0
+			}
+			let on = (held >> used) & 1 == 1
+			used++
+			return on
+		}
+
+		def short() !string {
+			let size = try u8()
+			try need(size)
+			at += size
+			return string(data[at - size:at])
+		}
+
+		def long() !byte[] {
+			let size = try u32()
+			try need(size)
+			at += size
+			return data[at - size:at].clone()
+		}
+
+		def table() !map<string, any> {
+			let inner = new Decoder(try long())
+			let out map<string, any> = {}
+			for inner.left() > 0 {
+				let key = try inner.short()
+				out[key] = try inner.field()
+			}
+			return out
+		}
+
+		// One value of a table or an array, its type letter first.
+		// Fails with ErrorKind.Protocol for a type no broker sends.
+		def field() !any {
+			let letter = char(try u8())
+			match letter {
+				case 't':
+					return (try u8()) != 0
+				case 'b':
+					return signed(try u8(), 8)
+				case 'B':
+					return try u8()
+				case 's':
+					return signed(try u16(), 16)
+				case 'u':
+					return try u16()
+				case 'I':
+					return signed(try u32(), 32)
+				case 'i':
+					return try u32()
+				case 'l':
+					return try u64()
+				case 'f':
+					return float(__bitcast_f32_from_u32(uint32(try u32())))
+				case 'd':
+					return float(__bitcast_f64_from_u64(uint64(try u64())))
+				case 'D':
+					let scale = try u8()
+					return Decimal{scale: scale, value: signed(try u32(), 32)}
+				case 'S':
+					let raw = try long()
+					// Text cannot hold a zero byte; such a string stays bytes.
+					return raw when raw.includes(byte(0))
+					return string(raw)
+				case 'x':
+					return try long()
+				case 'A':
+					let inner = new Decoder(try long())
+					let items any[] = []
+					for inner.left() > 0 {
+						items.push(try inner.field())
+					}
+					return items
+				case 'T':
+					return time.fromUnixNs(int64(try u64()) * 1000000000)
+				case 'F':
+					return try table()
+				case 'V':
+					return none
+				default:
+					fail errorOf(ErrorKind.Protocol, "amqp: a table value of unknown type {letter}")
+			}
+		}
+	}
+
+	// The value of the low `width` bits of v read as two's complement.
+	def signed(v int, width int) int {
+		return v when width >= 64 || (v >> (width - 1)) & 1 == 0
+		return v - (1 << width)
+	}
+}

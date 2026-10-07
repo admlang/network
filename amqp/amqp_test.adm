@@ -1,0 +1,873 @@
+// These tests need a broker; without ADM_TEST_AMQP they pass without
+// running. See README.md for the broker they expect.
+partial module adm.network.amqp {
+	use (
+		std.crypto.x509::(CertPool)
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.net.tls
+		std.os
+		std.testing
+		std.time
+	)
+
+	// The broker as `user:password@host:port`. The tests use queues and
+	// exchanges whose names start with `adm-test-` in the virtual host "/".
+	@env("ADM_TEST_AMQP")
+	internal const testBroker string
+
+	// A broker that takes TLS, as `host:port`, and the folder with its
+	// `ca.pem` and the client's `client.pem` and `client.key`;
+	// `testservers/tls.sh` starts one and writes them.
+	@env("ADM_TEST_AMQP_TLS")
+	internal const testSecure string
+
+	@env("ADM_TEST_AMQP_CERTS")
+	internal const testCerts string
+
+	// The broker's management API as `http://user:password@host:port`:
+	// TestReconnect closes its own connection through it.
+	@env("ADM_TEST_AMQP_ADMIN")
+	internal const testAdmin string
+
+	// Set while the broker is made to block publishers; see TestBlocked.
+	@env("ADM_TEST_AMQP_BLOCKED")
+	internal const testBlocked string
+
+	def open(options string = "") !Connection {
+		return try connect("amqp://{testBroker}{options}")
+	}
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is AmqpError
+		return ErrorKind.Server
+	}
+
+	// A durable queue of its own for one test, emptied. (RabbitMQ 4 takes
+	// no queue that is neither durable nor exclusive.)
+	def scratch(ch Channel, name string, arguments map<string, any> = {}) !string {
+		let full = "adm-test-{name}"
+		ch.deleteQueue(full) onerror recover 0
+		try ch.declareQueue(full, durable = true, arguments = arguments)
+		return full
+	}
+
+	// How opening a channel fails: Server when it does not.
+	def channelFailure(mq Connection) ErrorKind {
+		let kind = ErrorKind.Server
+		let ch = mq.channel() onerror (err error) {
+			kind = kindOfFailure(err)
+			return kind
+		}
+		ch.close() onerror recover none
+		return kind
+	}
+
+	def bodyOf(d ?Delivery) string {
+		return "(none)" when d is none
+		return d.text()
+	}
+
+	check "Connect" {
+		@test()
+		def TestAddressErrors() !none {
+			let kind = ErrorKind.Server
+			connect("http://localhost") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("amqp://localhost?frame_max=100") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("amqp://localhost?colour=blue") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Argument
+			kind = ErrorKind.Server
+			connect("amqp://127.0.0.1:1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Connection
+
+			let c = new Connection()
+			let target = try targetOf(c, "amqps://ana:s%40cret@broker.example:5999/orders?heartbeat=10&name=billing&auth_mechanism=amqplain")
+			assert target.secure && target.host == "broker.example" && target.port == 5999
+			assert target.username == "ana" && target.password == "s@cret" && target.vhost == "orders"
+			assert target.heartbeat == 10s && target.name == "billing" && target.auth == Auth.AMQPlain
+			let plain = try targetOf(new Connection(), "broker.example")
+			assert !plain.secure && plain.port == 5672 && plain.vhost == "/" && plain.username == "guest" && plain.password == "guest"
+			assert (try targetOf(new Connection(), "amqps://broker.example")).port == 5671
+			assert !c.isOpen()
+			assert channelFailure(c) == ErrorKind.Closed
+		}
+
+		@test()
+		def TestHandshake() !none {
+			return none when testBroker == ""
+			let mq = try open("?name=adm-test-handshake&frame_max=8192&channel_max=3&heartbeat=7")
+			assert mq.isOpen()
+			assert mq.server().hasKey("product") && mq.server().hasKey("capabilities")
+			assert mq.agreedFrameMax() == 8192
+			assert mq.agreedHeartbeat() == 7s
+			assert mq.blocked() is none
+			let a = try mq.channel()
+			let b = try mq.channel()
+			let c = try mq.channel()
+			assert a.number() == 1 && b.number() == 2 && c.number() == 3
+			assert channelFailure(mq) == ErrorKind.Argument
+			let kind = ErrorKind.Server
+			try b.close()
+			assert !b.isOpen()
+			let again = try mq.channel()
+			assert again.number() == 2
+			try mq.close()
+			assert !mq.isOpen() && !a.isOpen()
+			kind = ErrorKind.Server
+			a.declareQueue("adm-test-never") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover QueueInfo{}
+			}
+			assert kind == ErrorKind.Closed
+		}
+
+		@test()
+		def TestRefusals() !none {
+			return none when testBroker == ""
+			let at = testBroker.indexOf("@")
+			let host = testBroker.slice(at + 1, testBroker.len())
+			let kind = ErrorKind.Server
+			connect("amqp://guest:wrong-password@{host}") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Denied
+			kind = ErrorKind.Server
+			connect("amqp://{testBroker}/adm-test-no-such-vhost") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Denied
+			let other = try open("?auth_mechanism=amqplain")
+			assert other.isOpen()
+			try other.close()
+		}
+
+		@test()
+		def TestHeartbeats() !none {
+			return none when testBroker == ""
+			let mq = try open("?heartbeat=1")
+			let ch = try mq.channel()
+			time.sleep(3500ms)
+			assert mq.isOpen()
+			let q = try ch.declareQueue(exclusive = true)
+			assert q.name != ""
+			try mq.close()
+		}
+
+		@test()
+		def TestSecretAndFlow() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let secret Secret<string> = "guest"
+			try mq.updateSecret(secret, "rotation")
+			let ch = try mq.channel()
+			try ch.flow(true)
+			// RabbitMQ does not stop a channel: it closes the connection.
+			let code = 0
+			ch.flow(false) onerror (err error) {
+				code = err.replyCode when err is AmqpError
+				recover none
+			}
+			assert code == 540
+			for let i = 0; i < 50 && mq.isOpen(); i++ {
+				time.sleep(20ms)
+			}
+			assert !mq.isOpen()
+		}
+
+		@test()
+		def TestSecure() !none {
+			return none when testSecure == "" || testCerts == ""
+			let pool = new CertPool()
+			pool.appendCertsFromPEM(string(try os.readFile("{testCerts}/ca.pem")))
+			let mq = new Connection()
+			mq.tls = tls.Config{serverName: "localhost", rootCAs: pool}
+			try mq.connect("amqps://guest:guest@{testSecure}")
+			let ch = try mq.channel()
+			let q = try ch.declareQueue(exclusive = true)
+			try ch.publish("", q.name, "under TLS")
+			let jobs = try ch.consume(q.name, autoAck = true)
+			assert bodyOf(try jobs.next(5s)) == "under TLS"
+			try mq.close()
+
+			// The client certificate names the user; no password travels.
+			let named = new Connection()
+			named.username = "nobody"
+			named.auth = Auth.External
+			named.tls = tls.Config{serverName: "localhost", rootCAs: pool, certificates: [try tls.loadKeyPair("{testCerts}/client.pem", "{testCerts}/client.key")]}
+			try named.connect("amqps://{testSecure}")
+			let own = try named.channel()
+			assert (try own.declareQueue(exclusive = true)).name != ""
+			try named.close()
+
+			// An authority the client does not trust.
+			let kind = ErrorKind.Server
+			connect("amqps://guest:guest@{testSecure}") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Connection()
+			}
+			assert kind == ErrorKind.Connection
+		}
+
+		// Needs the broker pushed over its memory limit while it runs:
+		//   rabbitmqctl set_vm_memory_high_watermark absolute 1MB
+		// and back with `rabbitmqctl set_vm_memory_high_watermark 0.6` afterwards.
+		@test()
+		def TestBlocked() !none {
+			return none when testBroker == "" || testBlocked == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try ch.declareQueue(exclusive = true)
+			let reason ?string = none
+			for let i = 0; i < 300 && reason is none; i++ {
+				ch.publish("", q.name, "x") onerror recover none
+				time.sleep(100ms)
+				reason = mq.blocked()
+			}
+			fail "the broker never blocked the connection" when reason is none
+			assert reason.len() > 0
+			for let i = 0; i < 300 && !(mq.blocked() is none); i++ {
+				time.sleep(100ms)
+			}
+			assert mq.blocked() is none
+			try mq.close()
+		}
+	}
+
+	// Makes the broker close the connections that carry a name, as an
+	// operator would; returns how many it closed.
+	def kick(name string) !int {
+		let at = testAdmin.indexOf("@")
+		let slash = testAdmin.indexOf("//")
+		let who = testAdmin.slice(slash + 2, at).split(":")
+		let admin = new http.Client("http://{testAdmin.slice(at + 1, testAdmin.len())}", 10s)
+		admin.username = who[0]
+		let secret Secret<string> = who[1]
+		admin.password = secret
+		let closed = 0
+		// The API learns of a connection a moment after it opened.
+		for let i = 0; i < 100 && closed == 0; i++ {
+			let listed = try new encoding.JSON().parse(try (try admin.get("/api/connections")).bytes())
+			match listed {
+				case any[]:
+					for let item in listed {
+						match item {
+							case map<string, any>:
+								let label = item.get("user_provided_name")
+								let id = item.get("name")
+								match label {
+									case string:
+										match id {
+											case string:
+												if label == name {
+													try admin.delete("/api/connections/{url.pathEscape(id)}")
+													closed++
+												}
+											default:
+										}
+									default:
+								}
+							default:
+						}
+					}
+				default:
+			}
+			time.sleep(200ms) when closed == 0
+		}
+		return closed
+	}
+
+	check "Reconnect" {
+		@test()
+		def TestReconnect() !none {
+			return none when testBroker == "" || testAdmin == ""
+			let label = "adm-test-reconnect-{time.now().unixNs()}"
+			let mq = new Connection()
+			mq.reconnect = true
+			mq.reconnectWait = 200ms
+			mq.name = label
+			let back = 0
+			mq.onReconnect = def () {
+				back++
+			}
+			try mq.connect("amqp://{testBroker}")
+			let ch = try mq.channel()
+			let durable = try scratch(ch, "reconnect")
+			let own = try ch.declareQueue(exclusive = true)
+			try ch.declareExchange("adm-test-reconnect", ExchangeKind.Fanout, autoDelete = true)
+			try ch.bindQueue(own.name, "adm-test-reconnect")
+			try ch.bindQueue(durable, "adm-test-reconnect")
+			try ch.qos(5)
+			try ch.confirms()
+			let fromOwn = try ch.consume(own.name, autoAck = true)
+			let fromDurable = try ch.consume(durable)
+			let other = try mq.channel()
+			try ch.publish("adm-test-reconnect", "", "before")
+			assert bodyOf(try fromOwn.next(5s)) == "before"
+			let held = try fromDurable.next(5s)
+			fail "no delivery before the break" when held is none
+
+			assert (try kick(label)) == 1
+			for let i = 0; i < 150 && back == 0; i++ {
+				time.sleep(100ms)
+			}
+			assert back == 1 && mq.isOpen() && ch.isOpen() && other.isOpen()
+			// The delivery of the old connection cannot be answered; the
+			// broker hands the message out again.
+			let refused = false
+			held.ack() onerror (err error) {
+				refused = true
+				recover none
+			}
+			assert refused
+			let again = try fromDurable.next(5s)
+			fail "the unanswered message did not come again" when again is none
+			assert again.text() == "before" && again.redelivered
+			try again.ack()
+
+			// The exchange, both queues, their bindings, the consumers and
+			// the confirm mode are back; the broker's queue has a new name.
+			assert ch.queueName(own.name) != own.name && ch.queueName(durable) == durable
+			try ch.publish("adm-test-reconnect", "", "after", mandatory = true)
+			assert bodyOf(try fromOwn.next(5s)) == "after"
+			let second = try fromDurable.next(5s)
+			fail "no delivery after the break" when second is none
+			assert second.text() == "after" && !second.redelivered
+			try second.ack()
+			try ch.publish("", ch.queueName(own.name), "straight")
+			assert bodyOf(try fromOwn.next(5s)) == "straight"
+			assert (try other.declareQueue(durable, durable = true, passive = true)).consumers == 1
+
+			// Twice in a row, and what was cancelled or deleted stays so.
+			try fromOwn.cancel()
+			try ch.unbindQueue(durable, "adm-test-reconnect")
+			assert (try kick(label)) == 1
+			for let i = 0; i < 150 && back == 1; i++ {
+				time.sleep(100ms)
+			}
+			assert back == 2
+			try ch.publish("adm-test-reconnect", "", "unbound")
+			try ch.publish("", durable, "direct")
+			let last = try fromDurable.next(5s)
+			fail "no delivery after the second break" when last is none
+			assert last.text() == "direct"
+			try last.ack()
+			try ch.deleteQueue(durable)
+			try mq.close()
+			assert !mq.isOpen() && !ch.isOpen()
+
+			// Without `reconnect` a closed connection ends its consumers.
+			let plain = new Connection()
+			plain.name = "{label}-plain"
+			try plain.connect("amqp://{testBroker}")
+			let pc = try plain.channel()
+			let pq = try pc.declareQueue(exclusive = true)
+			let waiting = try pc.consume(pq.name)
+			assert (try kick("{label}-plain")) == 1
+			refused = false
+			waiting.next(10s) onerror (err error) {
+				refused = true
+				recover none
+			}
+			assert refused && !plain.isOpen()
+		}
+	}
+
+	check "Queues" {
+		@test()
+		def TestPublishAndGet() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try scratch(ch, "get")
+			assert (try ch.get(q)) is none
+			try ch.publish("", q, "one")
+			try ch.publish("", q, "two".bytes())
+			let headers map<string, any> = {"attempt": 3, "tags": ["a", "b"]}
+			let rich = Message{body: "three".bytes(), contentType: "text/x-test", headers: headers, persistent: true, priority: 4, correlationId: "c-9", replyTo: "answers", expires: 60s, messageId: "m-9", kind: "test.event", appId: "suite"}
+			rich.timestamp = time.fromUnixNs(1700000000 * 1000000000)
+			try ch.publish("", q, rich)
+			let info = QueueInfo{}
+			for let i = 0; i < 50 && info.messages < 3; i++ {
+				time.sleep(20ms)
+				info = try ch.declareQueue(q, durable = true, passive = true)
+			}
+			assert info.messages == 3 && info.consumers == 0 && info.name == q
+
+			let first = try ch.get(q)
+			fail "the queue is empty" when first is none
+			assert first.text() == "one" && first.remaining == 2 && !first.redelivered
+			assert first.exchange == "" && first.routingKey == q && first.message.contentType == "text/plain"
+			try first.nack()
+			let again = try ch.get(q, autoAck = true)
+			let second = try ch.get(q, autoAck = true)
+			let third = try ch.get(q, autoAck = true)
+			let seen = [bodyOf(again), bodyOf(second), bodyOf(third)].sort((a, b) => a < b)
+			assert seen.join(",") == "one,three,two"
+			let richBack = third
+			richBack = second when bodyOf(second) == "three"
+			richBack = again when bodyOf(again) == "three"
+			fail "no third message" when richBack is none
+			let m = richBack.message
+			assert m.contentType == "text/x-test" && m.persistent && m.priority == 4
+			assert m.correlationId == "c-9" && m.replyTo == "answers" && m.messageId == "m-9"
+			assert m.kind == "test.event" && m.appId == "suite" && m.expires == 60s
+			let stamp = m.timestamp
+			fail "no timestamp" when stamp is none
+			assert stamp.unixNs() == 1700000000 * 1000000000
+			let attempt = m.headers["attempt"]
+			let attempts = 0
+			attempts = attempt when attempt is int
+			assert attempts == 3
+			assert (try ch.get(q)) is none
+
+			try ch.publish("", q, "left")
+			try ch.publish("", q, "behind")
+			let purged = 0
+			for let i = 0; i < 50 && purged < 2; i++ {
+				time.sleep(20ms)
+				purged += try ch.purgeQueue(q)
+			}
+			assert purged == 2
+			assert (try ch.deleteQueue(q)) == 0
+			try mq.close()
+		}
+
+		@test()
+		def TestChannelErrors() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let kind = ErrorKind.Server
+			let code = 0
+			ch.declareQueue("adm-test-missing", passive = true) onerror (err error) {
+				kind = kindOfFailure(err)
+				code = err.replyCode when err is AmqpError
+				recover QueueInfo{}
+			}
+			assert kind == ErrorKind.NotFound && code == 404
+			assert !ch.isOpen()
+			// The channel stays closed with the broker's reason.
+			kind = ErrorKind.Server
+			ch.declareQueue("adm-test-anything") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover QueueInfo{}
+			}
+			assert kind == ErrorKind.NotFound
+
+			// The connection takes a new channel.
+			let next = try mq.channel()
+			let q = try scratch(next, "errors")
+			kind = ErrorKind.Server
+			next.declareQueue(q, durable = true, arguments = {"x-max-length": 5}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover QueueInfo{}
+			}
+			assert kind == ErrorKind.Precondition
+
+			let third = try mq.channel()
+			try third.publish("", q, "x")
+			let d ?Delivery = none
+			for let i = 0; i < 50 && d is none; i++ {
+				time.sleep(20ms)
+				d = try third.get(q)
+			}
+			fail "nothing to get" when d is none
+			try d.ack()
+			try d.ack()
+			kind = ErrorKind.Server
+			for let i = 0; i < 50 && third.isOpen(); i++ {
+				time.sleep(20ms)
+			}
+			third.get(q) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Precondition
+
+			let owner = try mq.channel()
+			let mine = try owner.declareQueue("adm-test-exclusive", exclusive = true)
+			let stranger = try open()
+			let theirs = try stranger.channel()
+			kind = ErrorKind.Server
+			theirs.declareQueue(mine.name, passive = true) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover QueueInfo{}
+			}
+			assert kind == ErrorKind.Locked
+			try stranger.close()
+			let cleaner = try mq.channel()
+			try cleaner.deleteQueue(q)
+			try mq.close()
+		}
+
+		@test()
+		def TestLargeBodies() !none {
+			return none when testBroker == ""
+			// 8192 is the smallest frame RabbitMQ 4 agrees to.
+			let mq = try open("?frame_max=8192")
+			let ch = try mq.channel()
+			let q = try ch.declareQueue(exclusive = true)
+			let sizes = [0, 1, 8183, 8184, 8185, 16368, 300000]
+			for let size in sizes {
+				let body byte[] = []
+				body.len(size)
+				for let i = 0; i < size; i++ {
+					body[i] = byte((i * 31 + size) & 0xFF)
+				}
+				try ch.publish("", q.name, body)
+			}
+			let jobs = try ch.consume(q.name, autoAck = true)
+			for let size in sizes {
+				let d = try jobs.next(10s)
+				fail "no delivery of {size} bytes" when d is none
+				assert d.message.body.len() == size
+				let good = true
+				for let i = 0; i < size; i++ {
+					good = false when d.message.body[i] != byte((i * 31 + size) & 0xFF)
+				}
+				assert good
+			}
+			try mq.close()
+		}
+	}
+
+	check "Consumers" {
+		@test()
+		def TestNextAndAnswers() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try scratch(ch, "consume")
+			try ch.qos(1)
+			let jobs = try ch.consume(q)
+			assert jobs.isOpen() && jobs.queue == q && jobs.tag != ""
+			assert (try jobs.next(100ms)) is none
+			try ch.publish("", q, "a")
+			try ch.publish("", q, "b")
+			let a = try jobs.next(5s)
+			fail "no delivery" when a is none
+			assert a.text() == "a" && a.consumer == jobs.tag && !a.redelivered
+			// With a prefetch of one, nothing more comes before the answer.
+			assert (try jobs.next(200ms)) is none
+			try a.nack(requeue = true)
+			let seen string[] = []
+			let redelivered = 0
+			for let i = 0; i < 2; i++ {
+				let d = try jobs.next(5s)
+				fail "no delivery" when d is none
+				seen.push(d.text())
+				redelivered++ when d.redelivered
+				try d.ack()
+			}
+			seen = seen.sort((x, y) => x < y)
+			assert seen.join(",") == "a,b" && redelivered == 1
+
+			try ch.publish("", q, "dropped")
+			let gone = try jobs.next(5s)
+			fail "no delivery" when gone is none
+			try gone.reject(requeue = false)
+			assert (try jobs.next(200ms)) is none
+
+			let kind = ErrorKind.Server
+			ch.consume(q, tag = jobs.tag) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover jobs
+			}
+			assert kind == ErrorKind.Argument
+
+			try jobs.cancel()
+			assert !jobs.isOpen()
+			kind = ErrorKind.Server
+			jobs.next(100ms) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			try ch.publish("", q, "kept")
+			let info = QueueInfo{}
+			for let i = 0; i < 50 && info.messages < 1; i++ {
+				time.sleep(20ms)
+				info = try ch.declareQueue(q, durable = true, passive = true)
+			}
+			assert info.messages == 1 && info.consumers == 0
+			try ch.deleteQueue(q)
+			try mq.close()
+		}
+
+		@test()
+		def TestHandler() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try ch.declareQueue(exclusive = true)
+			let answers = try ch.declareQueue(exclusive = true)
+			// The handler calls the channel it is delivered on.
+			let worker = try ch.consume(q.name, def (d Delivery) {
+				ch.publish("", d.message.replyTo, "done {d.text()}") onerror recover none
+				d.ack() onerror recover none
+			})
+			for let i = 0; i < 20; i++ {
+				try ch.publish("", q.name, Message{body: "job {i}".bytes(), replyTo: answers.name})
+			}
+			let replies = try ch.consume(answers.name, autoAck = true)
+			for let i = 0; i < 20; i++ {
+				let d = try replies.next(5s)
+				fail "no answer {i}" when d is none
+				assert d.text() == "done job {i}"
+			}
+			try worker.cancel()
+			try mq.close()
+		}
+
+		@test()
+		def TestBrokerCancelsAndCloses() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try scratch(ch, "cancelled")
+			let jobs = try ch.consume(q)
+			let other = try mq.channel()
+			try other.deleteQueue(q)
+			let kind = ErrorKind.Server
+			jobs.next(5s) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			assert !jobs.isOpen() && ch.isOpen()
+
+			let q2 = try ch.declareQueue(exclusive = true)
+			let waiting = try ch.consume(q2.name)
+			let pending = async endOf(waiting, 10s)
+			time.sleep(100ms)
+			try mq.close()
+			assert (await pending) == ErrorKind.Closed
+		}
+
+		@test()
+		def TestManyChannels() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let setup = try mq.channel()
+			let q = try setup.declareQueue(exclusive = true)
+			let group = new AsyncScope()
+			for let i = 0; i < 16; i++ {
+				async<group> flood(mq, q.name)
+			}
+			try await group
+			let jobs = try setup.consume(q.name, autoAck = true)
+			let total = 0
+			for let i = 0; i < 16 * 50; i++ {
+				let d = try jobs.next(10s)
+				fail "delivery {i} is missing" when d is none
+				total += d.text().toInt<int>()
+			}
+			assert total == 16 * (49 * 50 / 2)
+			try mq.close()
+		}
+	}
+
+	// How a consumer's wait for a delivery ends: Server when one comes.
+	def endOf(jobs Consumer, wait duration) ErrorKind {
+		let kind = ErrorKind.Server
+		jobs.next(wait) onerror (err error) {
+			kind = kindOfFailure(err)
+			recover none
+		}
+		return kind
+	}
+
+	def flood(mq Connection, queue string) !none {
+		let ch = try mq.channel()
+		try ch.confirms()
+		for let i = 0; i < 50; i++ {
+			try ch.publish("", queue, "{i}")
+		}
+		try ch.close()
+		return none
+	}
+
+	check "Routing" {
+		@test()
+		def TestExchanges() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			ch.deleteExchange("adm-test-topic") onerror recover none
+			ch = try mq.channel() unless ch.isOpen()
+			try ch.declareExchange("adm-test-topic", ExchangeKind.Topic)
+			try ch.declareExchange("adm-test-fanout", ExchangeKind.Fanout, autoDelete = true)
+			try ch.declareExchange("adm-test-headers", "headers", autoDelete = true)
+			try ch.declareExchange("adm-test-topic", ExchangeKind.Topic, passive = true)
+			let paid = try ch.declareQueue(exclusive = true)
+			let all = try ch.declareQueue(exclusive = true)
+			let big = try ch.declareQueue(exclusive = true)
+			try ch.bindQueue(paid.name, "adm-test-topic", "orders.*.paid")
+			try ch.bindQueue(all.name, "adm-test-fanout")
+			try ch.bindExchange("adm-test-fanout", "adm-test-topic", "orders.#")
+			try ch.bindQueue(big.name, "adm-test-headers", arguments = {"x-match": "all", "size": "big", "region": "eu"})
+			try ch.confirms()
+			try ch.publish("adm-test-topic", "orders.7.paid", "paid 7")
+			try ch.publish("adm-test-topic", "orders.7.shipped", "shipped 7")
+			try ch.publish("adm-test-topic", "invoices.7.paid", "invoice 7")
+			try ch.publish("adm-test-headers", "", Message{body: "big eu".bytes(), headers: {"size": "big", "region": "eu"}})
+			try ch.publish("adm-test-headers", "", Message{body: "big us".bytes(), headers: {"size": "big", "region": "us"}})
+			assert bodyOf(try ch.get(paid.name, autoAck = true)) == "paid 7"
+			assert (try ch.get(paid.name)) is none
+			let fanned = [bodyOf(try ch.get(all.name, autoAck = true)), bodyOf(try ch.get(all.name, autoAck = true))].sort((a, b) => a < b)
+			assert fanned.join(",") == "paid 7,shipped 7"
+			assert (try ch.get(all.name)) is none
+			assert bodyOf(try ch.get(big.name, autoAck = true)) == "big eu"
+			assert (try ch.get(big.name)) is none
+
+			try ch.unbindQueue(paid.name, "adm-test-topic", "orders.*.paid")
+			try ch.unbindExchange("adm-test-fanout", "adm-test-topic", "orders.#")
+			try ch.publish("adm-test-topic", "orders.8.paid", "paid 8")
+			assert (try ch.get(paid.name)) is none
+			assert (try ch.get(all.name)) is none
+			try ch.deleteExchange("adm-test-topic")
+			let kind = ErrorKind.Server
+			ch.declareExchange("adm-test-topic", ExchangeKind.Topic, passive = true) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotFound
+			try mq.close()
+		}
+
+		@test()
+		def TestConfirmsAndReturns() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			try ch.confirms()
+			try ch.confirms()
+			let q = try ch.declareQueue(exclusive = true)
+			try ch.publish("", q.name, "confirmed", mandatory = true)
+			assert bodyOf(try ch.get(q.name, autoAck = true)) == "confirmed"
+
+			let came Returned[] = []
+			ch.onReturn = def (back Returned) {
+				came.push(back)
+			}
+			let kind = ErrorKind.Server
+			let code = 0
+			ch.publish("", "adm-test-nowhere", "lost", mandatory = true) onerror (err error) {
+				kind = kindOfFailure(err)
+				code = err.replyCode when err is AmqpError
+				recover none
+			}
+			assert kind == ErrorKind.Unroutable && code == 312
+			for let i = 0; i < 50 && came.len() == 0; i++ {
+				time.sleep(20ms)
+			}
+			assert came.len() == 1 && string(came[0].message.body) == "lost" && came[0].routingKey == "adm-test-nowhere" && came[0].replyCode == 312
+			// Unroutable and not mandatory: the broker takes it and drops it.
+			try ch.publish("", "adm-test-nowhere", "dropped")
+
+			// A full queue that refuses what it cannot hold.
+			let small = try scratch(ch, "small", {"x-max-length": 2, "x-overflow": "reject-publish"})
+			try ch.publish("", small, "1")
+			try ch.publish("", small, "2")
+			kind = ErrorKind.Server
+			ch.publish("", small, "3") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Refused
+
+			// Without waiting on each message: the answers are collected.
+			ch.confirmWait = false
+			for let i = 0; i < 200; i++ {
+				try ch.publish("", q.name, "bulk {i}")
+			}
+			try ch.waitConfirms(10s)
+			try ch.publish("", small, "4")
+			try ch.publish("", small, "5")
+			kind = ErrorKind.Server
+			ch.waitConfirms(10s) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Refused
+			try ch.waitConfirms(10s)
+			assert (try ch.purgeQueue(q.name)) == 200
+			try ch.deleteQueue(small)
+			try mq.close()
+		}
+
+		@test()
+		def TestReturnsWithoutConfirms() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let came Returned[] = []
+			ch.onReturn = def (back Returned) {
+				came.push(back)
+			}
+			try ch.publish("", "adm-test-nowhere", "back", mandatory = true)
+			for let i = 0; i < 100 && came.len() == 0; i++ {
+				time.sleep(20ms)
+			}
+			assert came.len() == 1 && string(came[0].message.body) == "back" && came[0].exchange == ""
+			try mq.close()
+		}
+
+		@test()
+		def TestTransactions() !none {
+			return none when testBroker == ""
+			let mq = try open()
+			let ch = try mq.channel()
+			let q = try ch.declareQueue(exclusive = true)
+			let kind = ErrorKind.Server
+			try ch.selectTx()
+			try ch.publish("", q.name, "kept")
+			let peek = try mq.channel()
+			assert (try peek.declareQueue(q.name, passive = true)).messages == 0
+			try ch.commitTx()
+			assert (try peek.declareQueue(q.name, passive = true)).messages == 1
+			try ch.publish("", q.name, "undone")
+			try ch.rollbackTx()
+			assert (try peek.declareQueue(q.name, passive = true)).messages == 1
+			let d = try ch.get(q.name)
+			fail "nothing kept" when d is none
+			assert d.text() == "kept"
+			try d.ack()
+			try ch.rollbackTx()
+			try ch.redeliver()
+			let again = try ch.get(q.name)
+			fail "the delivery did not come back" when again is none
+			assert again.text() == "kept" && again.redelivered
+			try again.ack()
+			try ch.commitTx()
+			assert (try ch.get(q.name)) is none
+
+			let plain = try mq.channel()
+			plain.commitTx() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Precondition
+			try mq.close()
+		}
+	}
+}

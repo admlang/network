@@ -1,0 +1,51 @@
+// Signature Version 4A: the request is signed with an ECDSA P-256 key made
+// from the secret key, for a set of regions instead of one. Multi-region
+// access points ask for it.
+internal partial module adm.network.s3.sigv4 {
+	use (
+		std.crypto
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+		adm.network.s3::*
+	)
+
+	const algorithmA = "AWS4-ECDSA-P256-SHA256"
+
+	// keyA makes the signing key of a pair of credentials: the first of
+	// HMAC-SHA-256(`AWS4A` + secret, counter-mode input over the access
+	// key) that is under the curve's order less two, plus one.
+	def keyA(accessKey string, secretKey string) crypto.ECDSAPrivateKey {
+		let n = crypto.p256.n
+		let secret = "AWS4A{secretKey}".bytes()
+		let d = bigint(1)
+		for let counter = 1; counter < 255; counter++ {
+			let input byte[] = [byte(0), byte(0), byte(0), byte(1)]
+			input.push(...algorithmA.bytes())
+			input.push(byte(0))
+			input.push(...accessKey.bytes())
+			input.push(byte(counter))
+			input.push(byte(0), byte(0), byte(1), byte(0))
+			let candidate = parseBigInt(hash.hmac(Hash.SHA256, secret, input))
+			if candidate <= n - 2 {
+				d = candidate + 1
+				break
+			}
+		}
+		return new crypto.ECDSAPrivateKey(crypto.p256, d, crypto.scalarBaseMult(crypto.p256, d))
+	}
+
+	def scopeA(signer Signer, amzDate string) string {
+		return "{amzDate.slice(0, 8)}/{signer.product}/aws4_request"
+	}
+
+	// The signature of a canonical request: the DER of an ECDSA signature
+	// over the SHA-256 of the string to sign, in hex.
+	// Fails when the system has no random bytes to give.
+	def signatureA(key crypto.ECDSAPrivateKey, amzDate string, scope string, request string) !string {
+		let text = [algorithmA, amzDate, scope, sha256Hex(request.bytes())].join("\n")
+		let der = key.signASN1(new hash.SHA256().hash(text.bytes())) onerror (err error) {
+			fail S3Error{message: "s3: signing needs random bytes: {err.message}", code: ErrorKind.Connection.value, kind: ErrorKind.Connection, cause: err}
+		}
+		return der.hex().lower()
+	}
+}

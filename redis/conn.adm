@@ -29,11 +29,14 @@ internal partial module adm.network.redis.resp {
 		role           string
 		// A cluster replica that is to answer reads (`READONLY`).
 		replica        bool
+		// The id of the connection that gets the invalidations of the keys
+		// this one reads (`CLIENT TRACKING ON REDIRECT`); 0 for none.
+		tracking       int
 	}
 
 	// A copy of a target that goes to another address.
 	def retarget(base Target, host string, port int) Target {
-		return Target{host: host, port: port, path: "", secure: base.secure, tlsConfig: base.tlsConfig, username: base.username, password: base.password, database: base.database, name: base.name, protocol: base.protocol, connectTimeout: base.connectTimeout, timeout: base.timeout, role: "", replica: false}
+		return Target{host: host, port: port, path: "", secure: base.secure, tlsConfig: base.tlsConfig, username: base.username, password: base.password, database: base.database, name: base.name, protocol: base.protocol, connectTimeout: base.connectTimeout, timeout: base.timeout, role: "", replica: false, tracking: 0}
 	}
 
 	// Conn is one connection. One task uses it at a time.
@@ -207,6 +210,25 @@ internal partial module adm.network.redis.resp {
 
 		def pools() !Pool[] {
 			return [self]
+		}
+
+		def shards(keys string[]) string[][] {
+			return [keys]
+		}
+
+		def epoch() int {
+			return 0
+		}
+
+		// track makes every connection opened from now on tell the server
+		// to send the invalidations of the keys it reads to the connection
+		// with id `redirect` (0 turns it off). The idle connections are
+		// closed, so none stays that does otherwise.
+		def track(redirect int) {
+			target.tracking = redirect
+			for let conn in takeAll() {
+				conn.close()
+			}
 		}
 
 		def isOpen() bool {
@@ -388,6 +410,10 @@ internal partial module adm.network.redis.resp {
 		}
 		if target.replica {
 			let answer = try one(conn, target.timeout, "READONLY")
+			fail serverError(answer.text()) when answer.isError()
+		}
+		if target.tracking != 0 {
+			let answer = try one(conn, target.timeout, "CLIENT", "TRACKING", "ON", "REDIRECT", target.tracking)
 			fail serverError(answer.text()) when answer.isError()
 		}
 		return none

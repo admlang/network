@@ -1,0 +1,682 @@
+// An Apache Kafka client, written in ADM over std.net. It speaks the
+// Kafka protocol to brokers from version 2.4 on, and to the services that
+// speak it (Redpanda, Amazon MSK, Confluent Cloud, Azure Event Hubs).
+partial module adm.network.kafka {
+	use (
+		std.net.tls
+		std.time
+		adm.network.kafka.wire::*
+	)
+
+	// Sasl is how the client logs in to the brokers.
+	enum Sasl {
+		// No login.
+		None        = "",
+		// User and password as they are; use it under TLS.
+		Plain       = "PLAIN",
+		ScramSha256 = "SCRAM-SHA-256",
+		ScramSha512 = "SCRAM-SHA-512",
+		// An OAuth 2 bearer token, given as the password.
+		OAuthBearer = "OAUTHBEARER",
+	}
+
+	// BrokerInfo is one broker of the cluster.
+	struct BrokerInfo {
+		id   int
+		host string
+		port int
+		// The rack the broker says it stands in; "" when it says none.
+		rack string
+	}
+
+	// PartitionInfo is one partition of a topic and the brokers that hold
+	// it.
+	struct PartitionInfo {
+		index    int
+		// The id of the broker that leads the partition.
+		leader   int
+		replicas int[]
+		// The replicas that hold everything the leader has.
+		inSync   int[]
+	}
+
+	// TopicInfo is a topic and its partitions.
+	struct TopicInfo {
+		name       string
+		// True for the topics Kafka keeps for itself (`__consumer_offsets`).
+		hidden     bool
+		partitions PartitionInfo[]
+	}
+
+	// MemberInfo is one member of a consumer group.
+	struct MemberInfo {
+		id         string
+		clientId   string
+		host       string
+		// The partitions the member reads, by topic.
+		partitions map<string, int[]>
+	}
+
+	// GroupInfo is the state of a consumer group.
+	struct GroupInfo {
+		id       string
+		// `Stable`, `PreparingRebalance`, `CompletingRebalance`, `Empty`
+		// or `Dead`.
+		state    string
+		// How the group shares out partitions (`range`, `roundrobin`).
+		strategy string
+		members  MemberInfo[]
+	}
+
+	// Client is a connection to a Kafka cluster: it knows the brokers and
+	// the topics, makes producers and consumers, and administers topics
+	// and groups. Any number of tasks may share it.
+	//
+	// ```
+	// let k = try kafka.connect("broker1:9092", "broker2:9092")
+	// try k.createTopic("orders", partitions = 6)
+	//
+	// let out = k.producer()
+	// try out.send("orders", "paid", key = "order-7")
+	//
+	// let orders = try k.consumer("billing", "orders")
+	// for let record in try orders.poll(1s) {
+	//     print("{record.offset}: {record.text()}")
+	// }
+	// try orders.commit()
+	// try k.close()
+	// ```
+	//
+	// Everything fails with a KafkaError: a broker's refusal (`kind` names
+	// the common ones, `errorCode` holds its number), ErrorKind.Connection
+	// when no broker can be reached, ErrorKind.TimedOut when an answer
+	// does not come within `timeout`, ErrorKind.Closed after `close`.
+	// Errors that pass by themselves (a partition changing its leader, a
+	// coordinator moving) are retried inside for up to `timeout`.
+	type Client {
+		// The name the brokers log and apply quotas to.
+		clientId         string          = "adm"
+		sasl             Sasl            = Sasl.None
+		username         string          = ""
+		password         ?Secret<string> = none
+		// True connects under TLS (`kafkas://`).
+		secure           bool            = false
+		// TLS settings; none checks the certificate against the system's
+		// authorities and the host name.
+		tls              ?tls.Config     = none
+		// How long opening a connection may take.
+		connectTimeout   duration        = 30s
+		// How long an answer may take, and for how long a request that
+		// fails for a passing reason is tried again.
+		timeout          duration        = 30s
+		internal cluster ?Cluster        = none
+		internal serial  int             = 0
+
+		def new() {}
+
+		// connect names brokers of the cluster and asks the first one that
+		// answers for the others. One address is enough; more help when
+		// that broker is down.
+		//
+		//     host[:port]
+		//     kafka://[user:password@]host[:port]
+		//     kafkas://...                 the same under TLS
+		//
+		// The port is 9092 when left out. A user and password in an
+		// address log in with `sasl`, or with SCRAM-SHA-256 when it is
+		// `None`.
+		// Fails with a KafkaError: ErrorKind.Argument for an address the
+		// client does not take, ErrorKind.Connection when no broker
+		// answers, ErrorKind.Denied when the login is refused.
+		def connect(servers ...string) !none {
+			fail errorOf(ErrorKind.Protocol, "kafka: the client is already connected") unless cluster is none
+			fail errorOf(ErrorKind.Argument, "kafka: connect needs the address of a broker") when servers.len() == 0
+			let seeds Node[] = []
+			for let server in servers {
+				seeds.push(try seedOf(self, server))
+			}
+			let word = ""
+			let secret = password
+			word = secret.reveal() unless secret is none
+			let login = Login{secure: secure, tlsConfig: tls, mechanism: sasl.value, username: username, password: word, clientId: clientId, connectTimeout: connectTimeout, timeout: timeout}
+			let joined = new Cluster(login, seeds)
+			joined.refresh([]) onerror (err error) {
+				joined.close()
+				fail err
+			}
+			cluster = joined
+			return none
+		}
+
+		internal def joined() !Cluster {
+			let c = cluster
+			fail errorOf(ErrorKind.Closed, "kafka: the client is not connected; call connect first") when c is none
+			return c
+		}
+
+		// close closes every connection; producers and consumers made from
+		// the client fail with ErrorKind.Closed afterwards. Close them
+		// first: a consumer leaves its group, a producer sends what it
+		// holds. Never fails.
+		def close() !none {
+			let c = cluster
+			c.close() unless c is none
+			return none
+		}
+
+		def dispose() {
+			let c = cluster
+			c.close() unless c is none
+		}
+
+		// ---- producers and consumers ----
+
+		// producer makes a producer; set its fields before the first send.
+		// Fails with ErrorKind.Closed for a client that is not connected.
+		def producer() !Producer {
+			let c = try joined()
+			serial++
+			return new Producer(new Sender(c, "p{serial}"))
+		}
+
+		// consumer makes a member of a consumer group that reads the
+		// topics named: the group shares their partitions among its
+		// members and remembers how far each was read. The group is joined
+		// on the first `poll`.
+		// Fails with a KafkaError: ErrorKind.Argument without a group or a
+		// topic, ErrorKind.Closed for a client that is not connected.
+		def consumer(group string, topics ...string) !Consumer {
+			let c = try joined()
+			fail errorOf(ErrorKind.Argument, "kafka: a consumer needs the id of its group; `reader` reads without one") when group == ""
+			fail errorOf(ErrorKind.Argument, "kafka: a consumer needs a topic to read") when topics.len() == 0
+			serial++
+			let engine = new Reader(c, "c{serial}", group)
+			engine.topics = topics
+			return new Consumer(engine, self)
+		}
+
+		// reader makes a consumer without a group that reads partitions of
+		// a topic alone: the ones named, or all of them. It starts where
+		// `startFrom` says (set it before the first `poll`, or `seek`) and
+		// commits nothing.
+		// Fails with a KafkaError: ErrorKind.NotFound for a topic or a
+		// partition that does not exist, ErrorKind.Closed for a client
+		// that is not connected.
+		def reader(topic string, partitions ...int) !Consumer {
+			let c = try joined()
+			serial++
+			let made = new Consumer(new Reader(c, "c{serial}", ""), self)
+			made.autoCommit = false
+			let known = try c.topic(topic)
+			let wanted int[] = []
+			for let partition in partitions {
+				fail errorOf(ErrorKind.NotFound, "kafka: topic '{topic}' has no partition {partition}; it has {known.parts.len()}") when partition < 0 || partition >= known.parts.len()
+				wanted.push(partition)
+			}
+			if wanted.len() == 0 {
+				for let part in known.parts {
+					wanted.push(part.index)
+				}
+			}
+			made.engine.addOwned(topic, wanted)
+			return made
+		}
+
+		// ---- the cluster ----
+
+		// brokers lists the brokers of the cluster.
+		// Fails with a KafkaError as every call does.
+		def brokers() !BrokerInfo[] {
+			let c = try joined()
+			try c.refresh(c.names())
+			let out BrokerInfo[] = []
+			for let id in c.nodeIds() {
+				let node = c.nodeOf(id)
+				out.push(BrokerInfo{id: node.id, host: node.host, port: node.port, rack: node.rack}) unless node is none
+			}
+			return out.sort((a, b) => a.id < b.id)
+		}
+
+		// The id of the broker that changes the cluster.
+		def controller() int {
+			let c = cluster
+			return c is none ?? (-1, c.controller)
+		}
+
+		// The id the cluster gave itself.
+		def clusterId() string {
+			let c = cluster
+			return c is none ?? ("", c.clusterId)
+		}
+
+		// topics lists every topic with its partitions.
+		// Fails with a KafkaError as every call does.
+		def topics() !TopicInfo[] {
+			let c = try joined()
+			try c.refresh([])
+			let out TopicInfo[] = []
+			for let name in c.names() {
+				let topic = c.cached(name)
+				out.push(infoOf(topic)) unless topic is none
+			}
+			return out.sort((a, b) => a.name < b.name)
+		}
+
+		// topic describes one topic.
+		// Fails with a KafkaError: ErrorKind.NotFound when it does not
+		// exist, and as every call does.
+		def topic(name string) !TopicInfo {
+			let c = try joined()
+			return infoOf(try c.topic(name, false, true))
+		}
+
+		// createTopic makes a topic and returns once its partitions have
+		// leaders. `partitions` and `replication` of -1 take the broker's
+		// defaults; `config` carries topic settings (`retention.ms`,
+		// `cleanup.policy`, `compression.type`).
+		// Fails with a KafkaError: ErrorKind.Exists when the topic exists,
+		// ErrorKind.Argument for a name, a count or a setting the broker
+		// refuses, and as every call does.
+		def createTopic(name string, partitions int = -1, replication int = -1, config map<string, string> = {}) !none {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.count(1)
+			ask.text(name)
+			ask.i32(partitions)
+			ask.i16(replication)
+			ask.count(0)
+			ask.count(config.len())
+			for let (key, value) in config {
+				ask.text(key)
+				ask.maybe(value)
+			}
+			ask.i32(millis(timeout))
+			ask.bool(false)
+			let answer = try adminCall(c, apiCreateTopics, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			let code = try answer.i16()
+			let said = try answer.maybe()
+			fail refusal(code, "creating topic '{name}'", said) when code != 0
+			try c.topic(name, true, true)
+			return none
+		}
+
+		// deleteTopic removes a topic and everything in it.
+		// Fails with a KafkaError: ErrorKind.NotFound when it does not
+		// exist, and as every call does.
+		def deleteTopic(name string) !none {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.texts([name])
+			ask.i32(millis(timeout))
+			let answer = try adminCall(c, apiDeleteTopics, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			let code = try answer.i16()
+			c.forget(name)
+			fail brokerError(code, "deleting topic '{name}'") when code != 0
+			return none
+		}
+
+		// addPartitions grows a topic to `total` partitions. Records with a
+		// key go to other partitions afterwards; a topic cannot shrink.
+		// Fails with a KafkaError: ErrorKind.Argument when `total` is not
+		// more than the topic has, ErrorKind.NotFound for a missing topic,
+		// and as every call does.
+		def addPartitions(name string, total int) !none {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.count(1)
+			ask.text(name)
+			ask.i32(total)
+			ask.i32(-1)
+			ask.i32(millis(timeout))
+			ask.bool(false)
+			let answer = try adminCall(c, apiCreatePartitions, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			let code = try answer.i16()
+			let said = try answer.maybe()
+			fail refusal(code, "adding partitions to '{name}'", said) when code != 0
+			// The new partitions get their leaders a moment later.
+			let deadline = time.now() + timeout
+			for {
+				let now = try c.topic(name, false, true)
+				break when now.parts.len() >= total
+				fail errorOf(ErrorKind.TimedOut, "kafka: topic '{name}' still has {now.parts.len()} partitions after {timeout}") when time.now() > deadline
+				time.sleep(100ms)
+			}
+			return none
+		}
+
+		// topicConfig returns the settings of a topic, the ones it takes
+		// from the broker's defaults included. Secret values read as "".
+		// Fails with a KafkaError: ErrorKind.NotFound for a missing topic,
+		// and as every call does.
+		def topicConfig(name string) !map<string, string> {
+			return try configOf(2, name)
+		}
+
+		// brokerConfig returns the settings of a broker.
+		// Fails with a KafkaError as every call does.
+		def brokerConfig(id int) !map<string, string> {
+			return try configOf(4, id.str())
+		}
+
+		internal def configOf(kind int, name string) !map<string, string> {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.count(1)
+			ask.i8(kind)
+			ask.text(name)
+			ask.i32(-1)
+			ask.bool(false)
+			// A broker answers for its own settings only.
+			let target = kind == 4 ?? (name.toInt<int>(), c.anyNode())
+			let broker = try c.conn(target, "meta")
+			let answer = try broker.call(apiDescribeConfigs, ask)
+			try answer.i32()
+			try answer.count()
+			let code = try answer.i16()
+			let said = try answer.maybe()
+			fail refusal(code, "the settings of '{name}'", said) when code != 0
+			try answer.i8()
+			try answer.text()
+			let out map<string, string> = {}
+			for let n = try answer.count(); n > 0; n-- {
+				let key = try answer.text()
+				out[key] = try answer.text()
+				try answer.bool()
+				try answer.i8()
+				try answer.bool()
+				for let s = try answer.count(); s > 0; s-- {
+					try answer.text()
+					try answer.maybe()
+					try answer.i8()
+				}
+			}
+			return out
+		}
+
+		// setTopicConfig changes settings of a topic: those in `values`
+		// are set, those named in `remove` go back to the broker's
+		// default; the others stay.
+		// Fails with a KafkaError: ErrorKind.Argument for a setting or a
+		// value the broker refuses, ErrorKind.NotFound for a missing topic,
+		// and as every call does.
+		def setTopicConfig(name string, values map<string, string>, remove string[] = []) !none {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.count(1)
+			ask.i8(2)
+			ask.text(name)
+			ask.count(values.len() + remove.len())
+			for let (key, value) in values {
+				ask.text(key)
+				ask.i8(0)
+				ask.maybe(value)
+			}
+			for let key in remove {
+				ask.text(key)
+				ask.i8(1)
+				ask.maybe(none)
+			}
+			ask.bool(false)
+			let answer = try adminCall(c, apiAlterConfigs, ask)
+			try answer.i32()
+			try answer.count()
+			let code = try answer.i16()
+			let said = try answer.maybe()
+			fail refusal(code, "changing the settings of '{name}'", said) when code != 0
+			return none
+		}
+
+		// ---- offsets ----
+
+		// earliest is the offset of the first record a partition still
+		// holds.
+		// Fails with a KafkaError: ErrorKind.NotFound for a missing topic
+		// or partition, and as every call does.
+		def earliest(topic string, partition int) !int {
+			return try offsetFor(try joined(), "meta", topic, partition, offsetEarliest)
+		}
+
+		// latest is the offset the next record of a partition will get.
+		// Fails as `earliest` does.
+		def latest(topic string, partition int) !int {
+			return try offsetFor(try joined(), "meta", topic, partition, offsetLatest)
+		}
+
+		// offsetAt is the offset of the first record written at or after
+		// a time; none when the partition holds no record that late.
+		// Fails with a KafkaError as `earliest` does.
+		def offsetAt(topic string, partition int, at time.Time) !?int {
+			let offset = try offsetFor(try joined(), "meta", topic, partition, int(at.unixNs() / 1000000))
+			return none when offset < 0
+			return offset
+		}
+
+		// deleteRecords drops the records of a partition before an offset
+		// and returns the offset of the first one left.
+		// Fails with a KafkaError: ErrorKind.OutOfRange for an offset past
+		// the partition's end, ErrorKind.NotFound for a missing topic or
+		// partition, and as every call does.
+		def deleteRecords(topic string, partition int, before int) !int {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.count(1)
+			ask.text(topic)
+			ask.count(1)
+			ask.i32(partition)
+			ask.i64(before)
+			ask.i32(millis(timeout))
+			let broker = try c.conn(try c.leader(topic, partition, true), "meta")
+			let answer = try broker.call(apiDeleteRecords, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			try answer.count()
+			try answer.i32()
+			let low = try answer.i64()
+			let code = try answer.i16()
+			fail brokerError(code, "deleting records of '{topic}' partition {partition}") when code != 0
+			return low
+		}
+
+		// ---- groups ----
+
+		// groups lists the ids of the consumer groups the cluster knows.
+		// Fails with a KafkaError as every call does.
+		def groups() !string[] {
+			let c = try joined()
+			try c.refresh(c.names())
+			let out string[] = []
+			// Each broker lists the groups it coordinates.
+			for let id in c.nodeIds() {
+				let broker = try c.conn(id, "meta")
+				let answer = try broker.call(apiListGroups, new Encoder())
+				try answer.i32()
+				let code = try answer.i16()
+				fail brokerError(code, "listing groups") when code != 0
+				for let n = try answer.count(); n > 0; n-- {
+					let group = try answer.text()
+					try answer.text()
+					out.push(group) unless out.includes(group)
+				}
+			}
+			return out.sort((a, b) => a < b)
+		}
+
+		// group describes a consumer group: its state and who reads what.
+		// A group nobody ever joined reads as `Dead` with no members.
+		// Fails with a KafkaError as every call does.
+		def group(id string) !GroupInfo {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.texts([id])
+			ask.bool(false)
+			let broker = try c.conn(try c.coordinator(id, 0), "meta")
+			let answer = try broker.call(apiDescribeGroups, ask)
+			try answer.i32()
+			try answer.count()
+			let code = try answer.i16()
+			fail brokerError(code, "describing group '{id}'") when code != 0
+			let info = GroupInfo{id: try answer.text()}
+			info.state = try answer.text()
+			try answer.text()
+			info.strategy = try answer.text()
+			for let n = try answer.count(); n > 0; n-- {
+				let member = MemberInfo{id: try answer.text()}
+				try answer.maybe()
+				member.clientId = try answer.text()
+				member.host = try answer.text()
+				try answer.bytes()
+				member.partitions = try assignmentIn(try answer.bytes())
+				info.members.push(member)
+			}
+			return info
+		}
+
+		// committed returns the offsets a group committed for a topic, by
+		// partition; a partition it never committed is left out.
+		// Fails with a KafkaError: ErrorKind.NotFound for a missing topic,
+		// and as every call does.
+		def committed(group string, topic string) !map<int, int> {
+			let c = try joined()
+			let known = try c.topic(topic)
+			let indexes int[] = []
+			for let part in known.parts {
+				indexes.push(part.index)
+			}
+			return try committedOffsets(c, "meta", group, topic, indexes)
+		}
+
+		// deleteGroup removes a group and its committed offsets.
+		// Fails with a KafkaError: ErrorKind.State while the group has
+		// members, ErrorKind.NotFound when it does not exist, and as every
+		// call does.
+		def deleteGroup(id string) !none {
+			let c = try joined()
+			let ask = new Encoder()
+			ask.texts([id])
+			let broker = try c.conn(try c.coordinator(id, 0), "meta")
+			let answer = try broker.call(apiDeleteGroups, ask)
+			try answer.i32()
+			try answer.count()
+			try answer.text()
+			let code = try answer.i16()
+			fail brokerError(code, "deleting group '{id}'") when code != 0
+			return none
+		}
+	}
+
+	// Sends a request that changes the cluster to its controller, once
+	// more when the controller moved meanwhile.
+	internal def adminCall(c Cluster, api int, ask Encoder) !Decoder {
+		let answer = try c.admin(api, ask, c.login.timeout)
+		// The answers to these requests carry their first error code at a
+		// place that depends on the request; a moved controller shows as
+		// NOT_CONTROLLER there, which a fresh look at the cluster cures.
+		return answer unless movedController(answer)
+		try c.refresh(c.names())
+		return try c.admin(api, ask, c.login.timeout)
+	}
+
+	// Whether an answer holds NOT_CONTROLLER (41) as a 16-bit code. The
+	// answers of the requests sent through `adminCall` are short, and 41
+	// preceded by a zero byte does not occur in their names.
+	internal def movedController(answer Decoder) bool {
+		for let i = 4; i + 1 < answer.data.len() && i < 64; i++ {
+			return true when int(answer.data[i]) == 0 && int(answer.data[i + 1]) == 41 && i + 2 == answer.data.len() - 2
+		}
+		return false
+	}
+
+	internal def refusal(code int, about string, said ?string) KafkaError {
+		let failure = brokerError(code, about)
+		failure.message = "{failure.message}: {said}" unless said is none
+		return failure
+	}
+
+	internal def millis(d duration) int {
+		return int(int64(d) / 1000000)
+	}
+
+	internal def infoOf(topic Topic) TopicInfo {
+		let info = TopicInfo{name: topic.name, hidden: topic.hidden}
+		for let part in topic.parts {
+			info.partitions.push(PartitionInfo{index: part.index, leader: part.leader, replicas: part.replicas, inSync: part.inSync})
+		}
+		return info
+	}
+
+	// The broker address a `connect` argument names; a user and password
+	// in it become the client's.
+	// Fails with ErrorKind.Argument for an address the client does not
+	// take.
+	internal def seedOf(k Client, server string) !Node {
+		let rest = server
+		if rest.startsWith("kafkas://") {
+			k.secure = true
+			rest = rest.slice(9, rest.len())
+		} else if rest.startsWith("kafka://") {
+			rest = rest.slice(8, rest.len())
+		} else {
+			fail errorOf(ErrorKind.Argument, "kafka: the scheme of '{server}' is not kafka or kafkas") when rest.contains("://")
+		}
+		let at = rest.indexOf("@")
+		if at >= 0 {
+			let who = rest.slice(0, at)
+			rest = rest.slice(at + 1, rest.len())
+			let colon = who.indexOf(":")
+			fail errorOf(ErrorKind.Argument, "kafka: '{server}' names a user without a password") when colon < 0
+			k.username = who.slice(0, colon)
+			let secret Secret<string> = who.slice(colon + 1, who.len())
+			k.password = secret
+			k.sasl = Sasl.ScramSha256 when k.sasl == Sasl.None
+		}
+		rest = rest.slice(0, rest.len() - 1) when rest.endsWith("/")
+		let host = rest
+		let digits = ""
+		if rest.startsWith("[") {
+			// An IPv6 address in brackets.
+			let close = rest.indexOf("]")
+			fail errorOf(ErrorKind.Argument, "kafka: '{server}' is not host:port") when close < 0
+			host = rest.slice(1, close)
+			let tail = rest.slice(close + 1, rest.len())
+			fail errorOf(ErrorKind.Argument, "kafka: '{server}' is not host:port") unless tail == "" || tail.startsWith(":")
+			digits = tail.slice(1, tail.len()) when tail != ""
+		} else {
+			let colon = rest.indexOf(":")
+			if colon >= 0 {
+				host = rest.slice(0, colon)
+				digits = rest.slice(colon + 1, rest.len())
+			}
+		}
+		let port = 9092
+		if rest.contains(":") && !(rest.startsWith("[") && rest.endsWith("]")) {
+			fail errorOf(ErrorKind.Argument, "kafka: the port of '{server}' is not a number") unless /^[0-9]{1,5}$/.test(digits)
+			port = digits.toInt<int>()
+		}
+		fail errorOf(ErrorKind.Argument, "kafka: '{server}' names no host") when host == ""
+		return Node{id: -1, host: host, port: port}
+	}
+
+	// connect opens a client on a cluster through the brokers named; see
+	// `Client.connect`.
+	//
+	// ```
+	// let k = try kafka.connect("kafkas://app:secret@broker1.internal:9093")
+	// ```
+	//
+	// Fails with a KafkaError as `Client.connect` does.
+	def connect(servers ...string) !Client {
+		let k = new Client()
+		try k.connect(...servers)
+		return k
+	}
+}

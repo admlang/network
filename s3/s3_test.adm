@@ -7,7 +7,8 @@ partial module adm.network.s3 {
 		std.os
 		std.testing
 		std.time
-		adm.network.s3.sigv4::(sha256Hex)
+		adm.network.s3.sigv4::(sha256Hex, checksumOf)
+		adm.network.s3.wire::(Call, parseXML)
 	)
 
 	// The server as `http://accessKey:secretKey@host:port`. The tests make
@@ -497,6 +498,39 @@ partial module adm.network.s3 {
 			try bucket.configuration("lifecycle", none)
 			assert (try bucket.configuration("lifecycle")) is none
 
+			// The same as values.
+			assert (try bucket.lifecycle()).len() == 0
+			let logs = LifecycleRule{id: "old-logs", prefix: "logs/", expireAfterDays: 30, abortUploadsAfterDays: 7}
+			let tagged = LifecycleRule{id: "temp", labels: {"kind": "temp"}, largerThan: 1024, noncurrentAfterDays: 3, keepNoncurrent: 2, enabled: false}
+			tagged.prefix = "tmp/"
+			let dated = LifecycleRule{id: "sunset", expireOn: time.fromUnixNs(int64(1900000000) * 1000000000)}
+			try bucket.lifecycle([logs, tagged, dated])
+			let kept = try bucket.lifecycle()
+			assert kept.len() == 3
+			let byId map<string, LifecycleRule> = {}
+			for let rule in kept {
+				byId[rule.id] = rule
+			}
+			assert byId["old-logs"].prefix == "logs/" && byId["old-logs"].expireAfterDays == 30 && byId["old-logs"].enabled
+			assert byId["temp"].prefix == "tmp/" && byId["temp"].labels["kind"] == "temp" && byId["temp"].largerThan == 1024
+			assert byId["temp"].noncurrentAfterDays == 3 && byId["temp"].keepNoncurrent == 2 && !byId["temp"].enabled
+			let sunset = byId["sunset"].expireOn
+			fail "no date" when sunset is none
+			assert sunset.unixNs() / 1000000000 == 1900000000 / 86400 * 86400 && byId["sunset"].prefix == ""
+			try bucket.lifecycle([])
+			assert (try bucket.lifecycle()).len() == 0
+
+			// What a rule set looks like on the wire, both ways.
+			// (MinIO does not keep the rule for unfinished uploads.)
+			let moving = LifecycleRule{id: "tier", prefix: "archive/", abortUploadsAfterDays: 7, transitions: [Transition{days:30, storageClass:"STANDARD_IA"}, Transition{days:90, storageClass:"GLACIER"}], noncurrentTransitions: [Transition{days:7, storageClass:"GLACIER", keep:1}]}
+			let document = try parseXML(lifecycleDocument([moving]), new Call("GET", "b"))
+			let read = lifecycleRuleIn(document.elements("Rule")[0])
+			assert read.transitions.len() == 2 && read.transitions[1].days == 90 && read.transitions[1].storageClass == "GLACIER"
+			assert read.noncurrentTransitions.len() == 1 && read.noncurrentTransitions[0].keep == 1 && read.prefix == "archive/" && read.abortUploadsAfterDays == 7
+			let pages = CorsRule{id: "app", origins: ["https://app.example.com"], methods: ["get", "PUT"], headers: ["*"], exposed: ["ETag"], maxAge: 1h}
+			let wire = string(corsDocument([pages]))
+			assert wire.contains("<AllowedOrigin>https://app.example.com</AllowedOrigin>") && wire.contains("<AllowedMethod>GET</AllowedMethod>") && wire.contains("<MaxAgeSeconds>3600</MaxAgeSeconds>") && wire.contains("<ExposeHeader>ETag</ExposeHeader>")
+
 			let res = try store.request("get", "adm-test-settings", query = {"location": ""})
 			assert (try res.text()).contains("LocationConstraint")
 			try wipe(store, "adm-test-settings")
@@ -599,6 +633,66 @@ partial module adm.network.s3 {
 	}
 
 	check "Presigned" {
+		@test()
+		def TestChecksums() !none {
+			// Known values of each kind.
+			assert checksumOf(Checksum.Crc32, "hello".bytes()) == "NhCmhg=="
+			assert checksumOf(Checksum.Crc32c, "hello".bytes()) == "mnG7TA=="
+			assert checksumOf(Checksum.Sha1, "hello".bytes()) == "qvTGHdzF6KLavt4PO0gs2a6pQ00="
+			assert checksumOf(Checksum.Sha256, "hello".bytes()) == "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+			return none when testServer == ""
+			let store = try testClient()
+			store.partSize = 5 * 1024 * 1024
+			try store.connect(testServer)
+			let bucket = try fresh(store, "adm-test-sums")
+			let data = pattern(300000)
+			for let kind in [Checksum.Crc32, Checksum.Crc32c, Checksum.Sha1, Checksum.Sha256] {
+				// Content in memory: the checksum goes ahead in a header.
+				try bucket.put("mem-{kind.value}", data, "", WriteOptions{checksum: kind})
+				let whole = try bucket.get("mem-{kind.value}", ReadOptions{checksum: true})
+				assert whole.info.checksums[kind.value] == checksumOf(kind, data)
+				assert sha256Hex(try whole.bytes()) == sha256Hex(data)
+				// A stream: the checksum follows the content, signed.
+				try bucket.put("stream-{kind.value}", new bytes.Buffer(data), data.len(), "", WriteOptions{checksum: kind})
+				let info = try bucket.info("stream-{kind.value}", ReadOptions{checksum: true})
+				fail "no info" when info is none
+				assert info.checksums[kind.value] == checksumOf(kind, data) && info.size == data.len()
+			}
+			// Without asking, a read carries none.
+			assert (try bucket.get("mem-crc32")).info.checksums.len() == 0
+			let nothing byte[] = []
+			try bucket.put("empty", new bytes.Buffer(nothing), 0, "", WriteOptions{checksum: Checksum.Crc32})
+			let none0 = try bucket.info("empty", ReadOptions{checksum: true})
+			fail "no info" when none0 is none
+			assert none0.checksums["crc32"] == "AAAAAA=="
+
+			// In parts: each part has its checksum, the object the checksum
+			// of those.
+			let large = pattern(11 * 1024 * 1024)
+			let many = try bucket.upload("parts", new bytes.Buffer(large), "", WriteOptions{checksum: Checksum.Crc32c})
+			assert many.parts == 3
+			let joined = try bucket.get("parts", ReadOptions{checksum: true})
+			assert joined.info.checksums["crc32c"].endsWith("-3")
+			assert sha256Hex(try joined.bytes()) == sha256Hex(large)
+			let manual = try bucket.multipart("manual", "", WriteOptions{checksum: Checksum.Sha256})
+			assert manual.checksum == Checksum.Sha256
+			let first = try manual.part(1, pattern(5 * 1024 * 1024))
+			let last = try manual.part(2, "tail".bytes())
+			assert first.checksum == checksumOf(Checksum.Sha256, pattern(5 * 1024 * 1024)) && last.checksum == checksumOf(Checksum.Sha256, "tail".bytes())
+			let listed = try manual.parts()
+			assert listed.len() == 2 && listed[1].checksum == last.checksum
+			try manual.complete()
+			let done = try bucket.info("manual", ReadOptions{checksum: true})
+			fail "no info" when done is none
+			assert done.checksums["sha256"].endsWith("-2")
+			try bucket.copy("mem-sha1", "copied", options = WriteOptions{checksum: Checksum.Crc32})
+			let copied = try bucket.info("copied", ReadOptions{checksum: true})
+			fail "no info" when copied is none
+			assert copied.checksums["crc32"] == checksumOf(Checksum.Crc32, data)
+			try wipe(store, "adm-test-sums")
+			return none
+		}
+
 		@test()
 		def TestLinks() !none {
 			return none when testServer == ""

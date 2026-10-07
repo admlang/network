@@ -1,0 +1,62 @@
+partial module adm.network.kafka {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is KafkaError`.
+	enum ErrorKind {
+		// No broker can be reached, or the connection broke.
+		Connection  = "connection",
+		// Nothing arrived within the timeout, or the broker gave up waiting
+		// for its replicas.
+		TimedOut    = "timeout",
+		// The client, producer or consumer was closed.
+		Closed      = "closed",
+		// A broker sent something that is not the Kafka protocol, or the
+		// client was used in a way the protocol does not allow.
+		Protocol    = "protocol",
+		// An argument or an option the client does not take, or one the
+		// broker refuses (a bad topic name, partition count, setting).
+		Argument    = "argument",
+		// The user or password is wrong, or the user may not do this.
+		Denied      = "denied",
+		// The topic, partition or group does not exist.
+		NotFound    = "notfound",
+		// The topic already exists.
+		Exists      = "exists",
+		// A record or a batch is larger than the broker takes.
+		TooLarge    = "toolarge",
+		// The offset asked for is before the first or after the last one
+		// the partition holds.
+		OutOfRange  = "outofrange",
+		// The consumer group changed while the consumer worked: what it
+		// tried (a commit) did not happen, and it gets its partitions anew
+		// on the next `poll`.
+		Rebalanced  = "rebalanced",
+		// Another producer with the same transactional id, or another
+		// member with the same instance id, took over.
+		Fenced      = "fenced",
+		// Records that fail their checksum.
+		Corrupt     = "corrupt",
+		// The broker is too old (or too new) for a request, or does not
+		// know the compression.
+		Unsupported = "unsupported",
+		// The call does not fit the state of a transaction: none is open,
+		// or one already is.
+		State       = "state",
+		// Any other error from a broker; `errorCode` holds its number.
+		Server      = "server",
+	}
+
+	// KafkaError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct KafkaError {
+		message   string
+		code      string
+		cause     ?error
+		stack     errors.StackTrace
+		kind      ErrorKind
+		// The broker's error number (3 for UNKNOWN_TOPIC_OR_PARTITION); 0
+		// when the failure did not come from a broker.
+		errorCode int
+	}
+}
