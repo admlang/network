@@ -1,0 +1,14 @@
+# adm.toml
+#
+# Manifest of the adm.network.memcached library. The [publisher] section is
+# written by `adm app init` with the publisher's key.
+
+schema = 1
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:XYlklXr2MCLkcFez40CLPavD2P/qJBTfIS6XRv33n/c="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.network.memcached"]
+description = "Memcached client"

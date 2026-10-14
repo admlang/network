@@ -1,0 +1,3 @@
+partial module adm.network.memcached {
+	// Memcached over std.net: the text and meta protocols, get, set, cas, touch, increment, many servers with consistent hashing, TLS, connection pools
+}

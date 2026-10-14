@@ -1,0 +1,11 @@
+// etcd v3 client
+@manifest(version = "0.0.1")
+library adm.network.etcd {
+	use (
+		adm.network.etcd
+	)
+
+	export (
+		adm.network.etcd
+	)
+}

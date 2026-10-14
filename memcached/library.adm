@@ -1,0 +1,11 @@
+// Memcached client
+@manifest(version = "0.0.1")
+library adm.network.memcached {
+	use (
+		adm.network.memcached
+	)
+
+	export (
+		adm.network.memcached
+	)
+}

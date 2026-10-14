@@ -1,0 +1,3 @@
+partial module adm.network.etcd {
+	// etcd v3 over std.net.grpc: key-value (range, put, delete, transactions), watch, leases with keep-alive, locks and elections, authentication, endpoints with failover, TLS and client certificates
+}
