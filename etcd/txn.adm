@@ -1,0 +1,263 @@
+partial module adm.network.etcd {
+	use (
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// How a compare relates the key's current state to the value given.
+	enum CompareOp {
+		Equal    = 0,
+		Greater  = 1,
+		Less     = 2,
+		NotEqual = 3,
+	}
+
+	// What of a key a compare looks at.
+	enum CompareTarget {
+		// How often it changed since created; 0 when it does not exist.
+		Version  = 0,
+		// The revision that created it; 0 when it does not exist.
+		Created  = 1,
+		// The revision that last changed it.
+		Modified = 2,
+		Value    = 3,
+		// The id of its lease, 0 for none.
+		Lease    = 4,
+	}
+
+	// One condition of a transaction, on a key or on every key of a range.
+	// Made by valueIs, versionIs, createdAt, modifiedAt and leaseIs.
+	struct Compare {
+		key    string
+		// The end of the range compared, "" for the key alone.
+		end    string        = ""
+		target CompareTarget = CompareTarget.Value
+		op     CompareOp     = CompareOp.Equal
+		// The number a Version, Created, Modified or Lease compare takes.
+		number int           = 0
+		// The value a Value compare takes.
+		data   byte[]        = []
+	}
+
+	// The key's value compared with value: equal by default.
+	//
+	//     cluster.txn().compare(etcd.valueIs("/k", "old")).then(etcd.putOp("/k", "new")).commit()
+	def valueIs(key string, value string, op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Value, op: op, data: value.bytes()}
+	}
+
+	// The key's value compared with the bytes.
+	def valueIs(key string, value byte[], op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Value, op: op, data: value}
+	}
+
+	// The key's version compared with version; `versionIs(key, 0)` holds
+	// when the key does not exist.
+	def versionIs(key string, version int, op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Version, op: op, number: version}
+	}
+
+	// The revision that created the key compared with revision.
+	def createdAt(key string, revision int, op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Created, op: op, number: revision}
+	}
+
+	// The revision that last changed the key compared with revision.
+	def modifiedAt(key string, revision int, op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Modified, op: op, number: revision}
+	}
+
+	// The key's lease compared with lease (none: no lease).
+	def leaseIs(key string, lease ?Lease, op CompareOp = CompareOp.Equal, end string = "") Compare {
+		return Compare{key: key, end: end, target: CompareTarget.Lease, op: op, number: leaseId(lease)}
+	}
+
+	// What an Op does.
+	enum OpKind {
+		Get,
+		Put,
+		Delete,
+		Txn,
+	}
+
+	// One operation of a transaction branch. Made by getOp, putOp,
+	// deleteOp and txnOp.
+	type Op {
+		kind             OpKind
+		internal request RequestOp
+
+		def new(kind OpKind, request RequestOp) {
+			self.kind = kind
+			self.request = request
+		}
+	}
+
+	// Reads keys as Client.range does.
+	def getOp(key string, options GetOptions = GetOptions{}) Op {
+		return new Op(OpKind.Get, RequestOp{range: rangeRequest(key, options)})
+	}
+
+	// Sets key to value as Client.put does.
+	def putOp(key string, value string, lease ?Lease = none, previous bool = false, ignoreLease bool = false) Op {
+		return putOp(key, value.bytes(), lease, previous, ignoreLease)
+	}
+
+	// Sets key to the bytes as Client.put does.
+	def putOp(key string, value byte[], lease ?Lease = none, previous bool = false, ignoreLease bool = false) Op {
+		return new Op(OpKind.Put, RequestOp{put: PutRequest{key: key.bytes(), value: value, lease: leaseId(lease), prevKv: previous, ignoreLease: ignoreLease}})
+	}
+
+	// Deletes key, the keys from it up to end, or with prefix every key
+	// that starts with it.
+	def deleteOp(key string, end string = "", previous bool = false, prefix bool = false) Op {
+		let request = DeleteRangeRequest{key: key.bytes(), rangeEnd: end.bytes(), prevKv: previous}
+		if prefix {
+			request.key = emptyKeyAll(key)
+			request.rangeEnd = rangeEndOf(key.bytes())
+		}
+		return new Op(OpKind.Delete, RequestOp{delete: request})
+	}
+
+	// A transaction nested in a branch of another (etcd 3.3 and later).
+	def txnOp(txn Txn) Op {
+		return new Op(OpKind.Txn, RequestOp{txn: txnRequestOf(txn)})
+	}
+
+	// A transaction: when every compare holds, the `then` operations run,
+	// otherwise the `otherwise` ones, all at one revision. A key may be
+	// written once per branch.
+	//
+	//     let r = try cluster.txn()
+	//         .compare(etcd.versionIs("/config/lock", 0))
+	//         .then(etcd.putOp("/config/lock", me))
+	//         .otherwise(etcd.getOp("/config/lock"))
+	//         .commit()
+	type Txn {
+		internal link     ?Transport = none
+		internal compares Compare[]  = []
+		internal success  Op[]       = []
+		internal failure  Op[]       = []
+
+		// A transaction to nest with txnOp, or to commit through a client's
+		// `commit(txn)`.
+		def new() {}
+
+		// Adds conditions; all of them must hold.
+		def compare(conditions ...Compare) Txn {
+			compares += conditions
+			return self
+		}
+
+		// Adds operations to run when the conditions hold.
+		def then(ops ...Op) Txn {
+			success += ops
+			return self
+		}
+
+		// Adds operations to run when a condition does not hold.
+		def otherwise(ops ...Op) Txn {
+			failure += ops
+			return self
+		}
+
+		// Runs the transaction. Fails with an EtcdError: Argument for a key
+		// written twice in a branch or too many operations (128 by default).
+		def commit() !TxnResult {
+			let l = link
+			fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: the transaction belongs to no client; commit it with Client.commit") when l is none
+			let reply = new TxnResponse()
+			try l.call("/etcdserverpb.KV/Txn", txnRequestOf(self), reply, false)
+			return txnResultOf(reply)
+		}
+	}
+
+	// What a transaction did.
+	struct TxnResult {
+		// Every compare held, so the `then` branch ran.
+		succeeded bool
+		// The store's revision after it.
+		revision  int
+		// One per operation of the branch that ran, in order.
+		results   OpResult[]
+	}
+
+	// What one operation of a transaction answered; the field of its kind
+	// is set.
+	struct OpResult {
+		kind   OpKind
+		range  ?RangeResult  = none
+		put    ?PutResult    = none
+		delete ?DeleteResult = none
+		// A nested transaction's result: results form a tree, never a
+		// cycle.
+		txn    ?TxnResult    = none
+	}
+
+	partial type Client {
+		// A transaction to build and commit on this client.
+		def txn() Txn {
+			let t = new Txn()
+			t.link = link
+			return t
+		}
+
+		// Runs a transaction built apart from a client. Fails as
+		// Txn.commit does.
+		def commit(txn Txn) !TxnResult {
+			let reply = new TxnResponse()
+			try link.call("/etcdserverpb.KV/Txn", txnRequestOf(txn), reply, false)
+			return txnResultOf(reply)
+		}
+	}
+
+	internal def txnRequestOf(t Txn) TxnRequest {
+		let r = new TxnRequest()
+		for let c in t.compares {
+			r.compare.push(compareMsg(c))
+		}
+		for let op in t.success {
+			r.success.push(op.request)
+		}
+		for let op in t.failure {
+			r.failure.push(op.request)
+		}
+		return r
+	}
+
+	internal def compareMsg(c Compare) CompareMsg {
+		let m = CompareMsg{result: int32(c.op.value), target: int32(c.target.value), key: c.key.bytes(), rangeEnd: c.end.bytes()}
+		match c.target {
+			case CompareTarget.Version:
+				m.version = c.number
+			case CompareTarget.Created:
+				m.createRevision = c.number
+			case CompareTarget.Modified:
+				m.modRevision = c.number
+			case CompareTarget.Lease:
+				m.lease = c.number
+			default:
+				m.value = c.data
+		}
+		return m
+	}
+
+	internal def txnResultOf(r TxnResponse) TxnResult {
+		let out = TxnResult{succeeded: r.succeeded, revision: r.header.revision}
+		for let op in r.responses {
+			let got = op.range
+			let put = op.put
+			let gone = op.delete
+			let inner = op.txn
+			if !(got is none) {
+				out.results.push(OpResult{kind: OpKind.Get, range: rangeResultOf(got)})
+			} else if !(put is none) {
+				out.results.push(OpResult{kind: OpKind.Put, put: putResultOf(put)})
+			} else if !(gone is none) {
+				out.results.push(OpResult{kind: OpKind.Delete, delete: deleteResultOf(gone)})
+			} else if !(inner is none) {
+				out.results.push(OpResult{kind: OpKind.Txn, txn: txnResultOf(inner)})
+			}
+		}
+		return out
+	}
+}

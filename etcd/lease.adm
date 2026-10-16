@@ -1,0 +1,299 @@
+partial module adm.network.etcd {
+	use (
+		std.time
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// A lease: keys put with it are deleted when it expires or is revoked.
+	// One granted with keep-alive is renewed in the background, a third of
+	// its time to live after each renewal, until it is revoked or the
+	// client is closed.
+	type Lease {
+		// The lease's id, as other etcd clients name it.
+		id             int
+		// The time to live the server granted.
+		ttl            duration
+		internal link  Transport
+		// Renewed by the client's keeper.
+		internal kept  bool
+		// When the lease runs out unless renewed; none while unknown.
+		atomic expires ?time.Time = none
+		// When the keeper renews it next.
+		atomic renewAt ?time.Time = none
+		atomic ended   bool       = false
+
+		def new(link Transport, id int, ttl duration, kept bool) {
+			self.link = link
+			self.id = id
+			self.ttl = ttl
+			self.kept = kept
+		}
+
+		// The lease as `etcd.Lease(id)`.
+		def str() string {
+			return "etcd.Lease({id})"
+		}
+
+		// Reports whether the lease is still held, as far as this side
+		// knows: not revoked, not reported expired, and renewed within its
+		// time to live (always true for a lease not kept alive here and not
+		// revoked through it).
+		def alive() bool {
+			return false when ended
+			let until = expires
+			return until is none || time.now().before(until)
+		}
+
+		// The time the lease has left, the time it was granted and, with
+		// keys, the keys attached to it. Fails with LeaseExpired once it is
+		// gone.
+		def timeToLive(keys bool = false) !LeaseInfo {
+			let reply = new LeaseTimeToLiveResponse()
+			try link.call("/etcdserverpb.Lease/LeaseTimeToLive", LeaseTimeToLiveRequest{id: id, keys: keys}, reply, true)
+			if reply.ttl < 0 {
+				ended = true
+				fail etcdError(ErrorKind.LeaseExpired, grpc.Code.NotFound, "etcd: lease {id} has expired")
+			}
+			let names string[] = []
+			for let k in reply.keys {
+				names.push(string(k))
+			}
+			return LeaseInfo{id: id, ttl: seconds(reply.ttl), granted: seconds(reply.grantedTtl), keys: names}
+		}
+
+		// Renews the lease once and returns its new time to live. Fails
+		// with LeaseExpired when it is gone.
+		def keepAliveOnce() !duration {
+			let s = try link.openStream("/etcdserverpb.Lease/LeaseKeepAlive", -1, link.config.timeout)
+			let sent = time.now()
+			let reply = new LeaseKeepAliveResponse()
+			let got = renewOn(s, id, reply) onerror (err error) {
+				s.cancel()
+				fail failureOf(err)
+			}
+			s.closeSend() onerror recover none
+			s.cancel()
+			if !got || reply.ttl <= 0 {
+				ended = true
+				fail etcdError(ErrorKind.LeaseExpired, grpc.Code.NotFound, "etcd: lease {id} has expired")
+			}
+			renewed(self, sent, reply.ttl)
+			return seconds(reply.ttl)
+		}
+
+		// Revokes the lease: its keys are deleted, and its keep-alive
+		// stops. Fails with LeaseExpired when it was already gone.
+		def revoke() !none {
+			link.keeper.forget(self) when kept
+			ended = true
+			try link.call("/etcdserverpb.Lease/LeaseRevoke", LeaseIdRequest{id: id}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Stops renewing the lease, leaving it to expire on the server.
+		def stopKeepAlive() {
+			link.keeper.forget(self) when kept
+		}
+	}
+
+	// What the server knows of a lease.
+	struct LeaseInfo {
+		id      int
+		// The time left.
+		ttl     duration
+		// The time to live it was granted.
+		granted duration
+		// The keys attached to it, when asked for.
+		keys    string[]
+	}
+
+	partial type Client {
+		// A new lease of ttl (rounded up to whole seconds; the server may
+		// grant more), kept alive until revoked or the client is closed
+		// unless keepAlive is false. id asks for that id, 0 lets the server
+		// choose. Fails with Argument for a ttl the server refuses, or an id
+		// in use.
+		def grant(ttl duration, keepAlive bool = true, id int = 0) !Lease {
+			let ns = int(ttl)
+			let secs = (ns + 999999999) / 1000000000
+			let reply = new LeaseGrantResponse()
+			try link.call("/etcdserverpb.Lease/LeaseGrant", LeaseGrantRequest{ttl: secs, id: id}, reply, false)
+			fail etcdError(ErrorKind.Server, grpc.Code.Unknown, "etcd: {reply.problem}") when reply.problem != ""
+			let lease = new Lease(link, reply.id, seconds(reply.ttl), keepAlive)
+			renewed(lease, time.now(), reply.ttl)
+			link.keeper.add(lease) when keepAlive
+			return lease
+		}
+
+		// The lease with id, granted elsewhere. keepAlive renews it from
+		// here; its time to live is learnt at the first renewal.
+		def lease(id int, keepAlive bool = false) Lease {
+			let lease = new Lease(link, id, 0s, keepAlive)
+			link.keeper.add(lease) when keepAlive
+			return lease
+		}
+
+		// The ids of every lease the cluster holds. Fails when no endpoint
+		// answers.
+		def leases() !int[] {
+			let reply = new LeaseLeasesResponse()
+			try link.call("/etcdserverpb.Lease/LeaseLeases", new Empty(), reply, true)
+			let out int[] = []
+			for let l in reply.leases {
+				out.push(l.id)
+			}
+			return out
+		}
+	}
+
+	// Keeps the leases of one client alive over one LeaseKeepAlive stream,
+	// on one task that runs while there are leases to keep.
+	internal type Keeper {
+		// The transport owns the keeper.
+		weak link      ?Transport
+		atomic leases  Lease[]            = []
+		atomic running bool               = false
+		atomic stopped bool               = false
+		atomic current ?grpc.ClientStream = none
+
+		def new(link Transport) {
+			self.link = link
+		}
+
+		def add(lease Lease) {
+			if enlist(lease) {
+				let task = async run()
+				task.keepAlive()
+			}
+		}
+
+		// Adds the lease; true when no task runs and one must start.
+		atomic def enlist(lease Lease) bool {
+			return false when stopped
+			leases.push(lease)
+			return false when running
+			running = true
+			return true
+		}
+
+		atomic def forget(lease Lease) {
+			let kept Lease[] = []
+			for let l in leases {
+				kept.push(l) unless l == lease
+			}
+			leases = kept
+		}
+
+		atomic def snapshot() Lease[] {
+			return leases.clone()
+		}
+
+		// Ends the task when no lease is left; true when it should stop.
+		atomic def retire() bool {
+			if stopped || leases.len() == 0 || link is none {
+				running = false
+				return true
+			}
+			return false
+		}
+
+		atomic def swap(s ?grpc.ClientStream) ?grpc.ClientStream {
+			let old = current
+			current = s
+			return old
+		}
+
+		def stop() {
+			stopped = true
+			let s = swap(none)
+			s.cancel() unless s is none
+		}
+
+		// The keep-alive loop: renews each lease when it is due, drops
+		// those the server reports gone or that ran out while it could not
+		// be reached.
+		def run() {
+			for !retire() {
+				let now = time.now()
+				for let lease in snapshot() {
+					continue unless renewalDue(lease, now)
+					if !lease.alive() {
+						lease.ended = true
+						forget(lease)
+						continue
+					}
+					renew(lease)
+				}
+				time.sleep(250ms)
+			}
+			let s = swap(none)
+			s.cancel() unless s is none
+		}
+
+		// The shared stream, opened when there is none.
+		def stream() !grpc.ClientStream {
+			let have = current
+			return have unless have is none
+			let l = link
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the client is gone") when l is none
+			let opened = try l.openStream("/etcdserverpb.Lease/LeaseKeepAlive")
+			swap(opened)
+			return opened
+		}
+
+		def renew(lease Lease) {
+			let s = stream() onerror (err error) {
+				lease.renewAt = time.now() + 1s
+				return
+			}
+			let sent = time.now()
+			let reply = new LeaseKeepAliveResponse()
+			let got = renewOn(s, lease.id, reply) onerror (err error) {
+				let old = swap(none)
+				old.cancel() unless old is none
+				let l = link
+				l.renewAfter(err) unless l is none
+				lease.renewAt = time.now() + 500ms
+				return
+			}
+			if !got {
+				swap(none)
+				lease.renewAt = time.now() + 500ms
+				return
+			}
+			if reply.ttl <= 0 {
+				lease.ended = true
+				forget(lease)
+				return
+			}
+			renewed(lease, sent, reply.ttl)
+		}
+	}
+
+	// Sends one keep-alive request and reads its answer; false when the
+	// stream ended instead.
+	internal def renewOn(s grpc.ClientStream, id int, reply LeaseKeepAliveResponse) !bool {
+		try s.send(LeaseIdRequest{id: id})
+		return try s.receive(reply)
+	}
+
+	// Records a renewal the server answered for a request sent at sent:
+	// the lease runs out a time to live after it, and is renewed a third of
+	// the way there.
+	internal def renewed(lease Lease, sent time.Time, ttlSeconds int) {
+		let life = seconds(ttlSeconds)
+		lease.expires = sent + life
+		let third = duration(int(life) / 3)
+		lease.renewAt = sent + (third < 500ms ?? (500ms, third))
+	}
+
+	internal def renewalDue(lease Lease, now time.Time) bool {
+		let at = lease.renewAt
+		return at is none || !now.before(at)
+	}
+
+	internal def seconds(n int) duration {
+		return duration(n * 1000000000)
+	}
+}

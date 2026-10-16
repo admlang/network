@@ -1,0 +1,279 @@
+partial module adm.network.etcd {
+	use (
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// One key and its value at a revision.
+	type KeyValue {
+		key            string
+		// The value's bytes; `value` is them as text.
+		data           byte[]
+		// The revision of the change that created the key.
+		createRevision int
+		// The revision of the last change to the key.
+		modRevision    int
+		// How often the key changed since it was created, 1 after the
+		// first put.
+		version        int
+		// The id of the lease the key is attached to, 0 for none.
+		lease          int
+
+		value string {
+			def get() string {
+				return string(data)
+			}
+		}
+	}
+
+	// What a range is ordered by.
+	enum SortTarget {
+		Key      = 0,
+		Version  = 1,
+		Created  = 2,
+		Modified = 3,
+		Value    = 4,
+	}
+
+	// Which way a range is ordered.
+	enum SortOrder {
+		// The server's order: by key, ascending.
+		None       = 0,
+		Ascending  = 1,
+		Descending = 2,
+	}
+
+	// Which keys a read covers and how it is answered.
+	struct GetOptions {
+		// Every key that starts with the key given.
+		prefix            bool       = false
+		// Every key from the key given up to, not including, this one; ""
+		// for the key alone (unless prefix or fromKey is set).
+		end               string     = ""
+		// Every key from the key given on.
+		fromKey           bool       = false
+		// The revision to read at; 0 for the latest.
+		revision          int        = 0
+		// At most this many keys; 0 for all.
+		limit             int        = 0
+		sortBy            SortTarget = SortTarget.Key
+		order             SortOrder  = SortOrder.None
+		// Leave the values out.
+		keysOnly          bool       = false
+		// Count the keys instead of returning them.
+		countOnly         bool       = false
+		// Answer from the member asked, without asking the leader: faster,
+		// and possibly behind the latest revision.
+		serializable      bool       = false
+		// Only keys last changed at or after (at or before) this revision;
+		// 0 for no bound.
+		minModRevision    int        = 0
+		maxModRevision    int        = 0
+		// Only keys created at or after (at or before) this revision; 0 for
+		// no bound.
+		minCreateRevision int        = 0
+		maxCreateRevision int        = 0
+	}
+
+	// The answer to a range read.
+	struct RangeResult {
+		kvs      KeyValue[]
+		// More keys matched than the limit let through.
+		more     bool
+		// How many keys matched, the limit aside.
+		count    int
+		// The store's revision when the read was served.
+		revision int
+	}
+
+	// The answer to a put.
+	struct PutResult {
+		// The revision the put made.
+		revision int
+		// The key as it was before, when asked for and it existed.
+		previous ?KeyValue
+	}
+
+	// The answer to a delete.
+	struct DeleteResult {
+		deleted  int
+		// The revision the delete made (the current one when nothing was
+		// deleted).
+		revision int
+		// The keys as they were, when asked for.
+		previous KeyValue[]
+	}
+
+	// Reads and writes of keys. Each fails with an EtcdError: Connection
+	// when no endpoint answers, TimedOut past the timeout, Denied when the
+	// user may not, Compacted for a revision compacted away.
+	partial type Client {
+		// The value of key as text; none when the key does not exist. Fails
+		// as every read does.
+		def get(key string, options GetOptions = GetOptions{}) !?string {
+			let kv = try entry(key, options)
+			return none when kv is none
+			return kv.value
+		}
+
+		// The key with its value and revisions; none when it does not
+		// exist. With a prefix or range in options, the first key of it.
+		// Fails as every read does.
+		def entry(key string, options GetOptions = GetOptions{}) !?KeyValue {
+			let o = options
+			o.limit = 1 when o.limit == 0
+			let r = try range(key, o)
+			return none when r.kvs.len() == 0
+			return r.kvs[0]
+		}
+
+		// Every key that starts with prefix, in key order unless options
+		// sort otherwise. Fails as every read does.
+		def getPrefix(prefix string, options GetOptions = GetOptions{}) !KeyValue[] {
+			let o = options
+			o.prefix = true
+			return (try range(prefix, o)).kvs
+		}
+
+		// How many keys the read covers. Fails as every read does.
+		def count(key string, options GetOptions = GetOptions{}) !int {
+			let o = options
+			o.countOnly = true
+			return (try range(key, o)).count
+		}
+
+		// The keys options cover, from key on. Fails as every read does.
+		def range(key string, options GetOptions = GetOptions{}) !RangeResult {
+			let reply = new RangeResponse()
+			try link.call("/etcdserverpb.KV/Range", rangeRequest(key, options), reply, true)
+			return rangeResultOf(reply)
+		}
+
+		// Sets key to value. With a lease the key goes when the lease does;
+		// previous asks for the key as it was; ignoreLease keeps the lease
+		// the key has. Fails with Argument for the empty key, LeaseExpired
+		// for a lease that is gone, TooLarge for a value over the server's
+		// request limit.
+		def put(key string, value string, lease ?Lease = none, previous bool = false, ignoreLease bool = false) !PutResult {
+			return try put(key, value.bytes(), lease, previous, ignoreLease)
+		}
+
+		// Sets key to the bytes, and fails, as the text form does.
+		def put(key string, value byte[], lease ?Lease = none, previous bool = false, ignoreLease bool = false) !PutResult {
+			let request = PutRequest{key: try keyBytes(key), value: value, lease: leaseId(lease), prevKv: previous, ignoreLease: ignoreLease}
+			let reply = new PutResponse()
+			try link.call("/etcdserverpb.KV/Put", request, reply, false)
+			return putResultOf(reply)
+		}
+
+		// Attaches key to lease, or to none, keeping its value. Fails with
+		// NotFound when the key does not exist.
+		def setLease(key string, lease ?Lease) !PutResult {
+			let request = PutRequest{key: try keyBytes(key), lease: leaseId(lease), ignoreValue: true}
+			let reply = new PutResponse()
+			try link.call("/etcdserverpb.KV/Put", request, reply, false)
+			return putResultOf(reply)
+		}
+
+		// Deletes key, or the keys from it up to end. previous asks for
+		// the keys as they were. Fails with Argument for the empty key.
+		def delete(key string, end string = "", previous bool = false) !DeleteResult {
+			let request = DeleteRangeRequest{key: try keyBytes(key), rangeEnd: end.bytes(), prevKv: previous}
+			let reply = new DeleteRangeResponse()
+			try link.call("/etcdserverpb.KV/DeleteRange", request, reply, false)
+			return deleteResultOf(reply)
+		}
+
+		// Deletes every key that starts with prefix; the empty prefix
+		// deletes every key. Fails as every write does.
+		def deletePrefix(prefix string, previous bool = false) !DeleteResult {
+			let request = DeleteRangeRequest{key: emptyKeyAll(prefix), rangeEnd: rangeEndOf(prefix.bytes()), prevKv: previous}
+			let reply = new DeleteRangeResponse()
+			try link.call("/etcdserverpb.KV/DeleteRange", request, reply, false)
+			return deleteResultOf(reply)
+		}
+
+		// Drops the history before revision: reads and watches at older
+		// revisions fail with Compacted afterwards. physical waits until
+		// the space is reclaimed.
+		def compact(revision int, physical bool = false) !none {
+			try link.call("/etcdserverpb.KV/Compact", CompactionRequest{revision: revision, physical: physical}, new HeaderOnly(), false)
+			return none
+		}
+	}
+
+	// The key's bytes. Fails with Argument for the empty key, which etcd
+	// does not store.
+	internal def keyBytes(key string) !byte[] {
+		fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: the key is empty") when key == ""
+		return key.bytes()
+	}
+
+	// The key bytes of a prefix: the empty prefix is the NUL key, the
+	// start of every key.
+	internal def emptyKeyAll(prefix string) byte[] {
+		return [byte(0)] when prefix == ""
+		return prefix.bytes()
+	}
+
+	internal def rangeEndOf(prefix byte[]) byte[] {
+		let end = prefix.clone()
+		for let i = end.len() - 1; i >= 0; i-- {
+			if end[i] < byte(0xFF) {
+				end[i] = end[i] + byte(1)
+				end.len(i + 1)
+				return end
+			}
+		}
+		// Every byte is 0xFF, or there is none: to the end of the keys.
+		return [byte(0)]
+	}
+
+	internal def rangeRequest(key string, o GetOptions) RangeRequest {
+		let r = RangeRequest{key: key.bytes(), limit: o.limit, revision: o.revision, sortOrder: int32(o.order.value), sortTarget: int32(o.sortBy.value), serializable: o.serializable, keysOnly: o.keysOnly, countOnly: o.countOnly, minModRevision: o.minModRevision, maxModRevision: o.maxModRevision, minCreateRevision: o.minCreateRevision, maxCreateRevision: o.maxCreateRevision}
+		if o.prefix {
+			r.key = emptyKeyAll(key)
+			r.rangeEnd = rangeEndOf(key.bytes())
+		} else if o.fromKey {
+			r.key = emptyKeyAll(key)
+			r.rangeEnd = [byte(0)]
+		} else if o.end != "" {
+			r.rangeEnd = o.end.bytes()
+		}
+		return r
+	}
+
+	internal def leaseId(lease ?Lease) int {
+		return 0 when lease is none
+		return lease.id
+	}
+
+	internal def kvOf(m KeyValueMsg) KeyValue {
+		return KeyValue{key: string(m.key), data: m.value, createRevision: m.createRevision, modRevision: m.modRevision, version: m.version, lease: m.lease}
+	}
+
+	internal def maybeKv(m ?KeyValueMsg) ?KeyValue {
+		return none when m is none
+		return kvOf(m)
+	}
+
+	internal def kvsOf(ms KeyValueMsg[]) KeyValue[] {
+		let out KeyValue[] = []
+		for let m in ms {
+			out.push(kvOf(m))
+		}
+		return out
+	}
+
+	internal def rangeResultOf(r RangeResponse) RangeResult {
+		return RangeResult{kvs: kvsOf(r.kvs), more: r.more, count: r.count, revision: r.header.revision}
+	}
+
+	internal def putResultOf(r PutResponse) PutResult {
+		return PutResult{revision: r.header.revision, previous: maybeKv(r.prevKv)}
+	}
+
+	internal def deleteResultOf(r DeleteRangeResponse) DeleteResult {
+		return DeleteResult{deleted: r.deleted, revision: r.header.revision, previous: kvsOf(r.prevKvs)}
+	}
+}

@@ -1,3 +1,316 @@
+// An etcd v3 client over std.net.grpc: key-value (range, put, delete,
+// transactions, compaction), watches, leases kept alive in the background,
+// locks and elections, the cluster and maintenance calls, authentication
+// and its users and roles. Calls go to the endpoints in turn; an endpoint
+// that cannot be reached is skipped for a while and the call goes to the
+// next one.
+//
+//     let cluster = try etcd.connect("http://127.0.0.1:2379")
+//     try cluster.put("/config/theme", "dark")
+//     let theme = try cluster.get("/config/theme")      // ?string
 partial module adm.network.etcd {
-	// etcd v3 over std.net.grpc: key-value (range, put, delete, transactions), watch, leases with keep-alive, locks and elections, authentication, endpoints with failover, TLS and client certificates
+	use (
+		std.time
+		std.net.grpc
+		std.net.tls
+		std.net.url
+		adm.network.etcd.wire::*
+	)
+
+	// How a Client connects.
+	struct Config {
+		// The members to talk to: `http://host:port`, `https://host:port`,
+		// or `host:port` (http, or https when tlsConfig is set). A user and
+		// password in a URL (`https://user:secret@host:2379`) sign in as
+		// username and password do.
+		endpoints      string[]
+		// The user to authenticate as; "" sends requests without a token.
+		username       string      = ""
+		password       string      = ""
+		// TLS for https endpoints: the roots to trust, the client
+		// certificate (`certificates`), the server name. None trusts the
+		// system roots.
+		tlsConfig      ?tls.Config = none
+		// How long connecting to one endpoint may take.
+		dialTimeout    duration    = 5s
+		// How long one request may take; 0s for no limit. Locks and
+		// campaigns wait as long as they need, unless given a timeout.
+		timeout        duration    = 15s
+		// How long an endpoint that could not be reached is passed over.
+		retryDown      duration    = 5s
+		// The largest response taken; a larger one fails the call.
+		maxReceiveSize int         = 2147483647
+	}
+
+	// A client of the cluster at the endpoints, one URL or `host:port`
+	// each. Signs in when an endpoint URL carries a user and password.
+	// Fails when an endpoint is not a URL, or signing in fails.
+	def connect(endpoints ...string) !Client {
+		return try connect(Config{endpoints: endpoints})
+	}
+
+	// A client as config says. Nothing is dialled until the first call,
+	// except to sign in when config names a user. Fails when there is no
+	// endpoint, one is not a URL, or signing in fails.
+	def connect(config Config) !Client {
+		let client = new Client(config)
+		try client.link.open()
+		return client
+	}
+
+	// A connection to an etcd cluster, shared by any number of tasks.
+	partial type Client {
+		internal link Transport
+
+		def new(config Config) {
+			self.link = new Transport(config)
+		}
+
+		// The endpoints, as URLs.
+		def endpoints() string[] {
+			let out string[] = []
+			for let e in link.members {
+				out.push(e.address)
+			}
+			return out
+		}
+
+		// The client as `etcd.Client(endpoints)`.
+		def str() string {
+			return "etcd.Client({endpoints().join(", ")})"
+		}
+
+		// Stops the keep-alive of every lease and closes the connections.
+		// Leases are left to expire; revoke them first to end them now.
+		// Never fails: closing a connection that already broke is no error.
+		def close() !none {
+			link.closed = true
+			link.keeper.stop()
+			for let e in link.members {
+				e.rpc.close() onerror recover none
+			}
+			return none
+		}
+	}
+
+	// The endpoints, the token and the calls on them.
+	internal type Transport {
+		config        Config
+		members       Endpoint[] = []
+		atomic turn   int        = 0
+		atomic token  string     = ""
+		atomic closed bool       = false
+		// Keeps the leases granted with keep-alive.
+		keeper        Keeper
+
+		def new(config Config) {
+			self.config = config
+			self.keeper = new Keeper(self)
+		}
+
+		def open() !none {
+			fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: no endpoint given") when config.endpoints.len() == 0
+			for let text in config.endpoints {
+				let address = text.contains("://") ?? (text, (config.tlsConfig is none ?? ("http://", "https://")) + text)
+				let u = url.parse(address) onerror (err error) {
+					fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: endpoint {text} is not a URL: {err.message}")
+				}
+				fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: endpoint {text} is neither http nor https") unless u.scheme.lower() := "http" || "https"
+				fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: endpoint {text} has no host") when u.hostname() == ""
+				let who = u.user
+				if !(who is none) && config.username == "" {
+					config.username = who.username
+					let secret = who.password
+					config.password = secret is none ?? ("", secret)
+				}
+				let plain = "{u.scheme.lower()}://{u.host.lower()}"
+				let rpc = new grpc.Client(plain)
+				rpc.tlsConfig = config.tlsConfig
+				rpc.dialTimeout = config.dialTimeout
+				rpc.maxReceiveSize = config.maxReceiveSize
+				rpc.userAgent = "adm-etcd/0.1"
+				members.push(new Endpoint(plain, rpc))
+			}
+			try authenticate() when config.username != ""
+			return none
+		}
+
+		// Signs in and keeps the token for the requests that follow. Fails
+		// with an EtcdError.
+		def authenticate() !none {
+			let reply = new AuthenticateResponse()
+			let request = AuthenticateRequest{name: config.username, password: config.password}
+			exchange("/etcdserverpb.Auth/Authenticate", request, reply, repeatable = true, signed = false, at = -1) onerror (err error) {
+				// A cluster without authentication takes requests without a
+				// token, as etcd's own client does.
+				if err.message.contains("authentication is not enabled") {
+					token = ""
+					return none
+				}
+				fail failureOf(err)
+			}
+			token = reply.token
+			return none
+		}
+
+		// The endpoints in the order a call tries them: from the next in
+		// turn, those passed over for failing last.
+		def order() int[] {
+			let n = members.len()
+			let start = nextTurn() % n
+			let up int[] = []
+			let down int[] = []
+			let now = time.now()
+			for let i = 0; i < n; i++ {
+				let k = (start + i) % n
+				if members[k].isDown(now) {
+					down.push(k)
+				} else {
+					up.push(k)
+				}
+			}
+			return up + down
+		}
+
+		atomic def nextTurn() int {
+			let t = turn
+			turn = t + 1 when t < 1000000000
+			turn = 0 unless t < 1000000000
+			return t
+		}
+
+		// The metadata of a call: the token, when signed in.
+		def metadata(signed bool) ?grpc.Metadata {
+			let t = token
+			return none when !signed || t == ""
+			let md = new grpc.Metadata()
+			md.add("token", t) onerror recover none
+			return md
+		}
+
+		// A unary call with failover. A repeatable call (one that changes
+		// nothing) goes to the next endpoint after any Unavailable failure;
+		// another only when it failed before reaching a server. A refused
+		// token is renewed once. `at` pins the call to one endpoint (-1:
+		// any); `wait` overrides the timeout (-1s: the configured one).
+		// Fails with an EtcdError.
+		def call(method string, request any, response any, repeatable bool, at int = -1, wait duration = -1s) !none {
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the client is closed") when closed
+			let renewed = false
+			for {
+				exchange(method, request, response, repeatable, true, at, wait) onerror (err error) {
+					if staleToken(err) && !renewed && config.username != "" {
+						renewed = true
+						authenticate() onerror (again error) {
+							fail failureOf(again)
+						}
+						continue
+					}
+					fail failureOf(err)
+				}
+				return none
+			}
+			return none
+		}
+
+		// One attempt at a call on each endpoint in turn, as call says.
+		// Fails with the last grpc.Status.
+		def exchange(method string, request any, response any, repeatable bool, signed bool, at int, wait duration = -1s) !none {
+			let options = grpc.CallOptions{metadata: metadata(signed), timeout: wait < 0s ?? (config.timeout, wait)}
+			let targets = at >= 0 ?? ([at], order())
+			let last error = grpc.errorOf(grpc.Code.Unavailable, "etcd: no endpoint answered")
+			for let k in targets {
+				let e = members[k]
+				let s = e.rpc.stream(method, options) onerror (err error) {
+					e.markDown(config.retryDown)
+					last = err
+					continue
+				}
+				unaryOn(s, request, response) onerror (err error) {
+					if unavailable(err) && repeatable {
+						e.markDown(config.retryDown) unless err.cause is none
+						last = err
+						continue
+					}
+					fail err
+				}
+				return none
+			}
+			fail last
+		}
+
+		// The endpoint a stream should open on, with the stream: the next in
+		// turn that answers. Fails with an EtcdError when none does.
+		def openStream(method string, at int = -1, wait duration = 0s) !grpc.ClientStream {
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the client is closed") when closed
+			let options = grpc.CallOptions{metadata: metadata(true), timeout: wait}
+			let targets = at >= 0 ?? ([at], order())
+			let last error = grpc.errorOf(grpc.Code.Unavailable, "etcd: no endpoint answered")
+			for let k in targets {
+				let e = members[k]
+				let s = e.rpc.stream(method, options) onerror (err error) {
+					e.markDown(config.retryDown)
+					last = err
+					continue
+				}
+				return s
+			}
+			fail failureOf(last)
+		}
+
+		// Renews the token after a stream was refused for it; false when
+		// the failure was something else or renewing fails.
+		def renewAfter(err error) bool {
+			return false unless staleToken(err) && config.username != ""
+			let ok = true
+			authenticate() onerror (again error) {
+				ok = false
+				recover none
+			}
+			return ok
+		}
+
+		// The index of the endpoint at address, as endpoints() lists it.
+		def indexOf(address string) !int {
+			return -1 when address == ""
+			let want = address.contains("://") ?? (address, (config.tlsConfig is none ?? ("http://", "https://")) + address)
+			for let (i, e) in members {
+				return i when e.address == want || e.address == want.trimEnd("/")
+			}
+			fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: {address} is not one of the endpoints")
+		}
+	}
+
+	// One member the client talks to.
+	internal type Endpoint {
+		address      string
+		rpc          grpc.Client
+		atomic until ?time.Time  = none
+
+		def new(address string, rpc grpc.Client) {
+			self.address = address
+			self.rpc = rpc
+		}
+
+		atomic def markDown(pause duration) {
+			until = time.now() + pause
+		}
+
+		atomic def isDown(now time.Time) bool {
+			let u = until
+			return !(u is none) && now.before(u)
+		}
+	}
+
+	// Sends one request on a fresh stream and reads its one response.
+	// Fails with a grpc.Status.
+	internal def unaryOn(s grpc.ClientStream, request any, response any) !none {
+		try s.send(request)
+		try s.closeSend()
+		let got = try s.receive(response)
+		fail grpc.errorOf(grpc.Code.Internal, "etcd: the call ended without a response") unless got
+		let extra = s.receive(new Empty()) onerror recover false
+		fail grpc.errorOf(grpc.Code.Internal, "etcd: the call answered with more than one response") when extra
+		return none
+	}
 }

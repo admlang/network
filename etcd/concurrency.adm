@@ -1,0 +1,268 @@
+// Locks and elections through etcd's v3lock and v3election services: the
+// server keeps the waiting order, and a holder that goes away loses the
+// lock or the leadership when its lease expires.
+partial module adm.network.etcd {
+	use (
+		std.time
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// A held lock. The lock lasts as long as its key, which lives on the
+	// lease: unlock it, or let the lease expire.
+	type Lock {
+		// The lock's name, as given to Client.lock.
+		name              string
+		// The key that holds the lock; the waiters' keys sort after it.
+		key               string
+		lease             Lease
+		internal link     Transport
+		internal ownLease bool
+
+		def new(link Transport, name string, key string, lease Lease, ownLease bool) {
+			self.link = link
+			self.name = name
+			self.key = key
+			self.lease = lease
+			self.ownLease = ownLease
+		}
+
+		// The lock as `etcd.Lock(name)`.
+		def str() string {
+			return "etcd.Lock({name})"
+		}
+
+		// Releases the lock, and revokes the lease when Client.lock granted
+		// it. Fails with an EtcdError.
+		def unlock() !none {
+			try link.call("/v3lockpb.Lock/Unlock", UnlockRequest{key: key.bytes()}, new HeaderOnly(), false)
+			try lease.revoke() when ownLease
+			return none
+		}
+	}
+
+	// An election: one candidate at a time leads, the others wait their
+	// turn in the order they campaigned.
+	type Election {
+		name          string
+		internal link Transport
+
+		def new(link Transport, name string) {
+			self.link = link
+			self.name = name
+		}
+
+		// Waits until this candidate leads, then announces value. Without a
+		// lease one of 60 seconds is granted and kept alive, and resign
+		// revokes it. timeout bounds the wait (0s: as long as it takes).
+		// Fails with an EtcdError: TimedOut when the timeout passes,
+		// LeaseExpired when the lease runs out first.
+		def campaign(value string, lease ?Lease = none, timeout duration = 0s) !Leadership {
+			let (held, own) = try leaseFor(link, lease)
+			let reply = new CampaignResponse()
+			link.call("/v3electionpb.Election/Campaign", CampaignRequest{name: name.bytes(), lease: held.id, value: value.bytes()}, reply, false, -1, timeout) onerror (err error) {
+				if own {
+					held.revoke() onerror recover none
+				}
+				fail err
+			}
+			let leader = reply.leader
+			fail etcdError(ErrorKind.Server, grpc.Code.Internal, "etcd: the campaign was answered without a leader key") when leader is none
+			return new Leadership(link, name, string(leader.key), leader.rev, held, own)
+		}
+
+		// The current leader's key and value; none when nobody leads. Fails
+		// when no endpoint answers.
+		def leader() !?KeyValue {
+			let reply = new LeaderResponse()
+			link.call("/v3electionpb.Election/Leader", LeaderRequest{name: name.bytes()}, reply, true) onerror (err error) {
+				return none when err.message.contains("no leader")
+				fail err
+			}
+			return maybeKv(reply.kv)
+		}
+
+		// Each leader in turn, and each value a leader proclaims, starting
+		// with the current one. Fails when no endpoint answers.
+		def observe() !Observation {
+			let o = new Observation(link, name)
+			try observeStream(o)
+			return o
+		}
+	}
+
+	// Leading an election, until resign or the lease runs out.
+	type Leadership {
+		// The election's name.
+		name              string
+		// The key that holds the leadership.
+		key               string
+		// The revision that created the key.
+		revision          int
+		lease             Lease
+		internal link     Transport
+		internal ownLease bool
+
+		def new(link Transport, name string, key string, revision int, lease Lease, ownLease bool) {
+			self.link = link
+			self.name = name
+			self.key = key
+			self.revision = revision
+			self.lease = lease
+			self.ownLease = ownLease
+		}
+
+		// Announces a new value without giving up the leadership. Fails
+		// with an EtcdError: NotFound when this side no longer leads.
+		def proclaim(value string) !none {
+			try link.call("/v3electionpb.Election/Proclaim", ProclaimRequest{leader: leaderKey(self), value: value.bytes()}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Gives up the leadership; the next candidate leads. Revokes the
+		// lease when campaign granted it. Fails with an EtcdError.
+		def resign() !none {
+			try link.call("/v3electionpb.Election/Resign", ResignRequest{leader: leaderKey(self)}, new HeaderOnly(), false)
+			try lease.revoke() when ownLease
+			return none
+		}
+	}
+
+	// The leaders of an election as they change. A `for` loop takes them
+	// one at a time; after a broken connection the current leader comes
+	// again only when it changed meanwhile.
+	type Observation {
+		internal link    Transport
+		internal name    string
+		internal current ?grpc.ClientStream = none
+		internal lastKey string             = ""
+		internal lastRev int                = 0
+		internal failed  ?error             = none
+		atomic closed    bool               = false
+
+		def new(link Transport, name string) {
+			self.link = link
+			self.name = name
+		}
+
+		// Implements Iterator<KeyValue>: the next leader or value, waiting
+		// for it; none when closed or failed (`close` says why).
+		def iterate() ?KeyValue {
+			let kv = next() onerror (err error) {
+				failed = err
+				return none
+			}
+			return kv
+		}
+
+		// The next leader or proclaimed value; none once closed. Fails with
+		// an EtcdError.
+		def next() !?KeyValue {
+			let backoff = 100ms
+			for !closed && !link.closed {
+				let s = observeStream(self) onerror (err error) {
+					fail err unless retryable(err)
+					time.sleep(backoff)
+					backoff = backoff + backoff when backoff < 5s
+					continue
+				}
+				let reply = new LeaderResponse()
+				let got = s.receive(reply) onerror (err error) {
+					dropObserve(self)
+					return none when closed
+					fail failureOf(err) unless retryable(err) || link.renewAfter(err)
+					time.sleep(backoff)
+					backoff = backoff + backoff when backoff < 5s
+					recover false
+				}
+				if !got {
+					dropObserve(self)
+					continue
+				}
+				let m = reply.kv
+				continue when m is none
+				let kv = kvOf(m)
+				continue when kv.key == lastKey && kv.modRevision <= lastRev
+				lastKey = kv.key
+				lastRev = kv.modRevision
+				return kv
+			}
+			return none
+		}
+
+		// Stops observing. Fails with the error that ended it before, if
+		// one did.
+		def close() !none {
+			closed = true
+			dropObserve(self)
+			let f = failed
+			fail f unless f is none
+			return none
+		}
+	}
+
+	partial type Client {
+		// Waits for the lock called name and holds it. The lock lives on
+		// lease; without one a lease of 60 seconds is granted and kept
+		// alive, and unlock revokes it. timeout bounds the wait (0s: as
+		// long as it takes). Fails with an EtcdError: TimedOut when the
+		// timeout passes, LeaseExpired when the lease runs out first.
+		def lock(name string, lease ?Lease = none, timeout duration = 0s) !Lock {
+			let (held, own) = try leaseFor(link, lease)
+			let reply = new LockResponse()
+			link.call("/v3lockpb.Lock/Lock", LockRequest{name: name.bytes(), lease: held.id}, reply, false, -1, timeout) onerror (err error) {
+				if own {
+					held.revoke() onerror recover none
+				}
+				fail err
+			}
+			return new Lock(link, name, string(reply.key), held, own)
+		}
+
+		// The election called name.
+		def election(name string) Election {
+			return new Election(link, name)
+		}
+	}
+
+	// The lease a lock or a campaign lives on: the one given, or a new one
+	// kept alive, with true for a new one.
+	internal def leaseFor(link Transport, lease ?Lease) !(Lease, bool) {
+		return (lease, false) unless lease is none
+		let reply = new LeaseGrantResponse()
+		try link.call("/etcdserverpb.Lease/LeaseGrant", LeaseGrantRequest{ttl: 60}, reply, false)
+		fail etcdError(ErrorKind.Server, grpc.Code.Unknown, "etcd: {reply.problem}") when reply.problem != ""
+		let made = new Lease(link, reply.id, seconds(reply.ttl), true)
+		renewed(made, time.now(), reply.ttl)
+		link.keeper.add(made)
+		return (made, true)
+	}
+
+	internal def leaderKey(l Leadership) LeaderKeyMsg {
+		return LeaderKeyMsg{name: l.name.bytes(), key: l.key.bytes(), rev: l.revision, lease: l.lease.id}
+	}
+
+	internal def observeStream(o Observation) !grpc.ClientStream {
+		let have = o.current
+		return have unless have is none
+		let s = try o.link.openStream("/v3electionpb.Election/Observe")
+		askLeader(s, o.name) onerror (err error) {
+			s.cancel()
+			fail failureOf(err)
+		}
+		o.current = s
+		return s
+	}
+
+	internal def askLeader(s grpc.ClientStream, name string) !none {
+		try s.send(LeaderRequest{name: name.bytes()})
+		try s.closeSend()
+		return none
+	}
+
+	internal def dropObserve(o Observation) {
+		let s = o.current
+		o.current = none
+		s.cancel() unless s is none
+	}
+}

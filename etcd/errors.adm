@@ -1,0 +1,95 @@
+partial module adm.network.etcd {
+	use (
+		std.errors
+		std.net.grpc
+	)
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is EtcdError`.
+	enum ErrorKind {
+		// No endpoint can be reached, the connection broke, the cluster has
+		// no leader, or the client was closed.
+		Connection   = "connection",
+		// The request did not finish within its timeout.
+		TimedOut     = "timeout",
+		// The user name or password is wrong, the token is refused, or the
+		// user may not do this.
+		Denied       = "denied",
+		// The user, role, member or key named does not exist.
+		NotFound     = "notfound",
+		// The revision asked for has been compacted away.
+		Compacted    = "compacted",
+		// The lease does not exist any more: it expired or was revoked.
+		LeaseExpired = "leaseexpired",
+		// The request is larger than the server takes (1.5 MiB by default),
+		// or the database is out of space.
+		TooLarge     = "toolarge",
+		// An argument the server or this client does not take: an empty
+		// key, a lease of the wrong client, a negative revision.
+		Argument     = "argument",
+		// Any other refusal of the server.
+		Server       = "server",
+	}
+
+	// EtcdError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct EtcdError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorKind
+		// The gRPC status the call ended with; Unavailable when the
+		// failure happened on this side of the connection.
+		status  grpc.Code
+	}
+
+	internal def etcdError(kind ErrorKind, status grpc.Code, message string, cause ?error = none) EtcdError {
+		return EtcdError{message: message, code: kind.value, cause: cause, kind: kind, status: status}
+	}
+
+	// The EtcdError of a failed call: the kind follows the status and the
+	// server's message (rpctypes in etcd).
+	internal def failureOf(err error) EtcdError {
+		return err when err is EtcdError
+		return etcdError(ErrorKind.Server, grpc.Code.Unknown, "etcd: {err.message}", err) unless err is grpc.Status
+		let text = err.message
+		let kind = ErrorKind.Server
+		switch {
+			case text.contains("required revision has been compacted"):
+				kind = ErrorKind.Compacted
+			case text.contains("requested lease not found"):
+				kind = ErrorKind.LeaseExpired
+			case text.contains("request is too large") || text.contains("database space exceeded"):
+				kind = ErrorKind.TooLarge
+			case text.contains("not found") || text.contains("does not exist") || err.kind == grpc.Code.NotFound:
+				kind = ErrorKind.NotFound
+			// "user name is empty": a request without a token to a cluster
+			// that checks users.
+			case text.contains("authentication failed") || text.contains("invalid auth token") || text.contains("user name is empty") || err.kind == grpc.Code.PermissionDenied || err.kind == grpc.Code.Unauthenticated:
+				kind = ErrorKind.Denied
+			case text.contains("request timed out") || err.kind == grpc.Code.DeadlineExceeded:
+				kind = ErrorKind.TimedOut
+			case err.kind == grpc.Code.InvalidArgument || err.kind == grpc.Code.OutOfRange:
+				kind = ErrorKind.Argument
+			case err.kind == grpc.Code.Unavailable || err.kind == grpc.Code.Cancelled:
+				kind = ErrorKind.Connection
+		}
+		let message = text.startsWith("etcdserver: ") ?? ("etcd: " + text.slice(12), text.startsWith("grpc: ") ?? ("etcd: " + text.slice(6), "etcd: " + text))
+		return etcdError(kind, err.kind, message, err)
+	}
+
+	// Reports whether the server refused the token: it expired, or the
+	// auth store changed since it was issued. Authenticating again helps.
+	internal def staleToken(err error) bool {
+		return false unless err is grpc.Status
+		return err.message.contains("invalid auth token") || err.message.contains("revision of auth store is old")
+	}
+
+	// Reports whether a call failed before the server could have acted on
+	// it, or the server answered that it cannot serve now (no leader,
+	// stopping): another endpoint may.
+	internal def unavailable(err error) bool {
+		return err is grpc.Status && err.kind == grpc.Code.Unavailable
+	}
+}

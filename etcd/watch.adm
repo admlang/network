@@ -1,0 +1,256 @@
+partial module adm.network.etcd {
+	use (
+		std.time
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// What happened to a key.
+	enum EventKind {
+		Put,
+		Delete,
+	}
+
+	// One change a watch saw.
+	struct WatchEvent {
+		kind     EventKind
+		key      string
+		// The key after the change; a Delete carries only the key and the
+		// revision of the delete (`modRevision`).
+		kv       KeyValue
+		// The key before the change, when the watch asked for it and the
+		// key existed.
+		previous ?KeyValue = none
+	}
+
+	// One answer of the server to a watch: the events of one or more
+	// revisions, or a progress notification.
+	struct WatchBatch {
+		// Every change up to this revision has been delivered.
+		revision int
+		events   WatchEvent[]
+		// A progress notification: no events, only the revision.
+		progress bool         = false
+	}
+
+	// The changes to a key, a prefix or a range, from a revision on, in the
+	// order they happened. A `for` loop takes them one at a time. When the
+	// connection breaks the watch goes on from the next revision on
+	// another endpoint, so no change is lost or repeated.
+	//
+	//     let watch = try cluster.watch("/config/", prefix = true)
+	//     for let event in watch {
+	//         print("{event.kind} {event.key}")
+	//     }
+	type Watch {
+		internal link     Transport
+		internal template WatchCreateRequest
+		internal current  ?grpc.ClientStream = none
+		internal watchId  int                = 0
+		// The revision the watch resumes from; 0 before it was created.
+		internal nextRev  int                = 0
+		internal pending  WatchEvent[]       = []
+		internal taken    int                = 0
+		internal parts    EventMsg[]         = []
+		internal failed   ?error             = none
+		atomic closed     bool               = false
+
+		def new(link Transport, template WatchCreateRequest) {
+			self.link = link
+			self.template = template
+			self.nextRev = template.startRevision
+		}
+
+		// Implements Iterator<WatchEvent>: the next change, waiting for
+		// one; none when the watch is closed or fails (`close` says why).
+		def iterate() ?WatchEvent {
+			let event = next() onerror (err error) {
+				failed = err
+				return none
+			}
+			return event
+		}
+
+		// The next change, waiting for it; none once the watch is closed.
+		// Fails with an EtcdError: Compacted when the revision to go on from
+		// was compacted away, Denied when the user may no longer read the
+		// keys.
+		def next() !?WatchEvent {
+			for taken >= pending.len() {
+				let b = try batch()
+				return none when b is none
+				pending = b.events
+				taken = 0
+			}
+			taken++
+			return pending[taken - 1]
+		}
+
+		// The next answer of the server: events, or a progress notification
+		// when the watch asked for them. None once the watch is closed.
+		// Fails as next does.
+		def batch() !?WatchBatch {
+			let backoff = 100ms
+			for !closed && !link.closed {
+				let s = watchStream(self) onerror (err error) {
+					fail err unless retryable(err)
+					time.sleep(backoff)
+					backoff = backoff + backoff when backoff < 5s
+					continue
+				}
+				let reply = new WatchResponse()
+				let got = s.receive(reply) onerror (err error) {
+					dropStream(self)
+					return none when closed
+					fail failureOf(err) unless retryable(err) || link.renewAfter(err)
+					time.sleep(backoff)
+					backoff = backoff + backoff when backoff < 5s
+					recover false
+				}
+				if !got {
+					dropStream(self)
+					continue
+				}
+				backoff = 100ms
+				if reply.canceled {
+					dropStream(self)
+					closed = true
+					fail canceledFailure(reply)
+				}
+				continue when reply.created
+				if reply.fragment {
+					parts += reply.events
+					continue
+				}
+				let events = parts + reply.events
+				parts = []
+				if events.len() == 0 {
+					nextRev = reply.header.revision + 1
+					return WatchBatch{revision: reply.header.revision, events: [], progress: true}
+				}
+				let out WatchEvent[] = []
+				for let e in events {
+					out.push(eventOf(e))
+				}
+				let last = events[events.len() - 1].kv
+				nextRev = last.modRevision + 1 unless last is none
+				return WatchBatch{revision: reply.header.revision, events: out}
+			}
+			return none
+		}
+
+		// Asks the server for a progress notification, which batch returns
+		// once every change up to the current revision was delivered.
+		// Fails when the stream fails.
+		def requestProgress() !none {
+			let s = try watchStream(self)
+			s.send(WatchRequest{progress: Empty{}}) onerror (err error) {
+				fail failureOf(err)
+			}
+			return none
+		}
+
+		// The revision up to which every change has been delivered.
+		def revision() int {
+			return nextRev - 1
+		}
+
+		// Ends the watch. Fails with the error that ended it before, if one
+		// did.
+		def close() !none {
+			let s = current
+			closed = true
+			if !(s is none) {
+				s.send(WatchRequest{cancel: WatchCancelRequest{watchId: watchId}}) onerror recover none
+				s.closeSend() onerror recover none
+				s.cancel()
+			}
+			let f = failed
+			fail f unless f is none
+			return none
+		}
+	}
+
+	partial type Client {
+		// Watches key; with prefix every key that starts with it, with end
+		// the keys from key up to end. revision starts from that revision
+		// (older changes included, 0: from now on); previous adds each
+		// key's value before the change; progress asks for a progress
+		// notification while nothing changes (every ten minutes by
+		// default); skipPuts and skipDeletes leave those events out.
+		// Fails with an EtcdError: Compacted for a revision compacted away.
+		def watch(key string, prefix bool = false, end string = "", revision int = 0, previous bool = false, progress bool = false, skipPuts bool = false, skipDeletes bool = false) !Watch {
+			let request = WatchCreateRequest{key: key.bytes(), rangeEnd: end.bytes(), startRevision: revision, progressNotify: progress, prevKv: previous, fragment: true}
+			if prefix {
+				request.key = emptyKeyAll(key)
+				request.rangeEnd = rangeEndOf(key.bytes())
+			}
+			request.filters.push(int32(0)) when skipPuts
+			request.filters.push(int32(1)) when skipDeletes
+			let w = new Watch(link, request)
+			try watchStream(w)
+			return w
+		}
+	}
+
+	// The stream the watch reads, opened and the watch created on it
+	// when there is none. Fails with an EtcdError.
+	internal def watchStream(w Watch) !grpc.ClientStream {
+		let have = w.current
+		return have unless have is none
+		let s = try w.link.openStream("/etcdserverpb.Watch/Watch")
+		let create = w.template
+		create.startRevision = w.nextRev
+		let reply = new WatchResponse()
+		let got = createOn(s, create, reply) onerror (err error) {
+			s.cancel()
+			fail failureOf(err) unless w.link.renewAfter(err)
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the watch stream ended before the watch was created")
+		}
+		if !got {
+			s.cancel()
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the watch stream ended before the watch was created")
+		}
+		if reply.canceled {
+			s.cancel()
+			w.closed = true
+			fail canceledFailure(reply)
+		}
+		w.watchId = reply.watchId
+		w.nextRev = reply.header.revision + 1 when w.nextRev == 0
+		w.current = s
+		return s
+	}
+
+	internal def dropStream(w Watch) {
+		let s = w.current
+		w.current = none
+		s.cancel() unless s is none
+		w.parts = []
+	}
+
+	internal def createOn(s grpc.ClientStream, create WatchCreateRequest, reply WatchResponse) !bool {
+		try s.send(WatchRequest{create: create})
+		return try s.receive(reply)
+	}
+
+	// Connection failures, and a server that cannot serve now, end in a
+	// new stream; anything else ends the watch.
+	internal def retryable(err error) bool {
+		return err.kind == ErrorKind.Connection when err is EtcdError
+		return unavailable(err) || (err is grpc.Status && err.kind == grpc.Code.Cancelled)
+	}
+
+	internal def canceledFailure(reply WatchResponse) EtcdError {
+		return etcdError(ErrorKind.Compacted, grpc.Code.OutOfRange, "etcd: the watch's revision has been compacted; the oldest kept is {reply.compactRevision}") when reply.compactRevision > 0
+		let reason = reply.cancelReason == "" ?? ("the server canceled the watch", reply.cancelReason)
+		let kind = reason.contains("permission denied") ?? (ErrorKind.Denied, ErrorKind.Server)
+		return etcdError(kind, grpc.Code.Cancelled, "etcd: {reason}")
+	}
+
+	internal def eventOf(e EventMsg) WatchEvent {
+		let kv = e.kv
+		let now = kv is none ?? (new KeyValue(), kvOf(kv))
+		return WatchEvent{kind: e.kind == int32(1) ?? (EventKind.Delete, EventKind.Put), key: now.key, kv: now, previous: maybeKv(e.prevKv)}
+	}
+}

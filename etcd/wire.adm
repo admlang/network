@@ -1,0 +1,673 @@
+// The messages of the etcd v3 API (etcdserverpb, mvccpb, authpb, v3lockpb,
+// v3electionpb) as the Protobuf codec binds them. Field numbers are the
+// .proto files' of etcd 3.6.
+internal partial module adm.network.etcd.wire {
+	use (
+		std.data.encoding::(protoField)
+	)
+
+	struct ResponseHeader {
+		@protoField(1)
+		clusterId uint64
+		@protoField(2)
+		memberId uint64
+		@protoField(3)
+		revision int
+		@protoField(4)
+		raftTerm uint64
+	}
+
+	struct KeyValueMsg {
+		@protoField(1)
+		key byte[]
+		@protoField(2)
+		createRevision int
+		@protoField(3)
+		modRevision int
+		@protoField(4)
+		version int
+		@protoField(5)
+		value byte[]
+		@protoField(6)
+		lease int
+	}
+
+	struct EventMsg {
+		// 0 PUT, 1 DELETE.
+		@protoField(1)
+		kind int32
+		@protoField(2)
+		kv ?KeyValueMsg
+		@protoField(3)
+		prevKv ?KeyValueMsg
+	}
+
+	// ---- KV ----
+
+	struct RangeRequest {
+		@protoField(1)
+		key byte[]
+		@protoField(2)
+		rangeEnd byte[]
+		@protoField(3)
+		limit int
+		@protoField(4)
+		revision int
+		@protoField(5)
+		sortOrder int32
+		@protoField(6)
+		sortTarget int32
+		@protoField(7)
+		serializable bool
+		@protoField(8)
+		keysOnly bool
+		@protoField(9)
+		countOnly bool
+		@protoField(10)
+		minModRevision int
+		@protoField(11)
+		maxModRevision int
+		@protoField(12)
+		minCreateRevision int
+		@protoField(13)
+		maxCreateRevision int
+	}
+
+	struct RangeResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		kvs KeyValueMsg[]
+		@protoField(3)
+		more bool
+		@protoField(4)
+		count int
+	}
+
+	struct PutRequest {
+		@protoField(1)
+		key byte[]
+		@protoField(2)
+		value byte[]
+		@protoField(3)
+		lease int
+		@protoField(4)
+		prevKv bool
+		@protoField(5)
+		ignoreValue bool
+		@protoField(6)
+		ignoreLease bool
+	}
+
+	struct PutResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		prevKv ?KeyValueMsg
+	}
+
+	struct DeleteRangeRequest {
+		@protoField(1)
+		key byte[]
+		@protoField(2)
+		rangeEnd byte[]
+		@protoField(3)
+		prevKv bool
+	}
+
+	struct DeleteRangeResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		deleted int
+		@protoField(3)
+		prevKvs KeyValueMsg[]
+	}
+
+	struct RequestOp {
+		@protoField(1, oneof = "request")
+		range ?RangeRequest
+		@protoField(2, oneof = "request")
+		put ?PutRequest
+		@protoField(3, oneof = "request")
+		delete ?DeleteRangeRequest
+		// A nested transaction: messages form a tree, never a cycle, so the
+		// strong reference is what keeps the inner one.
+		@protoField(4, oneof = "request")
+		txn ?TxnRequest
+	}
+
+	struct ResponseOp {
+		@protoField(1, oneof = "response")
+		range ?RangeResponse
+		@protoField(2, oneof = "response")
+		put ?PutResponse
+		@protoField(3, oneof = "response")
+		delete ?DeleteRangeResponse
+		// A nested transaction's answer: a tree, as RequestOp.txn.
+		@protoField(4, oneof = "response")
+		txn ?TxnResponse
+	}
+
+	struct CompareMsg {
+		// 0 EQUAL, 1 GREATER, 2 LESS, 3 NOT_EQUAL.
+		@protoField(1)
+		result int32
+		// 0 VERSION, 1 CREATE, 2 MOD, 3 VALUE, 4 LEASE.
+		@protoField(2)
+		target int32
+		@protoField(3)
+		key byte[]
+		@protoField(4, oneof = "target_union")
+		version ?int
+		@protoField(5, oneof = "target_union")
+		createRevision ?int
+		@protoField(6, oneof = "target_union")
+		modRevision ?int
+		@protoField(7, oneof = "target_union")
+		value ?byte[]
+		@protoField(8, oneof = "target_union")
+		lease ?int
+		@protoField(64)
+		rangeEnd byte[]
+	}
+
+	struct TxnRequest {
+		@protoField(1)
+		compare CompareMsg[]
+		@protoField(2)
+		success RequestOp[]
+		@protoField(3)
+		failure RequestOp[]
+	}
+
+	struct TxnResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		succeeded bool
+		@protoField(3)
+		responses ResponseOp[]
+	}
+
+	struct CompactionRequest {
+		@protoField(1)
+		revision int
+		@protoField(2)
+		physical bool
+	}
+
+	struct HeaderOnly {
+		@protoField(1)
+		header ResponseHeader
+	}
+
+	struct Empty {}
+
+	// ---- Watch ----
+
+	struct WatchCreateRequest {
+		@protoField(1)
+		key byte[]
+		@protoField(2)
+		rangeEnd byte[]
+		@protoField(3)
+		startRevision int
+		@protoField(4)
+		progressNotify bool
+		// 0 NOPUT, 1 NODELETE.
+		@protoField(5)
+		filters int32[]
+		@protoField(6)
+		prevKv bool
+		@protoField(7)
+		watchId int
+		@protoField(8)
+		fragment bool
+	}
+
+	struct WatchCancelRequest {
+		@protoField(1)
+		watchId int
+	}
+
+	struct WatchRequest {
+		@protoField(1, oneof = "request_union")
+		create ?WatchCreateRequest
+		@protoField(2, oneof = "request_union")
+		cancel ?WatchCancelRequest
+		@protoField(3, oneof = "request_union")
+		progress ?Empty
+	}
+
+	struct WatchResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		watchId int
+		@protoField(3)
+		created bool
+		@protoField(4)
+		canceled bool
+		@protoField(5)
+		compactRevision int
+		@protoField(6)
+		cancelReason string
+		@protoField(7)
+		fragment bool
+		@protoField(11)
+		events EventMsg[]
+	}
+
+	// ---- Lease ----
+
+	struct LeaseGrantRequest {
+		@protoField(1)
+		ttl int
+		@protoField(2)
+		id int
+	}
+
+	struct LeaseGrantResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		id int
+		@protoField(3)
+		ttl int
+		@protoField(4)
+		problem string
+	}
+
+	struct LeaseIdRequest {
+		@protoField(1)
+		id int
+	}
+
+	struct LeaseKeepAliveResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		id int
+		@protoField(3)
+		ttl int
+	}
+
+	struct LeaseTimeToLiveRequest {
+		@protoField(1)
+		id int
+		@protoField(2)
+		keys bool
+	}
+
+	struct LeaseTimeToLiveResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		id int
+		@protoField(3)
+		ttl int
+		@protoField(4)
+		grantedTtl int
+		@protoField(5)
+		keys byte[][]
+	}
+
+	struct LeaseStatusMsg {
+		@protoField(1)
+		id int
+	}
+
+	struct LeaseLeasesResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		leases LeaseStatusMsg[]
+	}
+
+	// ---- Cluster ----
+
+	struct MemberMsg {
+		@protoField(1)
+		id uint64
+		@protoField(2)
+		name string
+		@protoField(3)
+		peerUrls string[]
+		@protoField(4)
+		clientUrls string[]
+		@protoField(5)
+		isLearner bool
+	}
+
+	struct MemberAddRequest {
+		@protoField(1)
+		peerUrls string[]
+		@protoField(2)
+		isLearner bool
+	}
+
+	struct MemberAddResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		member ?MemberMsg
+		@protoField(3)
+		members MemberMsg[]
+	}
+
+	struct MemberIdRequest {
+		@protoField(1)
+		id uint64
+	}
+
+	struct MemberUpdateRequest {
+		@protoField(1)
+		id uint64
+		@protoField(2)
+		peerUrls string[]
+	}
+
+	struct MemberListRequest {
+		@protoField(1)
+		linearizable bool
+	}
+
+	struct MembersResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		members MemberMsg[]
+	}
+
+	// ---- Maintenance ----
+
+	struct AlarmRequest {
+		// 0 GET, 1 ACTIVATE, 2 DEACTIVATE.
+		@protoField(1)
+		action int32
+		@protoField(2)
+		memberId uint64
+		// 0 NONE, 1 NOSPACE, 2 CORRUPT.
+		@protoField(3)
+		alarm int32
+	}
+
+	struct AlarmMemberMsg {
+		@protoField(1)
+		memberId uint64
+		@protoField(2)
+		alarm int32
+	}
+
+	struct AlarmResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		alarms AlarmMemberMsg[]
+	}
+
+	struct DowngradeInfoMsg {
+		@protoField(1)
+		enabled bool
+		@protoField(2)
+		targetVersion string
+	}
+
+	struct StatusResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		version string
+		@protoField(3)
+		dbSize int
+		@protoField(4)
+		leader uint64
+		@protoField(5)
+		raftIndex uint64
+		@protoField(6)
+		raftTerm uint64
+		@protoField(7)
+		raftAppliedIndex uint64
+		@protoField(8)
+		errors string[]
+		@protoField(9)
+		dbSizeInUse int
+		@protoField(10)
+		isLearner bool
+		@protoField(11)
+		storageVersion string
+		@protoField(12)
+		dbSizeQuota int
+		@protoField(13)
+		downgradeInfo ?DowngradeInfoMsg
+	}
+
+	struct HashResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		hash uint32
+	}
+
+	struct HashKVRequest {
+		@protoField(1)
+		revision int
+	}
+
+	struct HashKVResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		hash uint32
+		@protoField(3)
+		compactRevision int
+		@protoField(4)
+		hashRevision int
+	}
+
+	struct SnapshotResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		remainingBytes uint64
+		@protoField(3)
+		blob byte[]
+		@protoField(4)
+		version string
+	}
+
+	struct MoveLeaderRequest {
+		@protoField(1)
+		targetId uint64
+	}
+
+	struct DowngradeRequest {
+		// 0 VALIDATE, 1 ENABLE, 2 CANCEL.
+		@protoField(1)
+		action int32
+		@protoField(2)
+		version string
+	}
+
+	struct DowngradeResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		version string
+	}
+
+	// ---- Auth ----
+
+	struct AuthenticateRequest {
+		@protoField(1)
+		name string
+		@protoField(2)
+		password string
+	}
+
+	struct AuthenticateResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		token string
+	}
+
+	struct AuthStatusResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		enabled bool
+		@protoField(3)
+		authRevision uint64
+	}
+
+	struct UserAddOptionsMsg {
+		@protoField(1)
+		noPassword bool
+	}
+
+	struct UserAddRequest {
+		@protoField(1)
+		name string
+		@protoField(2)
+		password string
+		@protoField(3)
+		options ?UserAddOptionsMsg
+		@protoField(4)
+		hashedPassword string
+	}
+
+	struct NameRequest {
+		@protoField(1)
+		name string
+	}
+
+	struct UserGrantRoleRequest {
+		@protoField(1)
+		user string
+		@protoField(2)
+		role string
+	}
+
+	struct UserRevokeRoleRequest {
+		@protoField(1)
+		name string
+		@protoField(2)
+		role string
+	}
+
+	struct NamesResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		names string[]
+	}
+
+	struct PermissionMsg {
+		// 0 READ, 1 WRITE, 2 READWRITE.
+		@protoField(1)
+		permType int32
+		@protoField(2)
+		key byte[]
+		@protoField(3)
+		rangeEnd byte[]
+	}
+
+	struct RoleGetResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		perm PermissionMsg[]
+	}
+
+	struct RoleGrantPermissionRequest {
+		@protoField(1)
+		name string
+		@protoField(2)
+		perm ?PermissionMsg
+	}
+
+	struct RoleRevokePermissionRequest {
+		@protoField(1)
+		role string
+		@protoField(2)
+		key byte[]
+		@protoField(3)
+		rangeEnd byte[]
+	}
+
+	// ---- v3lockpb ----
+
+	struct LockRequest {
+		@protoField(1)
+		name byte[]
+		@protoField(2)
+		lease int
+	}
+
+	struct LockResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		key byte[]
+	}
+
+	struct UnlockRequest {
+		@protoField(1)
+		key byte[]
+	}
+
+	// ---- v3electionpb ----
+
+	struct LeaderKeyMsg {
+		@protoField(1)
+		name byte[]
+		@protoField(2)
+		key byte[]
+		@protoField(3)
+		rev int
+		@protoField(4)
+		lease int
+	}
+
+	struct CampaignRequest {
+		@protoField(1)
+		name byte[]
+		@protoField(2)
+		lease int
+		@protoField(3)
+		value byte[]
+	}
+
+	struct CampaignResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		leader ?LeaderKeyMsg
+	}
+
+	struct LeaderRequest {
+		@protoField(1)
+		name byte[]
+	}
+
+	struct LeaderResponse {
+		@protoField(1)
+		header ResponseHeader
+		@protoField(2)
+		kv ?KeyValueMsg
+	}
+
+	struct ResignRequest {
+		@protoField(1)
+		leader ?LeaderKeyMsg
+	}
+
+	struct ProclaimRequest {
+		@protoField(1)
+		leader ?LeaderKeyMsg
+		@protoField(2)
+		value byte[]
+	}
+}

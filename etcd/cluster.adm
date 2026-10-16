@@ -1,0 +1,264 @@
+partial module adm.network.etcd {
+	use (
+		std.io
+		std.net.grpc
+		adm.network.etcd.wire::*
+	)
+
+	// A member of the cluster.
+	struct Member {
+		id         uint64
+		// The member's name; "" until a member added with addMember starts.
+		name       string
+		peerUrls   string[]
+		clientUrls string[]
+		// A learner receives the log but does not vote.
+		learner    bool
+	}
+
+	// What one member reports of itself.
+	struct MemberStatus {
+		// The member that answered.
+		memberId         uint64
+		// Its server version.
+		version          string
+		// The id of the member it takes for the leader; 0 for none.
+		leader           uint64
+		// The size of its database file, and the part of it in use, in
+		// bytes; dbSizeQuota is its space quota.
+		dbSize           int
+		dbSizeInUse      int
+		dbSizeQuota      int
+		raftIndex        uint64
+		raftTerm         uint64
+		raftAppliedIndex uint64
+		// The alarms and errors the member reports.
+		errors           string[]
+		learner          bool
+		// The version of its storage format (etcd 3.6).
+		storageVersion   string
+		// The revision of its store.
+		revision         int
+		// A downgrade in progress, and the version it goes to.
+		downgrading      bool
+		downgradeTarget  string
+	}
+
+	// An alarm a member raised.
+	enum AlarmKind {
+		None    = 0,
+		// The member ran out of space; the cluster takes only reads and
+		// deletes until it is disarmed.
+		NoSpace = 1,
+		// The member's data differs from the others'.
+		Corrupt = 2,
+	}
+
+	// An alarm, and the member that raised it.
+	struct Alarm {
+		memberId uint64
+		kind     AlarmKind
+	}
+
+	// The hash of a member's keys and values up to a revision, to compare
+	// members with.
+	struct KVHash {
+		hash            uint32
+		// The revision compacted up to.
+		compactRevision int
+		// The revision hashed up to.
+		hashRevision    int
+		memberId        uint64
+	}
+
+	// A step of a cluster downgrade (etcd 3.6).
+	enum DowngradeAction {
+		// Checks that the cluster can go to the version.
+		Validate = 0,
+		// Starts the downgrade.
+		Enable   = 1,
+		// Stops it.
+		Cancel   = 2,
+	}
+
+	// The cluster's members and the maintenance of each one. A call that
+	// takes an endpoint goes to that one (one of `endpoints()`, or its
+	// `host:port`); "" lets the client choose. Each fails with an
+	// EtcdError, Argument for an endpoint the client does not have.
+	partial type Client {
+		// Every member of the cluster. Fails when no endpoint answers.
+		def members() !Member[] {
+			let reply = new MembersResponse()
+			try link.call("/etcdserverpb.Cluster/MemberList", MemberListRequest{linearizable: true}, reply, true)
+			return membersOf(reply.members)
+		}
+
+		// Adds a member that will listen to its peers at peerUrls; start it
+		// afterwards with the cluster's member list. learner adds it
+		// without a vote, until promoteMember. Fails when a URL is invalid
+		// or taken, or the cluster has too few started members.
+		def addMember(peerUrls string[], learner bool = false) !Member {
+			let reply = new MemberAddResponse()
+			try link.call("/etcdserverpb.Cluster/MemberAdd", MemberAddRequest{peerUrls: peerUrls, isLearner: learner}, reply, false)
+			let m = reply.member
+			fail etcdError(ErrorKind.Server, grpc.Code.Internal, "etcd: the member was added without its description") when m is none
+			return memberOf(m)
+		}
+
+		// Removes the member. Fails with NotFound for an unknown id.
+		def removeMember(id uint64) !none {
+			try link.call("/etcdserverpb.Cluster/MemberRemove", MemberIdRequest{id: id}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Changes the URLs the member's peers reach it at. Fails with
+		// NotFound for an unknown id.
+		def updateMember(id uint64, peerUrls string[]) !none {
+			try link.call("/etcdserverpb.Cluster/MemberUpdate", MemberUpdateRequest{id: id, peerUrls: peerUrls}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Gives a learner its vote, once it has caught up with the leader.
+		// Fails when the member is no learner or has not caught up.
+		def promoteMember(id uint64) !none {
+			try link.call("/etcdserverpb.Cluster/MemberPromote", MemberIdRequest{id: id}, new HeaderOnly(), false)
+			return none
+		}
+
+		// What a member reports of itself. Fails when the member does not
+		// answer.
+		def status(endpoint string = "") !MemberStatus {
+			let reply = new StatusResponse()
+			try link.call("/etcdserverpb.Maintenance/Status", new Empty(), reply, true, try link.indexOf(endpoint))
+			let out = MemberStatus{memberId: reply.header.memberId, version: reply.version, leader: reply.leader, dbSize: reply.dbSize, dbSizeInUse: reply.dbSizeInUse, dbSizeQuota: reply.dbSizeQuota, raftIndex: reply.raftIndex, raftTerm: reply.raftTerm, raftAppliedIndex: reply.raftAppliedIndex, errors: reply.errors, learner: reply.isLearner, storageVersion: reply.storageVersion, revision: reply.header.revision}
+			let d = reply.downgradeInfo
+			if !(d is none) {
+				out.downgrading = d.enabled
+				out.downgradeTarget = d.targetVersion
+			}
+			return out
+		}
+
+		// The alarms raised in the cluster. Fails when no endpoint answers.
+		def alarms() !Alarm[] {
+			let reply = new AlarmResponse()
+			try link.call("/etcdserverpb.Maintenance/Alarm", AlarmRequest{action: int32(0)}, reply, true)
+			let out Alarm[] = []
+			for let a in reply.alarms {
+				out.push(Alarm{memberId: a.memberId, kind: alarmKindOf(a.alarm)})
+			}
+			return out
+		}
+
+		// Clears an alarm, after its cause was dealt with (space freed
+		// with compact and defragment). Fails when the user is not root.
+		def disarm(alarm Alarm) !none {
+			try link.call("/etcdserverpb.Maintenance/Alarm", AlarmRequest{action: int32(2), memberId: alarm.memberId, alarm: int32(alarm.kind.value)}, new AlarmResponse(), false)
+			return none
+		}
+
+		// Gives a member's free pages back to the file system. The member
+		// answers nothing else meanwhile, which may take a while: no
+		// timeout applies. Fails when the member does not answer.
+		def defragment(endpoint string = "") !none {
+			try link.call("/etcdserverpb.Maintenance/Defragment", new Empty(), new HeaderOnly(), false, try link.indexOf(endpoint), 0s)
+			return none
+		}
+
+		// The hash of a member's whole store. Fails when the member does not
+		// answer.
+		def hash(endpoint string = "") !uint32 {
+			let reply = new HashResponse()
+			try link.call("/etcdserverpb.Maintenance/Hash", new Empty(), reply, true, try link.indexOf(endpoint))
+			return reply.hash
+		}
+
+		// The hash of a member's keys and values up to revision (0: the
+		// latest). Fails with Compacted for a revision compacted away.
+		def hashKV(revision int = 0, endpoint string = "") !KVHash {
+			let reply = new HashKVResponse()
+			try link.call("/etcdserverpb.Maintenance/HashKV", HashKVRequest{revision: revision}, reply, true, try link.indexOf(endpoint))
+			return KVHash{hash: reply.hash, compactRevision: reply.compactRevision, hashRevision: reply.hashRevision, memberId: reply.header.memberId}
+		}
+
+		// Writes a member's snapshot, the file `etcdutl snapshot restore`
+		// takes, to out and returns its size in bytes. Fails as out does
+		// too.
+		def snapshot(out io.Writer, endpoint string = "") !int {
+			let s = try link.openStream("/etcdserverpb.Maintenance/Snapshot", try link.indexOf(endpoint))
+			let total = 0
+			askSnapshot(s) onerror (err error) {
+				s.cancel()
+				fail failureOf(err)
+			}
+			for {
+				let part = new SnapshotResponse()
+				let got = s.receive(part) onerror (err error) {
+					fail failureOf(err)
+				}
+				break unless got
+				if part.blob.len() > 0 {
+					out.write(part.blob) onerror (err error) {
+						s.cancel()
+						fail err
+					}
+					total += part.blob.len()
+				}
+			}
+			return total
+		}
+
+		// Hands the leadership to the member target. The request goes to
+		// the leader, found by asking the endpoints in turn. Fails with
+		// Connection when no endpoint is the leader, and when target is no
+		// voting member.
+		def moveLeader(target uint64) !none {
+			let at = -1
+			for let (i, _) in link.members {
+				let reply = new StatusResponse()
+				link.call("/etcdserverpb.Maintenance/Status", new Empty(), reply, true, i) onerror recover none
+				if reply.leader != uint64(0) && reply.leader == reply.header.memberId {
+					at = i
+					break
+				}
+			}
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: no endpoint is the leader") when at < 0
+			try link.call("/etcdserverpb.Maintenance/MoveLeader", MoveLeaderRequest{targetId: target}, new HeaderOnly(), false, at)
+			return none
+		}
+
+		// Validates, starts or cancels a downgrade of the cluster to
+		// version (`3.5`); returns the cluster's version. Fails when the
+		// version is no valid target or no downgrade is in progress to
+		// cancel.
+		def downgrade(action DowngradeAction, version string = "") !string {
+			let reply = new DowngradeResponse()
+			try link.call("/etcdserverpb.Maintenance/Downgrade", DowngradeRequest{action: int32(action.value), version: version}, reply, false)
+			return reply.version
+		}
+	}
+
+	internal def askSnapshot(s grpc.ClientStream) !none {
+		try s.send(new Empty())
+		try s.closeSend()
+		return none
+	}
+
+	internal def memberOf(m MemberMsg) Member {
+		return Member{id: m.id, name: m.name, peerUrls: m.peerUrls, clientUrls: m.clientUrls, learner: m.isLearner}
+	}
+
+	internal def membersOf(ms MemberMsg[]) Member[] {
+		let out Member[] = []
+		for let m in ms {
+			out.push(memberOf(m))
+		}
+		return out
+	}
+
+	internal def alarmKindOf(n int32) AlarmKind {
+		return AlarmKind.NoSpace when n == int32(1)
+		return AlarmKind.Corrupt when n == int32(2)
+		return AlarmKind.None
+	}
+}

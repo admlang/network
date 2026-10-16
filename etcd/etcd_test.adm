@@ -1,0 +1,549 @@
+// These tests need an etcd server; without ADM_TEST_ETCD they pass
+// without running. See README.md for the server they expect.
+partial module adm.network.etcd {
+	use (
+		std.bytes::(Buffer)
+		std.crypto.x509::(CertPool)
+		std.net.tls
+		std.os
+		std.testing
+		std.time
+	)
+
+	// The server's address as `host:port`. The tests use keys under
+	// `/adm-test/` and delete them.
+	@env("ADM_TEST_ETCD")
+	internal const testServer string
+
+	// An etcd with authentication, as `user:password@host:port` for root;
+	// `testservers/auth.sh` starts one.
+	@env("ADM_TEST_ETCD_AUTH")
+	internal const testAuth string
+
+	// An etcd that takes TLS with client certificates, as `host:port`, and
+	// the folder with its ca.pem, client.pem and client.key;
+	// `testservers/tls.sh` starts one.
+	@env("ADM_TEST_ETCD_TLS")
+	internal const testSecure string
+
+	@env("ADM_TEST_ETCD_CERTS")
+	internal const testCerts string
+
+	// The client endpoints of a three-member cluster, comma-separated;
+	// `testservers/cluster.sh` starts one.
+	@env("ADM_TEST_ETCD_CLUSTER")
+	internal const testCluster string
+
+	// A client with the test keys deleted.
+	def fresh() !Client {
+		let c = try connect(testServer)
+		try c.deletePrefix("/adm-test/")
+		return c
+	}
+
+	def text(v ?string) string {
+		return "(none)" when v is none
+		return v
+	}
+
+	def nextEvent(w Watch) !WatchEvent {
+		let e = try w.next()
+		fail "the watch ended" when e is none
+		return e
+	}
+
+	def nextLeader(o Observation) !KeyValue {
+		let kv = try o.next()
+		fail "the observation ended" when kv is none
+		return kv
+	}
+
+	def present(kv ?KeyValue) !KeyValue {
+		fail "the key is missing" when kv is none
+		return kv
+	}
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is EtcdError
+		return ErrorKind.Server
+	}
+
+	check "Key-value" {
+		@test()
+		def TestPutGet() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let put = try c.put("/adm-test/a", "one")
+			assert put.revision > 0
+			assert text(try c.get("/adm-test/a")) == "one"
+			assert (try c.get("/adm-test/missing")) is none
+			let again = try c.put("/adm-test/a", "two", previous = true)
+			let before = again.previous
+			assert !(before is none) && before.value == "one"
+			let kv = try c.entry("/adm-test/a")
+			assert !(kv is none) && kv.version == 2 && kv.modRevision == again.revision
+			try c.put("/adm-test/b", [byte(0), byte(1), byte(2)])
+			let b = try c.entry("/adm-test/b")
+			assert !(b is none) && b.data.len() == 3 && b.data[2] == byte(2)
+			try c.close()
+		}
+
+		@test()
+		def TestRanges() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			for let i = 0; i < 5; i++ {
+				try c.put("/adm-test/r/{i}", "v{i}")
+			}
+			try c.put("/adm-test/s", "x")
+			let all = try c.getPrefix("/adm-test/r/")
+			assert all.len() == 5 && all[0].key == "/adm-test/r/0" && all[4].value == "v4"
+			let down = try c.getPrefix("/adm-test/r/", GetOptions{order: SortOrder.Descending, limit: 2})
+			assert down.len() == 2 && down[0].key == "/adm-test/r/4"
+			let r = try c.range("/adm-test/r/1", GetOptions{end: "/adm-test/r/3"})
+			assert r.kvs.len() == 2 && r.count == 2 && !r.more
+			let limited = try c.range("/adm-test/r/", GetOptions{prefix: true, limit: 3})
+			assert limited.kvs.len() == 3 && limited.more && limited.count == 5
+			assert (try c.count("/adm-test/", GetOptions{prefix: true})) == 6
+			let keys = try c.getPrefix("/adm-test/r/", GetOptions{keysOnly: true})
+			assert keys.len() == 5 && keys[0].data.len() == 0
+			let old = try c.getPrefix("/adm-test/r/", GetOptions{revision: all[2].modRevision})
+			assert old.len() == 3
+			let from = try c.range("/adm-test/r/3", GetOptions{fromKey: true})
+			assert from.kvs.len() == 3
+			let gone = try c.delete("/adm-test/r/0", "/adm-test/r/2", previous = true)
+			assert gone.deleted == 2 && gone.previous.len() == 2
+			let rest = try c.deletePrefix("/adm-test/")
+			assert rest.deleted == 4
+			try c.close()
+		}
+
+		@test()
+		def TestErrors() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let kind = ErrorKind.Server
+			c.put("", "x") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover PutResult{}
+			}
+			assert kind == ErrorKind.Argument
+			let dead = try connect("127.0.0.1:1")
+			kind = ErrorKind.Server
+			dead.get("/adm-test/a") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Connection
+			try c.close()
+		}
+	}
+
+	check "Leases" {
+		@test()
+		def TestLeaseKeys() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let lease = try c.grant(2s, keepAlive = false)
+			assert lease.id != 0 && lease.ttl == 2s
+			try c.put("/adm-test/l", "x", lease = lease)
+			let info = try lease.timeToLive(keys = true)
+			assert info.keys.len() == 1 && info.keys[0] == "/adm-test/l" && info.granted == 2s
+			assert (try c.leases()).indexOf(lease.id) >= 0
+			let ttl = try lease.keepAliveOnce()
+			assert ttl == 2s
+			try lease.revoke()
+			assert (try c.get("/adm-test/l")) is none
+			let kind = ErrorKind.Server
+			c.put("/adm-test/l", "x", lease = lease) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover PutResult{}
+			}
+			assert kind == ErrorKind.LeaseExpired
+			try c.close()
+		}
+
+		@test()
+		def TestKeepAlive() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let kept = try c.grant(2s)
+			let left = try c.grant(2s, keepAlive = false)
+			try c.put("/adm-test/kept", "x", lease = kept)
+			try c.put("/adm-test/left", "x", lease = left)
+			time.sleep(4s)
+			assert kept.alive()
+			assert text(try c.get("/adm-test/kept")) == "x"
+			assert (try c.get("/adm-test/left")) is none
+			try kept.revoke()
+			assert !kept.alive()
+			try c.close()
+		}
+	}
+
+	check "Transactions" {
+		@test()
+		def TestCompareAndSwap() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let made = try c.txn().compare(versionIs("/adm-test/t", 0)).then(putOp("/adm-test/t", "first")).otherwise(getOp("/adm-test/t")).commit()
+			assert made.succeeded && made.results.len() == 1 && made.results[0].kind == OpKind.Put
+			let again = try c.txn().compare(versionIs("/adm-test/t", 0)).then(putOp("/adm-test/t", "second")).otherwise(getOp("/adm-test/t")).commit()
+			assert !again.succeeded
+			let read = again.results[0].range
+			assert !(read is none) && read.kvs[0].value == "first"
+			let kv = try present(try c.entry("/adm-test/t"))
+			let swapped = try c.txn().compare(valueIs("/adm-test/t", "first"), modifiedAt("/adm-test/t", kv.modRevision)).then(putOp("/adm-test/t", "third", previous = true), deleteOp("/adm-test/u")).commit()
+			assert swapped.succeeded && swapped.results.len() == 2
+			let put = swapped.results[0].put
+			assert !(put is none) && !(put.previous is none)
+			assert text(try c.get("/adm-test/t")) == "third"
+			let older = try c.txn().compare(createdAt("/adm-test/t", kv.createRevision, CompareOp.Less)).commit()
+			assert !older.succeeded
+			let ranged = try c.txn().compare(valueIs("/adm-test/", "", CompareOp.Greater, prefixEndOf("/adm-test/"))).commit()
+			assert ranged.succeeded
+			let inner = new Txn().then(getOp("/adm-test/", GetOptions{prefix: true}))
+			let nested = try c.txn().then(txnOp(inner), deleteOp("/adm-test/", prefix = true)).commit()
+			let got = nested.results[0].txn
+			assert !(got is none) && got.succeeded
+			let gone = nested.results[1].delete
+			assert !(gone is none) && gone.deleted == 1
+			let kind = ErrorKind.Server
+			c.txn().then(putOp("/adm-test/x", "1"), putOp("/adm-test/x", "2")).commit() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover TxnResult{}
+			}
+			assert kind == ErrorKind.Argument
+			try c.close()
+		}
+	}
+
+	def prefixEndOf(prefix string) string {
+		return string(rangeEndOf(prefix.bytes()))
+	}
+
+	check "Watch" {
+		@test()
+		def TestWatchPrefix() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let w = try c.watch("/adm-test/w/", prefix = true, previous = true)
+			try c.put("/adm-test/w/a", "1")
+			try c.put("/adm-test/w/a", "2")
+			try c.put("/adm-test/other", "x")
+			try c.delete("/adm-test/w/a")
+			let e1 = try nextEvent(w)
+			assert e1.kind == EventKind.Put && e1.key == "/adm-test/w/a" && e1.kv.value == "1" && e1.previous is none
+			let e2 = try nextEvent(w)
+			let p2 = e2.previous
+			assert e2.kv.value == "2" && !(p2 is none) && p2.value == "1"
+			let e3 = try nextEvent(w)
+			assert e3.kind == EventKind.Delete && e3.key == "/adm-test/w/a"
+			assert w.revision() == e3.kv.modRevision
+			try w.close()
+			assert (try w.next()) is none
+			try c.close()
+		}
+
+		@test()
+		def TestWatchHistoryAndFilters() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let start = (try c.put("/adm-test/h", "1")).revision
+			try c.put("/adm-test/h", "2")
+			try c.delete("/adm-test/h")
+			let w = try c.watch("/adm-test/h", revision = start, skipPuts = true)
+			let e = try nextEvent(w)
+			assert e.kind == EventKind.Delete
+			try w.close()
+			let all = try c.watch("/adm-test/h", revision = start)
+			let kinds EventKind[] = []
+			for let event in all {
+				kinds.push(event.kind)
+				break when kinds.len() == 3
+			}
+			assert kinds.len() == 3 && kinds[2] == EventKind.Delete
+			try all.close()
+			try c.close()
+		}
+
+		@test()
+		def TestWatchProgressAndResume() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let w = try c.watch("/adm-test/p", progress = true)
+			try w.requestProgress()
+			let b = try w.batch()
+			assert !(b is none) && b.progress && b.events.len() == 0
+			try c.put("/adm-test/p", "1")
+			let first = try nextEvent(w)
+			assert first.kv.value == "1"
+			// A broken stream: the changes made meanwhile still arrive, once.
+			dropStream(w)
+			try c.put("/adm-test/p", "2")
+			try c.put("/adm-test/p", "3")
+			let second = try nextEvent(w)
+			let third = try nextEvent(w)
+			assert second.kv.value == "2" && third.kv.value == "3"
+			try w.close()
+			try c.close()
+		}
+
+		@test()
+		def TestWatchCompacted() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let old = (try c.put("/adm-test/c", "1")).revision
+			let now = (try c.put("/adm-test/c", "2")).revision
+			try c.compact(now)
+			assert watchFailure(c, "/adm-test/c", old) == ErrorKind.Compacted
+			let kind = ErrorKind.Server
+			c.get("/adm-test/c", GetOptions{revision: old}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Compacted
+			try c.close()
+		}
+	}
+
+	// The kind of failure a watch from revision ends with. etcd creates
+	// the watch and cancels it right after, so the first read fails.
+	def watchFailure(c Client, key string, revision int) ErrorKind {
+		let w = c.watch(key, revision = revision) onerror (err error) {
+			return kindOfFailure(err)
+		}
+		let kind = ErrorKind.Server
+		w.next() onerror (err error) {
+			kind = kindOfFailure(err)
+			recover none
+		}
+		w.close() onerror recover none
+		return kind
+	}
+
+	check "Concurrency" {
+		@test()
+		def TestLock() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let lock = try c.lock("/adm-test/lock")
+			assert lock.key.startsWith("/adm-test/lock/")
+			let kind = ErrorKind.Server
+			c.lock("/adm-test/lock", timeout = 500ms) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover lock
+			}
+			assert kind == ErrorKind.TimedOut
+			let waiter = async takeLock(c)
+			time.sleep(300ms)
+			try lock.unlock()
+			let second = try await waiter
+			assert second != "" && second != lock.key
+			assert (try c.count("/adm-test/lock/", GetOptions{prefix: true})) == 0
+			try c.close()
+		}
+
+		@test()
+		def TestElection() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let e = c.election("/adm-test/election")
+			assert (try e.leader()) is none
+			let lead = try e.campaign("alpha")
+			let now = try e.leader()
+			assert !(now is none) && now.value == "alpha" && now.key == lead.key
+			let watch = try e.observe()
+			let seen = try nextLeader(watch)
+			assert seen.value == "alpha"
+			try lead.proclaim("beta")
+			let changed = try nextLeader(watch)
+			assert changed.value == "beta"
+			let other = async campaignFor(c, "gamma")
+			time.sleep(300ms)
+			try lead.resign()
+			assert (try await other) == "gamma"
+			let next = try nextLeader(watch)
+			assert next.value == "gamma"
+			try watch.close()
+			try c.close()
+		}
+	}
+
+	def takeLock(c Client) !string {
+		let lock = try c.lock("/adm-test/lock")
+		let key = lock.key
+		try lock.unlock()
+		return key
+	}
+
+	def campaignFor(c Client, value string) !string {
+		let lead = try c.election("/adm-test/election").campaign(value)
+		let now = try c.election("/adm-test/election").leader()
+		try lead.resign()
+		return now is none ?? ("", now.value)
+	}
+
+	check "Cluster" {
+		@test()
+		def TestMembersAndMaintenance() !none {
+			return none when testServer == ""
+			let c = try connect("127.0.0.1:1", testServer)
+			let members = try c.members()
+			assert members.len() >= 1 && members[0].clientUrls.len() >= 1
+			let st = try c.status(testServer)
+			assert st.version.startsWith("3.") && st.leader != uint64(0) && st.dbSize > 0
+			assert (try c.alarms()).len() == 0
+			let h = try c.hashKV(endpoint = testServer)
+			assert h.hashRevision > 0
+			assert (try c.hash(testServer)) != uint32(0)
+			let out = new Buffer()
+			let n = try c.snapshot(out, testServer)
+			assert n > 0 && out.len() == n
+			try c.defragment(testServer)
+			let kind = ErrorKind.Server
+			c.status("127.0.0.1:9") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover MemberStatus{}
+			}
+			assert kind == ErrorKind.Argument
+			try c.close()
+		}
+	}
+
+	def authHost() string {
+		let parts = testAuth.split("@")
+		return parts[parts.len() - 1]
+	}
+
+	check "Authentication" {
+		@test()
+		def TestUsersAndTokens() !none {
+			return none when testAuth == ""
+			let root = try connect("http://{testAuth}")
+			try root.deletePrefix("/adm-test/")
+			assert (try root.authStatus()).enabled
+			try root.put("/adm-test/a", "1")
+			// Tokens of the test server live two seconds: the client signs
+			// in again when the server refuses its token.
+			time.sleep(3s)
+			assert text(try root.get("/adm-test/a")) == "1"
+			let reader = try connect(Config{endpoints: [authHost()], username: "reader", password: "reader"})
+			assert text(try reader.get("/adm-test/a")) == "1"
+			let kind = ErrorKind.Server
+			reader.put("/adm-test/a", "2") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover PutResult{}
+			}
+			assert kind == ErrorKind.Denied
+			kind = ErrorKind.Server
+			connect(Config{endpoints: [authHost()], username: "reader", password: "wrong"}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover root
+			}
+			assert kind == ErrorKind.Denied
+			kind = ErrorKind.Server
+			let anonymous = try connect(authHost())
+			anonymous.get("/adm-test/a") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Denied
+			try reader.close()
+			try anonymous.close()
+			try root.close()
+		}
+
+		@test()
+		def TestUserAndRoleAdministration() !none {
+			return none when testAuth == ""
+			let root = try connect("http://{testAuth}")
+			root.removeUser("adm-test-user") onerror recover none
+			root.removeRole("adm-test-role") onerror recover none
+			try root.addUser("adm-test-user", "pw")
+			assert (try root.users()).indexOf("adm-test-user") >= 0
+			try root.addRole("adm-test-role")
+			assert (try root.roles()).indexOf("adm-test-role") >= 0
+			try root.grantPermission("adm-test-role", Permission{kind: PermissionKind.ReadWrite, key: "/adm-test/user/", prefix: true})
+			let perms = try root.rolePermissions("adm-test-role")
+			assert perms.len() == 1 && perms[0].kind == PermissionKind.ReadWrite && perms[0].key == "/adm-test/user/" && perms[0].end == "/adm-test/user0"
+			try root.grantRole("adm-test-user", "adm-test-role")
+			assert (try root.userRoles("adm-test-user")).indexOf("adm-test-role") >= 0
+			let user = try connect(Config{endpoints: [authHost()], username: "adm-test-user", password: "pw"})
+			try user.put("/adm-test/user/x", "mine")
+			try root.changePassword("adm-test-user", "pw2")
+			try root.revokePermission("adm-test-role", Permission{kind: PermissionKind.Read, key: "/adm-test/user/", prefix: true})
+			assert (try root.rolePermissions("adm-test-role")).len() == 0
+			try root.revokeRole("adm-test-user", "adm-test-role")
+			try root.removeRole("adm-test-role")
+			try root.removeUser("adm-test-user")
+			let kind = ErrorKind.Server
+			root.userRoles("adm-test-user") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover string[]
+			}
+			assert kind == ErrorKind.NotFound
+			try user.close()
+			try root.deletePrefix("/adm-test/")
+			try root.close()
+		}
+	}
+
+	check "TLS" {
+		@test()
+		def TestClientCertificate() !none {
+			return none when testSecure == "" || testCerts == ""
+			let pool = new CertPool()
+			pool.appendCertsFromPEM(string(try os.readFile("{testCerts}/ca.pem")))
+			let pair = try tls.loadKeyPair("{testCerts}/client.pem", "{testCerts}/client.key")
+			let c = try connect(Config{endpoints: ["https://{testSecure}"], tlsConfig: tls.Config{serverName: "localhost", rootCAs: pool, certificates: [pair]}})
+			try c.put("/adm-test/tls", "secured")
+			assert text(try c.get("/adm-test/tls")) == "secured"
+			try c.delete("/adm-test/tls")
+			try c.close()
+			let bare = try connect(Config{endpoints: [testSecure], tlsConfig: tls.Config{serverName: "localhost", rootCAs: pool}})
+			let kind = ErrorKind.Server
+			bare.get("/adm-test/tls") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Connection
+			try bare.close()
+		}
+	}
+
+	check "Several members" {
+		@test()
+		def TestClusterMembers() !none {
+			return none when testCluster == ""
+			let endpoints = testCluster.split(",")
+			let c = try connect(Config{endpoints: ["127.0.0.1:1"] + endpoints})
+			try c.deletePrefix("/adm-test/")
+			let members = try c.members()
+			assert members.len() == 3
+			let rev = (try c.put("/adm-test/m", "x")).revision
+			for let e in endpoints {
+				assert text(try c.get("/adm-test/m", GetOptions{serializable: true})) == "x"
+				assert (try c.status(e)).revision >= rev
+				assert (try c.hashKV(rev, e)).hashRevision == rev
+			}
+			let leader = (try c.status(endpoints[0])).leader
+			let target = members[0].id == leader ?? (members[1].id, members[0].id)
+			try c.moveLeader(target)
+			assert (try c.status(endpoints[1])).leader == target
+			let learner = try c.addMember(["http://127.0.0.1:2494"], learner = true)
+			assert learner.learner && learner.name == ""
+			assert (try c.members()).len() == 4
+			try c.removeMember(learner.id)
+			assert (try c.members()).len() == 3
+			let kind = ErrorKind.Server
+			c.removeMember(learner.id) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotFound
+			try c.deletePrefix("/adm-test/")
+			try c.close()
+		}
+	}
+}

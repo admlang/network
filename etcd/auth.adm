@@ -1,0 +1,168 @@
+partial module adm.network.etcd {
+	use (
+		adm.network.etcd.wire::*
+	)
+
+	// Whether the cluster checks users, and the revision of its users and
+	// roles.
+	struct AuthStatus {
+		enabled  bool
+		revision uint64
+	}
+
+	// What a permission allows.
+	enum PermissionKind {
+		Read      = 0,
+		Write     = 1,
+		ReadWrite = 2,
+	}
+
+	// A role's right to read or write a key, a range or a prefix.
+	struct Permission {
+		kind   PermissionKind
+		key    string
+		// The end of the range, "" for the key alone.
+		end    string         = ""
+		// Every key that starts with key (end is then ignored).
+		prefix bool           = false
+	}
+
+	// Users, roles and their permissions. Turning authentication on needs
+	// a `root` user with the `root` role. Each fails with an EtcdError:
+	// Denied for a user who may not manage them, NotFound for an unknown
+	// user or role, Server for one that exists already.
+	partial type Client {
+		// Turns authentication on: from then on requests need a user. Fails
+		// when there is no root user with the root role.
+		def enableAuth() !none {
+			try link.call("/etcdserverpb.Auth/AuthEnable", new Empty(), new HeaderOnly(), false)
+			return none
+		}
+
+		// Turns authentication off. Fails when the user is not root.
+		def disableAuth() !none {
+			try link.call("/etcdserverpb.Auth/AuthDisable", new Empty(), new HeaderOnly(), false)
+			return none
+		}
+
+		// Whether authentication is on. Fails as the calls above do.
+		def authStatus() !AuthStatus {
+			let reply = new AuthStatusResponse()
+			try link.call("/etcdserverpb.Auth/AuthStatus", new Empty(), reply, true)
+			return AuthStatus{enabled: reply.enabled, revision: reply.authRevision}
+		}
+
+		// Adds a user. noPassword makes one that signs in with a client
+		// certificate only (its common name is the user). Fails when the
+		// user exists.
+		def addUser(name string, password string, noPassword bool = false) !none {
+			let request = UserAddRequest{name: name, password: password, options: UserAddOptionsMsg{noPassword: noPassword}}
+			try link.call("/etcdserverpb.Auth/UserAdd", request, new HeaderOnly(), false)
+			return none
+		}
+
+		// Removes a user. Fails with NotFound for an unknown user.
+		def removeUser(name string) !none {
+			try link.call("/etcdserverpb.Auth/UserDelete", NameRequest{name: name}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Sets a user's password. Fails with NotFound for an unknown user.
+		def changePassword(name string, password string) !none {
+			try link.call("/etcdserverpb.Auth/UserChangePassword", AuthenticateRequest{name: name, password: password}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Every user's name. Fails when the user may not list them.
+		def users() !string[] {
+			let reply = new NamesResponse()
+			try link.call("/etcdserverpb.Auth/UserList", new Empty(), reply, true)
+			return reply.names
+		}
+
+		// The roles granted to the user. Fails with NotFound for an unknown
+		// user.
+		def userRoles(name string) !string[] {
+			let reply = new NamesResponse()
+			try link.call("/etcdserverpb.Auth/UserGet", NameRequest{name: name}, reply, true)
+			return reply.names
+		}
+
+		// Grants a role to a user. Fails with NotFound for an unknown user
+		// or role.
+		def grantRole(user string, role string) !none {
+			try link.call("/etcdserverpb.Auth/UserGrantRole", UserGrantRoleRequest{user: user, role: role}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Takes a role from a user. Fails with NotFound when the user does
+		// not exist or does not have it.
+		def revokeRole(user string, role string) !none {
+			try link.call("/etcdserverpb.Auth/UserRevokeRole", UserRevokeRoleRequest{name: user, role: role}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Adds a role without permissions. Fails when the role exists.
+		def addRole(name string) !none {
+			try link.call("/etcdserverpb.Auth/RoleAdd", NameRequest{name: name}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Removes a role. Fails with NotFound for an unknown role.
+		def removeRole(name string) !none {
+			try link.call("/etcdserverpb.Auth/RoleDelete", NameRequest{name: name}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Every role's name. Fails when the user may not list them.
+		def roles() !string[] {
+			let reply = new NamesResponse()
+			try link.call("/etcdserverpb.Auth/RoleList", new Empty(), reply, true)
+			return reply.names
+		}
+
+		// The permissions of the role. A prefix permission comes back as
+		// the range it covers. Fails with NotFound for an unknown role.
+		def rolePermissions(role string) !Permission[] {
+			let reply = new RoleGetResponse()
+			try link.call("/etcdserverpb.Auth/RoleGet", NameRequest{name: role}, reply, true)
+			let out Permission[] = []
+			for let p in reply.perm {
+				out.push(Permission{kind: permissionKindOf(p.permType), key: string(p.key), end: string(p.rangeEnd)})
+			}
+			return out
+		}
+
+		// Gives a role the permission. Fails with NotFound for an unknown
+		// role.
+		def grantPermission(role string, permission Permission) !none {
+			let m = permissionMsg(permission)
+			try link.call("/etcdserverpb.Auth/RoleGrantPermission", RoleGrantPermissionRequest{name: role, perm: m}, new HeaderOnly(), false)
+			return none
+		}
+
+		// Takes back the permission on the permission's key or range (its
+		// kind does not matter). Fails with NotFound when the role does not
+		// have it.
+		def revokePermission(role string, permission Permission) !none {
+			let m = permissionMsg(permission)
+			try link.call("/etcdserverpb.Auth/RoleRevokePermission", RoleRevokePermissionRequest{role: role, key: m.key, rangeEnd: m.rangeEnd}, new HeaderOnly(), false)
+			return none
+		}
+	}
+
+	internal def permissionMsg(p Permission) PermissionMsg {
+		let m = PermissionMsg{permType: int32(p.kind.value), key: p.key.bytes(), rangeEnd: p.end.bytes()}
+		if p.prefix {
+			m.key = emptyKeyAll(p.key)
+			m.rangeEnd = rangeEndOf(p.key.bytes())
+		}
+		return m
+	}
+
+	internal def permissionKindOf(n int32) PermissionKind {
+		return PermissionKind.Write when n == int32(1)
+		return PermissionKind.ReadWrite when n == int32(2)
+		return PermissionKind.Read
+	}
+}
