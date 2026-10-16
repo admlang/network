@@ -6,6 +6,7 @@ partial module adm.network.etcd {
 		std.crypto.x509::(CertPool)
 		std.net.tls
 		std.os
+		std.services.config
 		std.testing
 		std.time
 	)
@@ -542,6 +543,189 @@ partial module adm.network.etcd {
 				recover none
 			}
 			assert kind == ErrorKind.NotFound
+			try c.deletePrefix("/adm-test/")
+			try c.close()
+		}
+	}
+
+	// What the Config service emits while a Source feeds it.
+	internal let seenChanges = new channel<string>(256)
+	internal let seenFailures = new channel<string>(64)
+
+	@on(config.Config.changed)
+	internal def onConfigChanged(evt Event<config.ConfigChange>) {
+		let after = evt.result.newValue
+		let now = "none"
+		now = "{after}" unless after is none
+		seenChanges.offer("{evt.result.key}={now}")
+	}
+
+	@on(config.Config.reloadFailed)
+	internal def onConfigReloadFailed(evt Event<config.ConfigReloadError>) {
+		seenFailures.offer(evt.result.error.message)
+	}
+
+	// The texts that come from the channel until none comes for a tenth
+	// of a second (for the first, within `first`), sorted.
+	def collected(from channel<string>, first duration = 100ms) string[] {
+		let out string[] = []
+		for {
+			let limit = time.sleepChan(out.len() == 0 ?? (first, 100ms))
+			let got = ""
+			select {
+				case from:
+					got = <-from
+				case limit:
+					return out.sort((a, b) => a < b)
+			}
+			out.push(got)
+		}
+		return out
+	}
+
+	// Starts the Config service on the source alone; the keys of the
+	// sources before are gone before the events are watched.
+	def configured(source Source) !none {
+		try await config.Config.stop()
+		try config.Config.config(config.ConfigConfig{})
+		seenChanges.flush()
+		seenFailures.flush()
+		try config.Config.config(config.ConfigConfig{sources: [config.SourceConfig{source: source}]})
+		try await config.Config.start()
+		return none
+	}
+
+	// The value of a key the service holds, as a T.
+	def setting<T>(key string) !T {
+		let value = try config.Config.get<T>(key)
+		fail "{key} has no value" when value is none
+		return value
+	}
+
+	// The kind of failure a load ends with; Server when it loads.
+	def loadFailure(source Source) ErrorKind {
+		let kind = ErrorKind.Server
+		source.load() onerror (err error) {
+			kind = kindOfFailure(err)
+			recover map<string, any>{}
+		}
+		return kind
+	}
+
+	check "Config source" {
+		@test()
+		def TestConfigKeys() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			try c.put("/adm-test/cfg", "not a key")
+			try c.put("/adm-test/cfg/db/host", "h")
+			try c.put("/adm-test/cfg/db/port", "5432")
+			try c.put("/adm-test/cfg/name", "shop")
+			try c.put("/adm-test/cfgother", "x")
+			let source = new Source(c, "/adm-test/cfg/")
+			assert source.name() == "etcd /adm-test/cfg/"
+			let named = new Source(c, "/adm-test/cfg", name = "settings")
+			assert named.name() == "settings"
+			let loaded = try source.load()
+			assert loaded.len() == 3 && loaded.hasKey("db.host") && loaded.hasKey("db.port") && loaded.hasKey("name")
+			// Without the trailing slash the prefix's own value is no key, and a longer name is one.
+			let wide = try named.load()
+			assert wide.len() == 4 && wide.hasKey("other")
+			try configured(source)
+			assert (try setting<string>("db.host")) == "h" && (try setting<int>("db.port")) == 5432
+			assert collected(seenChanges, 3s).join(" ") == "db.host=h db.port=5432 name=shop"
+			try await config.Config.stop()
+			try c.deletePrefix("/adm-test/")
+			try c.close()
+		}
+
+		@test()
+		def TestConfigJson() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			try c.put("/adm-test/json", "\{\"db\": \{\"host\": \"j\", \"port\": 1\}, \"flag\": true\}")
+			try c.put("/adm-test/json/extra/limit", "7")
+			try c.put("/adm-test/json/tags", "[\"a\", \"b\"]")
+			let source = new Source(c, "/adm-test/json", ValueFormat.Json)
+			let loaded = try source.load()
+			assert loaded.len() == 4 && loaded.hasKey("db") && loaded.hasKey("flag") && loaded.hasKey("extra.limit") && loaded.hasKey("tags")
+			try configured(source)
+			assert (try setting<string>("db.host")) == "j" && (try setting<int>("db.port")) == 1
+			assert (try setting<bool>("flag")) && (try setting<int>("extra.limit")) == 7
+			try await config.Config.stop()
+			// A value that is not JSON, and a prefix whose own value is not an object.
+			try c.put("/adm-test/json/tags", "[")
+			assert loadFailure(source) == ErrorKind.Argument
+			try c.delete("/adm-test/json/tags")
+			try c.put("/adm-test/json", "5")
+			assert loadFailure(source) == ErrorKind.Argument
+			try c.deletePrefix("/adm-test/")
+			try c.close()
+		}
+
+		@test()
+		def TestConfigFollowsTheKeys() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			try c.put("/adm-test/w/port", "1")
+			let source = new Source(c, "/adm-test/w/")
+			try configured(source)
+			assert collected(seenChanges, 3s).join(" ") == "port=1"
+			try c.put("/adm-test/w/port", "2")
+			assert collected(seenChanges, 3s).join(" ") == "port=2"
+			for let i = 0; i < 20; i++ {
+				try c.put("/adm-test/w/n{i}", "{i}")
+			}
+			let run = collected(seenChanges, 3s)
+			assert run.len() == 20 && run[0] == "n0=0"
+			try c.delete("/adm-test/w/port")
+			assert collected(seenChanges, 3s).join(" ") == "port=none"
+			// A stopped service does not follow the keys.
+			try await config.Config.stop()
+			try c.put("/adm-test/w/port", "3")
+			assert collected(seenChanges, 500ms).len() == 0
+			assert collected(seenFailures).len() == 0
+			try c.deletePrefix("/adm-test/")
+			try c.close()
+		}
+
+		@test()
+		def TestSourceReportsItsChanges() !none {
+			return none when testServer == ""
+			let c = try fresh()
+			let source = new Source(c, "/adm-test/s/")
+			let reported = new channel<string>(16)
+			// A change made between the load and the watch is seen.
+			try source.load()
+			try c.put("/adm-test/s/a", "1")
+			try source.watch(() => {
+				reported.offer("changed")
+			})
+			assert collected(reported, 3s).len() == 1
+			// Several writes in a row are one change.
+			for let i = 0; i < 20; i++ {
+				try c.put("/adm-test/s/b", "{i}")
+			}
+			assert collected(reported, 3s).len() == 1
+			// Another prefix is not this one.
+			try c.put("/adm-test/t", "x")
+			assert collected(reported, 500ms).len() == 0
+			try source.unwatch()
+			try c.put("/adm-test/s/a", "2")
+			assert collected(reported, 500ms).len() == 0
+			try source.unwatch()
+			// The load's revision compacted away: the watch starts from now and reports once.
+			try source.load()
+			try c.put("/adm-test/s/a", "3")
+			let now = (try c.put("/adm-test/s/a", "4")).revision
+			try c.compact(now)
+			try source.watch(() => {
+				reported.offer("changed")
+			})
+			assert collected(reported, 3s).len() == 1
+			try c.put("/adm-test/s/a", "5")
+			assert collected(reported, 3s).len() == 1
+			try source.unwatch()
 			try c.deletePrefix("/adm-test/")
 			try c.close()
 		}

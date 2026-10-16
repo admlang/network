@@ -1,0 +1,219 @@
+// The keys under a prefix as a source of the Config service
+// (std.services.config): read at each load, watched while the service
+// runs.
+partial module adm.network.etcd {
+	use (
+		std.data.encoding::(JSON)
+		std.net.grpc
+		std.time
+	)
+
+	// How the values under a Source's prefix are read.
+	enum ValueFormat {
+		// Each value is a text, which a typed read converts: the key
+		// `/config/db/host` under the prefix `/config/` is `db.host`.
+		Text,
+		// Each value is a JSON document: an object's members are the keys
+		// below the key (an object at the prefix itself gives top-level
+		// keys), any other value is the key's own.
+		Json,
+	}
+
+	// How long a run of changes must rest before the Config service is
+	// told: a tool that writes many keys makes one reload.
+	internal const settleTime = 100ms
+
+	// The keys under a prefix as a source of the Config service
+	// (`std.services.config`): a `ConfigSource` that is also a
+	// `WatchableConfigSource`.
+	//
+	//     use std.services.config::(Config, ConfigConfig, SourceConfig)
+	//
+	//     try Config.config(ConfigConfig{sources: [
+	//         SourceConfig{source: new FileSource("app.toml")},
+	//         SourceConfig{source: new etcd.Source(cluster, "/config/shop/")},
+	//     ]})
+	//     try await Config.start()
+	//
+	// The keys are read at each load; the names between the slashes after
+	// the prefix, joined by dots, are the configuration key (`db.host` for
+	// `/config/shop/db/host`). While the service is started the prefix is
+	// watched from the revision the load saw, so no change is missed, and
+	// a run of changes makes one reload once it rests. A watch the server
+	// ends (the user may no longer read the keys) ends the watching; the
+	// service's `restart` watches again.
+	type Source {
+		internal client   Client
+		internal prefix   string
+		internal format   ValueFormat
+		internal label    string
+		// The store's revision at the last load, 0 before one.
+		internal revision int         = 0
+		internal watching ?Watch      = none
+
+		// client is the cluster to read, prefix the keys to take (usually
+		// ending in `/`). name tells this source apart in the service's
+		// configuration: `etcd <prefix>` unless given.
+		def new(client Client, prefix string, format ValueFormat = ValueFormat.Text, name string = "") {
+			self.client = client
+			self.prefix = prefix
+			self.format = format
+			self.label = name == "" ?? ("etcd {prefix}", name)
+		}
+
+		// name implements ConfigSource.
+		def name() string {
+			return label
+		}
+
+		// load implements ConfigSource: the keys under the prefix now.
+		// Fails as a read of the cluster does (an EtcdError), and with
+		// Json when a value is not JSON or the prefix's own value is not
+		// an object.
+		def load() !map<string, any> {
+			let r = try client.range(prefix, GetOptions{prefix: true})
+			revision = r.revision
+			let out = map<string, any>{}
+			for let kv in r.kvs {
+				let key = configKey(kv.key[prefix.len():])
+				if format == ValueFormat.Text {
+					out[key] = kv.value unless key == ""
+					continue
+				}
+				let doc = try document(kv)
+				if key != "" {
+					out[key] = doc
+					continue
+				}
+				fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: {kv.key} does not hold a JSON object") unless doc is map<string, any>
+				let members map<string, any> = doc
+				for let (member, held) in members {
+					out[member] = held
+				}
+			}
+			return out
+		}
+
+		// watch implements WatchableConfigSource: calls changed when keys
+		// under the prefix change, from the last load on. When the
+		// revision of that load has been compacted away the watch starts
+		// from now and changed is called once, so the service reloads.
+		// Fails as a watch of the cluster does.
+		def watch(changed def ()) !none {
+			try unwatch()
+			let behind = false
+			let from = revision == 0 ?? (0, revision + 1)
+			let w = watchFrom(client, prefix, from) onerror (err error) {
+				fail err unless compactedAway(err)
+				behind = true
+				recover none
+			}
+			w = try watchFrom(client, prefix, 0) when w is none
+			fail etcdError(ErrorKind.Connection, grpc.Code.Unavailable, "etcd: the watch could not be opened") when w is none
+			swap(w)
+			let signals = new channel<bool>(2)
+			async follow(w, signals)
+			async notify(signals, changed, behind)
+			return none
+		}
+
+		// unwatch implements WatchableConfigSource. Does not fail.
+		def unwatch() !none {
+			let w = swap(none)
+			return none when w is none
+			w.close() onerror recover none
+			return none
+		}
+
+		// Makes next the watch and returns the one before.
+		internal atomic def swap(next ?Watch) ?Watch {
+			let before = watching
+			watching = next
+			return before
+		}
+
+		// Signals true to the notifier for each answer with events, until
+		// the watch ends, then false. A watch that ends because its
+		// revision was compacted away while the connection was down goes
+		// on from now.
+		internal def follow(w Watch, signals channel<bool>) {
+			let live = w
+			for {
+				let failure ?error = none
+				let b = live.batch() onerror (err error) {
+					failure = err
+					recover none
+				}
+				if b is none {
+					break unless compactedAway(failure)
+					let next = watchFrom(client, prefix, 0) onerror recover none
+					break when next is none
+					let before = swap(next)
+					if before is none {
+						// Unwatched meanwhile.
+						next.close() onerror recover none
+						break
+					}
+					live = next
+					signals.offer(true)
+					continue
+				}
+				signals.offer(true) when b.events.len() > 0
+			}
+			signals <- false
+		}
+	}
+
+	// Calls changed once a run of signalled changes rests for settleTime,
+	// and once more for the ones pending when the signals end. pending
+	// says there are changes before the first signal.
+	internal def notify(signals channel<bool>, changed def (), pending bool) {
+		let due = pending
+		for {
+			if !due {
+				let more = <-signals
+				return unless more
+				due = true
+			}
+			let rested = time.sleepChan(settleTime)
+			select {
+				case signals:
+					let more = <-signals
+					if !more {
+						changed()
+						return
+					}
+				case rested:
+					changed()
+					due = false
+			}
+		}
+	}
+
+	// The configuration key of an etcd key's part after the prefix: the
+	// names between its slashes, joined by dots.
+	internal def configKey(rest string) string {
+		return rest.split("/").filter(p => p != "").join(".")
+	}
+
+	// A watch of every key under prefix from the revision on (0: from
+	// now). Fails as Client.watch does.
+	internal def watchFrom(client Client, prefix string, from int) !?Watch {
+		return try client.watch(prefix, prefix = true, revision = from)
+	}
+
+	// The JSON document a key holds. Fails with Argument when its value is
+	// not JSON.
+	internal def document(kv KeyValue) !any {
+		let doc = new JSON().parse(kv.value) onerror (err error) {
+			fail etcdError(ErrorKind.Argument, grpc.Code.InvalidArgument, "etcd: {kv.key} does not hold JSON: {err.message}", err)
+		}
+		return doc
+	}
+
+	// Reports whether err says a revision has been compacted away.
+	internal def compactedAway(err ?error) bool {
+		return false when err is none
+		return err is EtcdError && err.kind == ErrorKind.Compacted
+	}
+}

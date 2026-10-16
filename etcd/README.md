@@ -104,6 +104,30 @@ for let leader in try election.observe() {
 try lead.resign()
 ```
 
+## Configuration
+
+`etcd.Source` feeds the Config service of `std.services.config` with the keys under a prefix:
+the names between the slashes after it, joined by dots, are the configuration key, so
+`/config/shop/db/host` under `/config/shop/` is `db.host`. The keys are read at each load and
+watched while the service is started, from the revision the load saw, so a change made
+meanwhile is not missed; a run of changes makes one reload once it rests.
+
+```adm
+use std.services.config::(Config, ConfigConfig, SourceConfig, FileSource)
+
+try Config.config(ConfigConfig{sources: [
+	SourceConfig{source: new FileSource("app.toml")},
+	SourceConfig{source: new etcd.Source(cluster, "/config/shop/")},        // wins over the file
+]})
+try await Config.start()
+let theme = try Config.get<string>("theme")
+```
+
+With `etcd.ValueFormat.Json` every value is a JSON document: an object's members are the keys
+below the key (an object at the prefix itself gives top-level keys), any other value is the
+key's own. `name` tells the source apart from another on the same prefix (`etcd <prefix>` by
+default).
+
 ## Cluster and administration
 
 `members`, `addMember` (as a learner too), `removeMember`, `updateMember`, `promoteMember`;
